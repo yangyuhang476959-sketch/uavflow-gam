@@ -1,0 +1,29 @@
+# Exact versions from the validated uav-gam environment. Install PyTorch and
+# torchvision separately first so the CUDA wheel matches the remote driver.
+transformers==5.5.4
+tokenizers==0.22.2
+huggingface_hub==1.10.1
+safetensors==0.5.3
+accelerate==1.13.0
+datasets==4.8.4
+timm==1.0.26
+einops==0.8.1
+numpy==1.26.4
+scipy==1.15.3
+h5py==3.16.0
+pyarrow==24.0.0
+pandas==3.0.3
+omegaconf==2.3.0
+antlr4-python3-runtime==4.9.3
+pillow==11.2.1
+opencv-python-headless==4.11.0.86
+imageio==2.37.3
+matplotlib==3.10.3
+tqdm==4.67.1
+protobuf==4.24.4
+wandb==0.24.2
+requests==2.34.2
+typer==0.26.8
+zstandard>=0.23
+modelscope==1.38.1
+modelscope-hub==0.4.3

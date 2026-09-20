@@ -1,0 +1,27 @@
+__pycache__/
+*.py[cod]
+*.log
+*.pt
+*.pth
+*.safetensors
+*.npy
+*.npz
+checkpoints/
+outputs/
+wandb/
+.env
+server.env
+.venv/
+modelscope_upload.log
+
+# Raw UAV-Flow and derived depth data are published separately on HF.
+data/raw/
+data/shards/
+hf_dataset/
+
+# Local downloads created by the remote setup helpers.
+data_remote/
+Depth-Anything-3/
+
+# Training outputs belong on the compute server, not in the source release.
+results/

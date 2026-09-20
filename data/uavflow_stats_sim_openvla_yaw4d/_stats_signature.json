@@ -1,0 +1,28 @@
+{
+  "action_convention": "yaw4d",
+  "action_delta_mode": "openvla_yaw_only",
+  "action_stats_key": "uavflow_sim",
+  "action_stats_samples": -1,
+  "chunk_size": 5,
+  "endpoint_repeat_count": 5,
+  "endpoint_self_pair_count": 0,
+  "future_steps": 5,
+  "mixture_weights": {
+    "real": 0.8,
+    "sim": 0.2
+  },
+  "openvla_uav_compatible": true,
+  "parquet_root": "UAV-Flow-Sim (runtime path supplied by UAVFLOW_SIM_ROOT)",
+  "real_root": null,
+  "real_translation_scale": 1.0,
+  "sim_root": "UAV-Flow-Sim (runtime path supplied by UAVFLOW_SIM_ROOT)",
+  "sim_translation_scale": 0.01,
+  "terminal_zero_action": true,
+  "translation_scale": 0.01,
+  "type": "uavflow",
+  "yaw_filter_deg": 45,
+  "yaw_filter_pad": 1,
+  "yaw_repair_algorithm": "so3_midpoint_slerp_v2",
+  "yaw_repair_deg": 45,
+  "yaw_repair_enabled": true
+}

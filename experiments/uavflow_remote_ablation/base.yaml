@@ -1,0 +1,175 @@
+seed: 42
+model_init_seed: 42
+
+stage1:
+  da3_checkpoint: checkpoints/track4world_da3.pth
+  idm_checkpoint: results/robot/unused-idm.pt
+  action_stats_dir: data/uavflow_stats_sim_openvla_yaw4d
+  text_encoder_type: qwen3_5
+  qwen_model: checkpoints/qwen3.5-2b
+  qwen_layers: [23]
+  qwen_attention_implementation: sdpa
+  qwen_use_reference_image: false
+  qwen_prompt_mode: current_image_openvla
+  qwen_token_selection: text_after_image
+  t5_model: checkpoints/t5-base
+
+dataset:
+  type: uavflow
+  parquet_root: data_remote/UAV-Flow-Sim
+  dataset_name: uavflow_sim
+  expected_shards: 21
+  action_stats_key: uavflow_sim
+  translation_scale: 0.01
+  image_size: [224, 224]
+  # Coupled K=5 baseline: two visual anchors [Ft,F(t+5)] and five actions.
+  future_steps: 1
+  visual_anchor_stride: 5
+  chunk_size: 5
+  eval_ratio: 0.05
+  episode_split_mode: stratified_instruction
+  episode_split_seed: 42
+  split_file: null
+  n_views: 1
+  camera_keys: [frontcamera]
+  action_convention: yaw4d
+  action_delta_mode: openvla_yaw_only
+  openvla_uav_compatible: true
+  terminal_zero_action: true
+  endpoint_repeat_count: 0
+  endpoint_self_pair_count: 0
+  endpoint_self_pair_start_count: 0
+  endpoint_self_pair_end_count: 5
+  endpoint_terminal_window_repeat_count: 0
+  endpoint_absorbing_window_count: 1
+  endpoint_absorbing_max_starts: 5
+  endpoint_absorbing_train_fraction: 0.20
+  stop_absorbing_positive: true
+  stop_target_mode: current
+  stop_soft_target_fraction: 0.0
+  episode_start_repeat_count: 5
+  episode_start_train_fraction: 0.0
+  yaw_repair_enabled: true
+  yaw_repair_deg: 45
+  yaw_filter_deg: 45
+  yaw_filter_pad: 1
+  max_trajectories: null
+  gt_depth_root: data_remote/UAV-Flow-Sim-Depth
+  gt_depth_fallback_roots: []
+  instruction_overrides_path: null
+  gt_depth_required: true
+  gt_depth_min_meters: 0.0
+  gt_depth_max_meters: 650.0
+
+model:
+  context_lengths: [1]
+  context_weights: [1.0]
+  rollout_steps: 1
+  action_chunk_size: 5
+  feature_target_offset: 1
+  d_model: 1024
+  depth: 12
+  num_heads: 16
+  ffn_ratio: 4.0
+  dropout: 0.0
+  condition_mode: cross_attn
+  language_len: 256
+  use_action_history: false
+  action_history_keep_prob: 1.0
+  use_pose_history: false
+  pose_history_keep_prob: 1.0
+  pose_history_xyz_noise_meters: 0.0
+  pose_history_yaw_noise_degrees: 0.0
+  pose_stats_samples: 0
+  use_fixed_first_frame: true
+  use_reference_type_embedding: true
+  dense_context_supervision: true
+  direct_action_enabled: true
+  compute_idm_branch: false
+  deep_action_enabled: true
+  relative_pose_head_enabled: false
+  train_deep_backbone: true
+  deep_train_start_block: 13
+  deep_lora:
+    enabled: false
+    start_block: 13
+    rank: 64
+    alpha: 128
+    dropout: 0.0
+  stop_head_enabled: false
+  stop_head_mode: legacy_action_token
+  stop_model_dim: 512
+  stop_num_heads: 8
+  stop_num_queries: 4
+  stop_decoder_layers: 2
+  stop_future_gate_init: 0.1
+  residual_prediction: false
+  residual_gate_init: 0.1
+  gradient_checkpointing: true
+
+augmentation:
+  enabled: false
+  probability: 0.5
+  brightness: 0.08
+  contrast: 0.08
+  color: 0.05
+
+loss:
+  action_weight: 3.0
+  action_direct_weight: 0.0
+  action_refine_weight: 1.0
+  feature_weight: 1.0
+  feature_patch_weight: 1.0
+  feature_cls_weight: 0.0
+  feature_register_weight: 0.0
+  feature_horizon_weights: [1.0]
+  deep_feature_weight: 0.0
+  deep_feature_patch_weight: 1.0
+  deep_feature_cls_weight: 0.25
+  depth_weight: 3.0
+  depth_target_source: ue_gt
+  depth_target_mode: future
+  depth_scale_mode: gam_window_pointnorm
+  depth_fixed_scale_meters: 100.0
+  depth_scale_loss_weight: 1.0
+  depth_linear_weight: 1.0
+  depth_log_weight: 0.0
+  depth_log_epsilon_normalized: 1.0e-6
+  depth_grad_weight: 1.0
+  depth_semantic_weight: 1.0
+  depth_semantic_separate_weight: 0.0
+  depth_semantic_linear_weight: 1.0
+  depth_semantic_log_weight: 0.0
+  depth_semantic_grad_weight: 1.0
+  depth_gradient_mode: gam_l1
+  depth_gradient_tolerance_pixels: 0
+  stop_weight: 0.0
+  stop_pos_weight: 5.0
+  relative_pose_weight: 0.0
+  action_rollout_pose_weight: 0.0
+  pose_consistency_weight: 0.0
+
+training:
+  results_dir: results/remote_ablation/placeholder
+  batch_size: 4
+  num_workers: 4
+  lr: 5.0e-5
+  lr_schedule: constant
+  predictor_lr_mult: 0.2
+  direct_action_head_lr_mult: 10.0
+  weight_decay: 0.0
+  warmup_steps: 0
+  max_epochs: 5
+  max_steps: 1
+  scheduler_total_steps: 0
+  min_lr_ratio: 0.05
+  grad_clip: 1.0
+  amp: true
+  log_every: 25
+  eval_every: 2000
+  eval_max_batches: 100
+  save_every: 0
+  # Match the five-epoch CLIP runs: archive one checkpoint per epoch.
+  # Mid-epoch last.pt remains available as an opt-in launcher override.
+  save_latest_every: 0
+  save_every_epochs: 1
