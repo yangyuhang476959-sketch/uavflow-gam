@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #PBS -N uavflow-gam
-#PBS -J 0-21
+#PBS -J 0-24
 #PBS -l select=1:ncpus=32:ngpus=4:mem=256gb
 #PBS -j oe
 set -euo pipefail

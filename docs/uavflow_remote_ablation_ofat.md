@@ -35,8 +35,8 @@ the row inherits every setting from `B0`.
 | W3 | dynamic pixel multiplier 1 -> 3 | Mild dynamic emphasis |
 | W5 | dynamic pixel multiplier 1 -> 5 | Medium dynamic emphasis |
 | W10 | dynamic pixel multiplier 1 -> 10 | Strong dynamic emphasis |
-| H0 | at K=5, supervise depth at current F(t) instead of F(t+5) | Current-depth regularization only; feature stays future5 |
-| HB | at K=5, supervise equal current F(t) + future F(t+5) depth | Does current depth stabilize future geometry? |
+| H0 | A: predict current feature and depth, keep future action chunk | Does current reconstruction suffice? |
+| HB | D: observed current + predicted future, joint dual-view deep pass | Does joint geometry interaction help? |
 | F3 | coupled scale K: 5 -> 3 | 3-action chunk, F(t+3) geometry, append 3 terminal FN frames |
 | F7 | coupled scale K: 5 -> 7 | 7-action chunk, F(t+7) geometry, append 7 terminal FN frames |
 | F10 | coupled scale K: 5 -> 10 | 10-action chunk, F(t+10) geometry, append 10 terminal FN frames |
@@ -46,15 +46,18 @@ the row inherits every setting from `B0`.
 | C3_W3HB | W3 + HB: dynamic multiplier 3 and current+future depth | Does mild dynamic emphasis help after geometry is stabilized? |
 | C4_F3W3 | F3 + W3: K=3 and dynamic multiplier 3 | Is near-future dynamic blur primarily horizon- or weight-limited? |
 | C5_F10HB | F10 + HB: K=10 and current+future depth | Can current geometry regularize the deliberately hard long horizon? |
-| CA1_HB | HB + one final action-to-current-deep cross-attention | Does directly reading current geometry help beyond its auxiliary loss? |
+| CA1_HB | C: separate current/future passes, terminal action-to-current CA | Separate versus joint geometry processing |
+| HC_DIRECT | B: bypass Predictor, observed current + language/F0 action adapter | Is the feature Predictor necessary? |
+| HE_DUALPRED | E: predicted current and future in joint deep pass | Observed versus predicted current |
+| HF_BRIDGE | F: action-only bridge between observed current and predicted future | Is direct visual interaction necessary? |
 
-Total: 22 Stage-1 runs: 16 clean main-effect/control rows plus six targeted
-interaction rows. Each automatically launches its matching five-epoch
+Total: 25 Stage-1 runs: original 21 minus two depth architecture controls plus
+six A–F architectures. Each automatically launches its matching five-epoch
 joint Stop Stage 2 from the selected Stage-1 checkpoint.
 
 `D1LOG` uses a normalized log clamp of `0.001`, which is `0.1 m` under
 the fixed `100 m` metric divisor. `W10` is retained as the strong dynamic-
-weight stress test, so the default compact matrix contains 22 runs.
+weight stress test, so the default compact matrix contains 25 runs.
 
 Do not confuse its per-pixel log-depth term with the `D2` log-scale loss:
 
@@ -71,7 +74,8 @@ H=1, K=5 this is `[F(t), F(t+5)]`; `current`, `future`, and `both` targets all
 use that same scale. `both` averages its two target losses rather than summing
 them, so it does not double the scale-loss coefficient.
 
-The 22-row compact matrix contains one clean baseline scheduler pair but does not
+See [architecture details and changed output names](DEPTH_ARCHITECTURES.md).
+The 25-row compact matrix contains one clean baseline scheduler pair but does not
 duplicate every scientific row under both schedules. The separate
 compute-rich launcher therefore uses a deduplicated 64-cell design containing
 all main effects and targeted two-factor/hard-setting interactions, without a

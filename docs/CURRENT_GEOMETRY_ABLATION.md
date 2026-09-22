@@ -1,14 +1,15 @@
 # CA1_HB: current geometry as an action input, not only an auxiliary loss
 
-The compact matrix now has **22** cells. All previous 21 IDs and scheduler
-indices remain unchanged. `CA1_HB` is appended at index **21**. The separate
-compute-rich/detailed matrix is unchanged.
+The compact matrix now has **25** cells. `CA1_HB` is architecture C at index
+**21**. See [all A–F architectures](DEPTH_ARCHITECTURES.md). The separate
+compute-rich matrix retains its original 64-cell loss-target design.
 
-Compare **HB vs CA1_HB**, not just B0 vs CA1_HB. Both use Qwen, no numeric pose,
+The former loss-only HB was this module's matched control. HB now means D,
+so HB vs CA1_HB compares two architectures. Both use Qwen, no numeric pose,
 H=1, chunk/stride=5, relative depth, dynamic weight=1 and equal current/future
 depth losses. Stage 1 stays 5 epochs with constant LR; Stage 2 stays 5 joint
 action/Stop epochs with cosine decay. Sampling, augmentation and loss weights
-are identical. Only `model.current_geometry_action_enabled` changes.
+are identical, but their deep attention topology differs.
 
 ```
 observed shallow -> shared DA3 deep -> current patches -> current depth loss
@@ -30,8 +31,8 @@ action hidden in Stage 2, using the existing legacy-action-token Stop head.
 
 Current deep features are cached in the forward output and reused by current
 depth loss: one current DA3 pass, not two. The original future path is unchanged.
-Training adds the small CA over HB. Inference also needs the current DA3 deep
-pass that loss-only HB can omit. Current DPT is not required for action inference.
+Relative to historical loss-only HB, training adds the small CA. Inference
+also requires the current deep pass. Current DPT is not needed for actions.
 No latency/VRAM/SR improvement is claimed without measurement.
 
 This first ablation rejects H>1: the existing observed deep encoder is not
@@ -53,8 +54,8 @@ RUN_IDS=CA1_HB bash experiments/uavflow_remote_ablation/run_server.sh
 bash experiments/uavflow_remote_ablation/run_compact_cell.sh 21
 ```
 
-All compact launchers include the new cell. Four GPUs per cell means 22 cells
-occupy 88 GPUs when launched simultaneously, subject to scheduler capacity.
+All compact launchers include this cell. Four GPUs per cell means 25 cells
+occupy 100 GPUs when launched simultaneously, subject to scheduler capacity.
 
 CPU regression checks (no model download or GPU allocation):
 

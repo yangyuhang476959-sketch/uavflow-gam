@@ -1,23 +1,26 @@
-id	language	direct_pose	depth_scale	depth_target	dynamic_weight	chunk_K	context_H	stage1_schedule	purpose
-B0	qwen	off	relative	future	1	5	1	constant	baseline
-S1COS	qwen	off	relative	future	1	5	1	cosine	stage1 schedule control
-P1	qwen	on	relative	future	1	5	1	constant	direct numeric pose main effect
-L1	t5	off	relative	future	1	5	1	constant	language encoder main effect
-D1	qwen	off	fixed_metric	future	1	5	1	constant	fixed metric depth main effect
-D2	qwen	off	scale_separated	future	1	5	1	constant	shape and scale separation main effect
-D1LOG	qwen	off	fixed_metric	future	1	5	1	constant	fixed metric with balanced linear/log value loss and GAM gradient
-W3	qwen	off	relative	future	3	5	1	constant	mild dynamic emphasis
-W5	qwen	off	relative	future	5	5	1	constant	medium dynamic emphasis
-W10	qwen	off	relative	future	10	5	1	constant	strong dynamic emphasis
-H0	qwen	off	relative	current	1	5	1	constant	current depth auxiliary target
-HB	qwen	off	relative	both	1	5	1	constant	current and future depth targets
-F3	qwen	off	relative	future	1	3	1	constant	short coupled action and geometry horizon
-F7	qwen	off	relative	future	1	7	1	constant	medium-long coupled horizon
-F10	qwen	off	relative	future	1	10	1	constant	long coupled horizon
-M1	qwen	off	relative	future	1	5	1,2,3,4	constant	GAM multi-window context
-C1_PL	t5	on	relative	future	1	5	1	constant	pose by language interaction
-C2_D2HB	qwen	off	scale_separated	both	1	5	1	constant	scale separation by depth target interaction
-C3_W3HB	qwen	off	relative	both	3	5	1	constant	dynamic emphasis by depth target interaction
-C4_F3W3	qwen	off	relative	future	3	3	1	constant	short horizon by dynamic emphasis interaction
-C5_F10HB	qwen	off	relative	both	1	10	1	constant	long horizon by current-depth anchor interaction
-CA1_HB	qwen	off	relative	both	1	5	1	constant	HB plus one refined-action cross-attention read of current deep patches
+id	language	direct_pose	depth_scale	depth_target	dynamic_weight	chunk_K	context_H	stage1_schedule	purpose	geometry_architecture
+B0	qwen	off	relative	future	1	5	1	constant	baseline	legacy
+S1COS	qwen	off	relative	future	1	5	1	cosine	stage1 schedule control	legacy
+P1	qwen	on	relative	future	1	5	1	constant	direct numeric pose main effect	legacy
+L1	t5	off	relative	future	1	5	1	constant	language encoder main effect	legacy
+D1	qwen	off	fixed_metric	future	1	5	1	constant	fixed metric depth main effect	legacy
+D2	qwen	off	scale_separated	future	1	5	1	constant	shape and scale separation main effect	legacy
+D1LOG	qwen	off	fixed_metric	future	1	5	1	constant	fixed metric with balanced linear/log value loss and GAM gradient	legacy
+W3	qwen	off	relative	future	3	5	1	constant	mild dynamic emphasis	legacy
+W5	qwen	off	relative	future	5	5	1	constant	medium dynamic emphasis	legacy
+W10	qwen	off	relative	future	10	5	1	constant	strong dynamic emphasis	legacy
+H0	qwen	off	relative	current	1	5	1	constant	A: reconstruct current feature and decode current depth	current_prediction
+HB	qwen	off	relative	both	1	5	1	constant	D: observed current plus predicted future jointly decoded	dual_observed
+F3	qwen	off	relative	future	1	3	1	constant	short coupled action and geometry horizon	legacy
+F7	qwen	off	relative	future	1	7	1	constant	medium-long coupled horizon	legacy
+F10	qwen	off	relative	future	1	10	1	constant	long coupled horizon	legacy
+M1	qwen	off	relative	future	1	5	1,2,3,4	constant	GAM multi-window context	legacy
+C1_PL	t5	on	relative	future	1	5	1	constant	pose by language interaction	legacy
+C2_D2HB	qwen	off	scale_separated	both	1	5	1	constant	scale separation by depth target interaction	dual_observed
+C3_W3HB	qwen	off	relative	both	3	5	1	constant	dynamic emphasis by depth target interaction	dual_observed
+C4_F3W3	qwen	off	relative	future	3	3	1	constant	short horizon by dynamic emphasis interaction	legacy
+C5_F10HB	qwen	off	relative	both	1	10	1	constant	long horizon by current-depth anchor interaction	dual_observed
+CA1_HB	qwen	off	relative	both	1	5	1	constant	C: legacy separate current/future passes with terminal action CA	legacy
+HC_DIRECT	qwen	off	relative	current	1	5	1	constant	B: bypass causal Predictor, retain reference/language action adapter	direct_current
+HE_DUALPRED	qwen	off	relative	both	1	5	1	constant	E: shared Predictor reconstructs current and predicts future; joint decode	dual_predicted
+HF_BRIDGE	qwen	off	relative	both	1	5	1	constant	F: observed current read only by actions; future-action bidirectional	dual_action_bridge

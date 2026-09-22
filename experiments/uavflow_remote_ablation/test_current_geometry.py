@@ -111,11 +111,11 @@ class Tests(unittest.TestCase):
         root = Path(__file__).parent
         with (root / "compact_matrix.tsv").open() as stream:
             rows = list(csv.DictReader(stream, delimiter="\t"))
-        self.assertEqual(len(rows), 22)
+        self.assertEqual(len(rows), 25)
         self.assertEqual(rows[20]["id"], "C5_F10HB")
         self.assertEqual(rows[21]["id"], "CA1_HB")
         hb = next(row for row in rows if row["id"] == "HB")
-        for key in hb.keys() - {"id", "purpose"}:
+        for key in hb.keys() - {"id", "purpose", "geometry_architecture"}:
             self.assertEqual(hb[key], rows[21][key])
 
 

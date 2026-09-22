@@ -189,8 +189,8 @@ does not silently receive four times as many terminal windows.
 - `D2`: relative -> shape/scale-separated depth;
 - `D1LOG`: fixed metric depth with `0.5 linear + 0.5 log + 1 GAM-gradient`;
 - `W3/W5/W10`: dynamic multiplier 3/5/10;
-- `H0`: at K=5, current depth only (feature remains future5);
-- `HB`: at K=5, current plus future5 depth (feature remains future5);
+- `H0`: architecture A, predict current feature/depth with future action chunk;
+- `HB`: architecture D, observed current + predicted future joint deep pass;
 - `F3/F7/F10`: coupled K=3/7/10;
 - `M1`: sampled causal H={1,2,3,4}, K=5.
 
@@ -204,7 +204,8 @@ interactions:
 - `C4_F3W3`: K=3 + dynamic multiplier 3;
 - `C5_F10HB`: K=10 + current/future depth.
 
-With the additional CA1_HB current-geometry action read control, this gives 22 Stage-1 runs, each followed by its matching Stage-2 joint Stop
+With C/CA1_HB, B/HC_DIRECT, E/HE_DUALPRED and F/HF_BRIDGE, this gives 25
+compact Stage-1 runs (see DEPTH_ARCHITECTURES.md), each followed by its matching Stage-2 joint Stop
 run. The five interactions were selected to resolve specific ambiguities in
 the main effects; this is not a Cartesian product.
 

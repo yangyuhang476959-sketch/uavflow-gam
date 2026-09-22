@@ -1,7 +1,7 @@
 # UAVFlow-GAM
 
-Compact matrix: **22 cells**. New `CA1_HB` compares direct current-geometry
-action access against loss-only `HB`; see [design and command](docs/CURRENT_GEOMETRY_ABLATION.md).
+Compact matrix: **25 cells**. Six A–F geometry architectures replace the two
+old depth architecture controls; see [architecture design](docs/DEPTH_ARCHITECTURES.md).
 
 Minimal research code for transferring Geometric Action Models to
 UAV-Flow-Sim. This repository contains only the source, configurations and
@@ -27,7 +27,7 @@ and its application order.
 - `scripts/`: environment setup, data download/audit and one-command handoff.
 - `data/instruction_overrides.json`: seven reviewed instruction corrections.
 - `data/uavflow_stats_sim_openvla_yaw4d/`: fixed action normalization statistics.
-- `experiments/uavflow_remote_ablation/`: restartable compact-22 and
+- `experiments/uavflow_remote_ablation/`: restartable compact-25 and
   compute-rich remote launchers.
 
 ## Remote experiment quick start

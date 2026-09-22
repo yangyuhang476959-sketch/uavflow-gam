@@ -4,7 +4,7 @@ Before pushing the staging tree:
 
 1. Confirm the GitHub origin is
    `https://github.com/yangyuhang476959-sketch/uavflow-gam.git`.
-2. Review the compact-22 and detailed-64 designs with the experiment owner.
+2. Review the compact-25 and detailed-64 designs with the experiment owner.
 3. Confirm all six derived-depth shards and `metadata/` are visible in
    `acetaffy123/UAV-Flow-Sim-Depth`; record its revision in the release notes.
 5. Publish selected checkpoints separately. Do not commit `.pt`, `.pth`, model

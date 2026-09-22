@@ -681,6 +681,19 @@ def feature_loss(
     }
 
 
+def architecture_feature_loss(mode, output, observed, target_future, **kwargs):
+    """Only detached real features are targets; E averages its two targets."""
+    target = observed.detach() if mode in {"current_prediction", "direct_current"} else target_future.detach()
+    values = feature_loss(output["future_shallow"], target, **kwargs)
+    if mode == "direct_current":
+        # No feature predictor exists in B. Do not fake a future reconstruction objective.
+        return {key: torch.zeros_like(value) for key, value in values.items()}
+    if mode == "dual_predicted":
+        current = feature_loss(output["predicted_current_shallow"], observed.detach(), **kwargs)
+        return {key: (value + current[key]) / 2 for key, value in values.items()}
+    return values
+
+
 def masked_action_l1(
     prediction: torch.Tensor, target: torch.Tensor, mask: torch.Tensor
 ) -> torch.Tensor:
@@ -946,14 +959,18 @@ def forward_batch(
             lang_padding_mask=language["attention_mask"],
             conditioning_generator=conditioning_generator,
         )
-        feature_values = feature_loss(
-            output["future_shallow"],
-            target_future,
+        geometry_architecture = getattr(model_ref, "geometry_architecture", "legacy")
+        if geometry_architecture != "legacy" and deep_feature_enabled:
+            raise ValueError("New geometry architectures use shallow feature targets; deep distillation is unsupported")
+        feature_kwargs = dict(
             patch_start=1 + int(getattr(da3, "num_register_tokens", 0)),
             horizon_weights=feature_horizon_weights,
             patch_weight=feature_patch_weight,
             cls_weight=feature_cls_weight,
             register_weight=feature_register_weight,
+        )
+        feature_values = architecture_feature_loss(
+            geometry_architecture, output, observed, target_future, **feature_kwargs
         )
         zero = output["actions_norm"].new_zeros(())
         direct_prediction = output.get("direct_actions_norm")
@@ -1085,6 +1102,10 @@ def forward_batch(
             }
         if depth_enabled:
             target_mode = str(depth_target_mode).lower()
+            if geometry_architecture in {"current_prediction", "direct_current"} and target_mode != "current":
+                raise ValueError("Current architectures require loss.depth_target_mode=current")
+            if geometry_architecture.startswith("dual_") and target_mode != "both":
+                raise ValueError("Dual architectures require loss.depth_target_mode=both")
             if target_mode not in {"future", "current", "both"}:
                 raise ValueError(
                     f"Unsupported depth_target_mode={depth_target_mode!r}; "
@@ -1208,21 +1229,24 @@ def forward_batch(
                 if target_mode in {"current", "both"}:
                     # CA1_HB already needs this pass for action. Reuse its graph
                     # for current depth rather than executing DA3 a third time.
-                    current_features = output.get("current_geometry_features")
-                    if current_features is None:
-                        current_features = da3.propagate_shallow_visual_slots_grad(
-                            observed,
-                            gradient_checkpointing=bool(
-                                getattr(model_ref, "deep_gradient_checkpointing", False)
-                            ),
+                    current_output = output.get("current_depth_output")
+                    if current_output is not None:
+                        current_pred_depth = current_output["depth"].reshape(
+                            batch_size, action_steps, views, *current_output["depth"].shape[-2:]
                         )
-                    current_pred_depth = _decode_visual_depth_levels(
-                        da3,
-                        current_features["deep_levels"],
-                        batch_size=batch_size,
-                        steps=action_steps,
-                        views=views,
-                    )
+                    else:
+                        current_features = output.get("current_geometry_features")
+                        if current_features is None:
+                            current_features = da3.propagate_shallow_visual_slots_grad(
+                                observed,
+                                gradient_checkpointing=bool(
+                                    getattr(model_ref, "deep_gradient_checkpointing", False)
+                                ),
+                            )
+                        current_pred_depth = _decode_visual_depth_levels(
+                            da3, current_features["deep_levels"],
+                            batch_size=batch_size, steps=action_steps, views=views,
+                        )
                     losses.append(_ue_loss(current_pred_depth, 0))
                 depth_values = {
                     key: sum(item[key] for item in losses) / float(len(losses))

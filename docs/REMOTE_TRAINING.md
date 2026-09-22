@@ -1,6 +1,6 @@
 # Remote UAV-Flow training
 
-This document reproduces the compact 22-run ablation and the optional
+This document reproduces the compact 25-run ablation and the optional
 compute-rich matrix on a clean GPU server. Large datasets and checkpoints are
 not stored in Git.
 
@@ -105,10 +105,10 @@ OUTPUT_ROOT=/tmp/uavflow_smoke \
 bash experiments/uavflow_remote_ablation/run_remote.sh
 ```
 
-## 6. Compact 22-run experiment
+## 6. Compact 25-run experiment
 
 Production defaults are four GPUs, batch 6/GPU, no accumulation and global
-batch 24. This lets all 22 compact cells occupy 88 GPUs in one wave. Stage 1
+batch 24. This lets all 25 compact cells occupy 100 GPUs in one wave. Stage 1
 and Stage 2 each train five physical epochs.
 
 ```bash
@@ -121,7 +121,7 @@ The command above runs all cells sequentially on one four-GPU worker. On a
 cluster, submit one four-GPU array job per cell using the matching scheduler:
 
 ```bash
-# Slurm: 22 jobs x 4 GPUs = 88 GPUs in one wave
+# Slurm: 25 jobs x 4 GPUs = 100 GPUs in one wave
 sbatch experiments/uavflow_remote_ablation/submit_slurm_compact.sh
 
 # PBS Pro / OpenPBS
@@ -145,7 +145,7 @@ index 0 is `B0`, index 20 is `C5_F10HB`, and index 21 is `CA1_HB`. Every cell pr
 24 and writes to a separate output directory.
 
 The compact matrix contains 16 main-effect/control rows, five selected
-interactions and the HB-matched CA1_HB action-access control. See
+interactions and six A–F geometry architectures. See docs/DEPTH_ARCHITECTURES.md and
 `docs/CURRENT_GEOMETRY_ABLATION.md` for its implementation and
 `docs/uavflow_remote_ablation_ofat.md` for the exact list and
 `docs/uavflow_remote_ablation_detailed.md` for data/loss semantics.

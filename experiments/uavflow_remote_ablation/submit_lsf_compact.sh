@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#BSUB -J "uavflow-gam[1-22]"
+#BSUB -J "uavflow-gam[1-25]"
 #BSUB -n 32
 #BSUB -gpu "num=4"
 #BSUB -oo "uavflow-gam-%J_%I.out"

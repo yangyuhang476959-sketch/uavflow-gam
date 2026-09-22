@@ -15,6 +15,9 @@ from robot.modeling.action_head_v2 import ActionHeadV2
 from robot.modeling.future_predictor import GAMFuturePredictor
 from .idm import build_frozen_idm  # Backward-compatible re-export.
 from .current_geometry import CurrentGeometryRead
+from .geometry_architectures import (
+    GEOMETRY_ARCHITECTURES, DUAL_ARCHITECTURES, DirectCurrentActionSeed, select_dual_view,
+)
 
 
 class PatchMotionStopHead(nn.Module):
@@ -502,6 +505,7 @@ class UAVFlowPredictorIDM(nn.Module):
         residual_gate_init: float = 0.10,
         gradient_checkpointing: bool = True,
         current_geometry_action_enabled: bool = False,
+        geometry_architecture: str = "legacy",
     ) -> None:
         super().__init__()
         self.da3 = da3
@@ -537,6 +541,14 @@ class UAVFlowPredictorIDM(nn.Module):
         self.compute_idm_branch = bool(compute_idm_branch)
         self.deep_action_enabled = bool(deep_action_enabled)
         self.current_geometry_action_enabled = bool(current_geometry_action_enabled)
+        self.geometry_architecture = str(geometry_architecture)
+        if self.geometry_architecture not in GEOMETRY_ARCHITECTURES:
+            raise ValueError(f"Unknown geometry_architecture={self.geometry_architecture}")
+        if self.geometry_architecture != "legacy":
+            if not self.deep_action_enabled or self.rollout_steps != 1 or self.compute_idm_branch:
+                raise ValueError("Geometry architectures require deep action, rollout=1, no legacy IDM")
+            if self.current_geometry_action_enabled:
+                raise ValueError("Do not combine joint geometry architectures with the terminal CA control")
         if self.current_geometry_action_enabled and (not self.deep_action_enabled or self.rollout_steps != 1):
             raise ValueError("Current geometry action read requires deep_action_enabled and rollout_steps=1")
         self.train_deep_backbone = bool(train_deep_backbone)
@@ -722,6 +734,26 @@ class UAVFlowPredictorIDM(nn.Module):
             CurrentGeometryRead(int(da3.embed_dim))
             if self.current_geometry_action_enabled else None
         )
+        self.direct_current_seed = (
+            DirectCurrentActionSeed(int(da3.embed_dim), int(language_dim))
+            if self.geometry_architecture == "direct_current" else None
+        )
+        self.prediction_roles = (
+            nn.Parameter(torch.randn(2, int(d_model)) * 0.02)
+            if self.geometry_architecture == "dual_predicted" else None
+        )
+        if self.direct_current_seed is not None:
+            if not self.use_fixed_first_frame:
+                self.direct_current_seed.reference_role.requires_grad = False
+            # Keep the legacy predictor object only for config/checkpoint API
+            # compatibility. It is neither executed nor optimized in B.
+            for parameter in self.predictor.parameters():
+                parameter.requires_grad = False
+            for parameter in (self.reference_step_embed, self.residual_gate_logit,
+                              self.missing_action_embed, self.missing_pose_embed):
+                parameter.requires_grad = False
+            if self.use_pose_history or self.use_action_history:
+                raise ValueError("direct_current control does not accept numeric pose/action history")
 
     @property
     def residual_gate(self) -> torch.Tensor:
@@ -755,6 +787,7 @@ class UAVFlowPredictorIDM(nn.Module):
         conditioning_generator: torch.Generator | None = None,
         force_action_history_missing: bool = False,
         force_pose_history_missing: bool = False,
+        prediction_role: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Predict future shallow tokens; normal training uses exactly one step.
 
@@ -905,6 +938,12 @@ class UAVFlowPredictorIDM(nn.Module):
                 while action_keep.ndim < predictor_action_valid.ndim:
                     action_keep = action_keep.unsqueeze(-1)
                 predictor_action_valid = predictor_action_valid & action_keep
+            if prediction_role is not None:
+                if predictor_step_roles is None:
+                    predictor_step_roles = sequence.new_zeros(
+                        b, predictor_sequence.shape[1], self.predictor.d_model
+                    )
+                predictor_step_roles = predictor_step_roles + prediction_role.to(predictor_step_roles)
             out = self.predictor(
                 past_visual_tokens=predictor_sequence,
                 proprio_history=predictor_pose,
@@ -1017,8 +1056,9 @@ class UAVFlowPredictorIDM(nn.Module):
     ) -> dict[str, object]:
         if self.current_geometry_action_enabled and observed_shallow.shape[1] != 1:
             raise ValueError("Current geometry action ablation supports H=1 only (avoid temporal leakage)")
-        future, direct_action_tokens = self.rollout_shallow(
-            observed_shallow,
+        if self.geometry_architecture != "legacy" and observed_shallow.shape[1:3] != (1, 1):
+            raise ValueError("Geometry architecture ablations require H=1 and one physical camera")
+        rollout_kwargs = dict(
             reference_shallow=reference_shallow,
             observed_action_history=observed_action_history,
             observed_action_history_valid_mask=observed_action_history_valid_mask,
@@ -1030,7 +1070,25 @@ class UAVFlowPredictorIDM(nn.Module):
             force_action_history_missing=force_action_history_missing,
             force_pose_history_missing=force_pose_history_missing,
         )
+        predicted_current = None
+        current_action_tokens = None
+        if self.direct_current_seed is not None:
+            future = observed_shallow
+            direct_action_tokens = self.direct_current_seed(
+                observed_shallow,
+                reference_shallow if self.use_fixed_first_frame else None,
+                lang_feats, lang_padding_mask,
+            )
+        else:
+            role = {} if self.prediction_roles is None else {"prediction_role": self.prediction_roles[1]}
+            future, direct_action_tokens = self.rollout_shallow(observed_shallow, **rollout_kwargs, **role)
+            if self.prediction_roles is not None:
+                # Shared Predictor weights, two target-role-conditioned passes.
+                predicted_current, current_action_tokens = self.rollout_shallow(
+                    observed_shallow, **rollout_kwargs, prediction_role=self.prediction_roles[0]
+                )
         deep_joint_features = None
+        current_depth_output = None
         current_geometry_features = None
         refined_action_tokens = None
         if self.deep_action_enabled or self.stop_head_enabled:
@@ -1040,18 +1098,39 @@ class UAVFlowPredictorIDM(nn.Module):
             # visual feature and dedicated action seed enter frozen DA3 deeper
             # blocks together. Gradients flow through those frozen operations
             # back into both predictor outputs.
+            is_dual = self.geometry_architecture in DUAL_ARCHITECTURES
+            deep_visuals = future
+            deep_actions = direct_action_tokens
+            deep_kwargs = {}
+            if is_dual:
+                current = observed_shallow if predicted_current is None else predicted_current
+                seed = direct_action_tokens if current_action_tokens is None else current_action_tokens
+                deep_visuals = torch.cat([current, future], dim=2)
+                deep_actions = torch.cat([seed, direct_action_tokens], dim=2)
+                deep_kwargs["dual_state_attention"] = (
+                    "action_bridge" if self.geometry_architecture == "dual_action_bridge" else "full"
+                )
             deep_joint_features = self.da3.propagate_shallow_with_actions_grad(
-                future,
-                direct_action_tokens,
+                deep_visuals,
+                deep_actions,
                 decode_visuals=self.depth_decode_enabled,
                 gradient_checkpointing=self.deep_gradient_checkpointing,
                 deep_temporal_causal_mask=True,
+                **deep_kwargs,
             )
             deep_tokens = deep_joint_features.get("action_tokens")
             if not isinstance(deep_tokens, torch.Tensor):
                 raise RuntimeError("DA3 joint propagation did not return action_tokens.")
             b, steps, views = direct_action_tokens.shape[:3]
-            refined_action_tokens = deep_tokens.reshape(b, steps, views, -1)
+            if is_dual:
+                refined_action_tokens = deep_tokens.reshape(b, steps, 2, -1).mean(dim=2, keepdim=True)
+                direct_action_tokens = deep_actions.mean(dim=2, keepdim=True)
+                current_depth_output = select_dual_view(deep_joint_features, b, 0)
+                deep_joint_features = select_dual_view(deep_joint_features, b, 1)
+            else:
+                refined_action_tokens = deep_tokens.reshape(b, steps, views, -1)
+                if self.geometry_architecture in {"current_prediction", "direct_current"}:
+                    current_depth_output = deep_joint_features
             if self.current_geometry_read is not None:
                 current_geometry_features = self.da3.propagate_shallow_visual_slots_grad(
                     observed_shallow,
@@ -1148,6 +1227,8 @@ class UAVFlowPredictorIDM(nn.Module):
             raise RuntimeError("Neither direct nor IDM action branch is enabled.")
         return {
             "future_shallow": future,
+            "predicted_current_shallow": predicted_current,
+            "current_depth_output": current_depth_output,
             "idm_features": idm_features,
             "actions_norm": actions_norm,
             "direct_actions_norm": direct_actions_norm,

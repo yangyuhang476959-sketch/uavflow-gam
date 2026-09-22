@@ -1517,6 +1517,7 @@ class DA3GiantEncoder(nn.Module):
         deep_temporal_causal_mask: bool = False,
         profile: Optional[Dict[str, object]] = None,
         dino_tokens: Optional[torch.Tensor] = None,
+        dual_state_attention: str = "full",
     ) -> Dict[str, torch.Tensor]:
         """Resume DA3 from shallow visual tokens plus supplied action seeds.
 
@@ -1528,6 +1529,10 @@ class DA3GiantEncoder(nn.Module):
         """
         _cuda_profile_mark(profile, "deep_start")
         b, steps, v_count, n_visual, dim = visual_tokens.shape
+        if dual_state_attention not in {"full", "action_bridge"}:
+            raise ValueError(f"Unknown dual_state_attention: {dual_state_attention}")
+        if dual_state_attention == "action_bridge" and (steps != 1 or v_count != 2):
+            raise ValueError("action_bridge requires H=1 and two state views")
         if dim != self.embed_dim:
             raise ValueError(f"Expected visual dim {self.embed_dim}, got {dim}.")
         if action_tokens.shape != (b, steps, v_count, dim):
@@ -1559,6 +1564,7 @@ class DA3GiantEncoder(nn.Module):
                     step_valid_mask=None,
                     deep_temporal_causal_mask=deep_temporal_causal_mask,
                     dino_tokens=None if dino_tokens is None else dino_tokens.index_select(0, batch_indices)[:, :sub_steps],
+                    dual_state_attention=dual_state_attention,
                 )
                 compact_result = self._scatter_compact_deep_result(
                     compact_result,
@@ -1689,7 +1695,15 @@ class DA3GiantEncoder(nn.Module):
             else:
                 attn_type, pos_emb = "local", l_pos
             use_flex = attn_type == "global" and global_block_mask is not None
-            if use_checkpoint and current_x.requires_grad:
+            if dual_state_attention == "action_bridge":
+                from robot.modeling.dual_geometry_attention import run_dual_masked_block
+                # Also mask LOCAL layers: otherwise current patches can read
+                # their local action token and leak future information back.
+                def directed_block(x, block=blk, pos=pos_emb, kind=attn_type):
+                    return run_dual_masked_block(x, block, pos, global_attention=kind == "global")
+                current_x = (torch_checkpoint(directed_block, current_x, use_reentrant=False)
+                             if use_checkpoint and current_x.requires_grad else directed_block(current_x))
+            elif use_checkpoint and current_x.requires_grad:
                 if use_flex:
                     current_x = torch_checkpoint(
                         lambda x, block=blk, pos=pos_emb, mask=global_block_mask: self._run_deep_global_block_flex(
@@ -1910,6 +1924,7 @@ class DA3GiantEncoder(nn.Module):
         deep_temporal_causal_mask: bool = False,
         profile: Optional[Dict[str, object]] = None,
         dino_tokens: Optional[torch.Tensor] = None,
+        dual_state_attention: str = "full",
     ) -> Dict[str, torch.Tensor]:
         return self._propagate_shallow_with_actions_impl(
             visual_tokens,
@@ -1922,6 +1937,7 @@ class DA3GiantEncoder(nn.Module):
             deep_temporal_causal_mask=deep_temporal_causal_mask,
             profile=profile,
             dino_tokens=dino_tokens,
+            dual_state_attention=dual_state_attention,
         )
 
     def _propagate_and_decode_impl(

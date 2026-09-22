@@ -40,7 +40,7 @@ STAGE2_WARMUP_STEPS="${STAGE2_WARMUP_STEPS:-500}"
 STAGE2_MIN_LR_RATIO="${STAGE2_MIN_LR_RATIO:-0.05}"
 STAGE1_EPOCHS="${STAGE1_EPOCHS:-5}"
 STAGE2_EPOCHS="${STAGE2_EPOCHS:-5}"
-RUN_IDS="${RUN_IDS:-B0,S1COS,P1,L1,D1,D2,D1LOG,W3,W5,W10,H0,HB,F3,F7,F10,M1,C1_PL,C2_D2HB,C3_W3HB,C4_F3W3,C5_F10HB,CA1_HB}"
+RUN_IDS="${RUN_IDS:-B0,S1COS,P1,L1,D1,D2,D1LOG,W3,W5,W10,H0,HB,F3,F7,F10,M1,C1_PL,C2_D2HB,C3_W3HB,C4_F3W3,C5_F10HB,CA1_HB,HC_DIRECT,HE_DUALPRED,HF_BRIDGE}"
 RUN_STAGE2="${RUN_STAGE2:-1}"
 RUN_LABEL="${RUN_LABEL:-}"
 EXTRA_OVERRIDES_FILE="${EXTRA_OVERRIDES_FILE:-}"
@@ -137,10 +137,19 @@ variant_overrides() {
       printf '%s\n' "loss.depth_semantic_weight=${id#W}"
       ;;
     H0)
-      printf '%s\n' 'loss.depth_target_mode=current'
+      printf '%s\n' 'loss.depth_target_mode=current' 'model.geometry_architecture=current_prediction'
       ;;
     HB)
-      printf '%s\n' 'loss.depth_target_mode=both'
+      printf '%s\n' 'loss.depth_target_mode=both' 'model.geometry_architecture=dual_observed'
+      ;;
+    HC_DIRECT)
+      printf '%s\n' 'loss.depth_target_mode=current' 'model.geometry_architecture=direct_current' 'loss.feature_weight=0.0'
+      ;;
+    HE_DUALPRED)
+      printf '%s\n' 'loss.depth_target_mode=both' 'model.geometry_architecture=dual_predicted'
+      ;;
+    HF_BRIDGE)
+      printf '%s\n' 'loss.depth_target_mode=both' 'model.geometry_architecture=dual_action_bridge'
       ;;
     CA1_HB)
       printf '%s\n' 'loss.depth_target_mode=both' 'model.current_geometry_action_enabled=true'
@@ -168,6 +177,7 @@ variant_overrides() {
         'model.language_len=77'
       ;;
     C2_D2HB)
+      printf '%s\n' 'model.geometry_architecture=dual_observed'
       # Shape/scale separation may be most useful when current geometry also
       # anchors the harder endpoint-depth prediction.
       printf '%s\n' \
@@ -175,6 +185,7 @@ variant_overrides() {
         'loss.depth_target_mode=both'
       ;;
     C3_W3HB)
+      printf '%s\n' 'model.geometry_architecture=dual_observed'
       # Mild dynamic emphasis plus current/future supervision tests whether
       # sparse-object blur is a weighting problem after stabilizing geometry.
       printf '%s\n' \
@@ -192,6 +203,7 @@ variant_overrides() {
         'loss.depth_semantic_weight=3'
       ;;
     C5_F10HB)
+      printf '%s\n' 'model.geometry_architecture=dual_observed'
       # At the deliberately hard long horizon, current-depth supervision tests
       # whether an observation reconstruction anchor prevents future blur.
       printf '%s\n' \
@@ -218,9 +230,19 @@ latest_checkpoint() {
     2>/dev/null | sort -V | tail -n 1
 }
 
+output_id_for() {
+  local id="$1" label="${RUN_LABEL:-$1}"
+  # Revised meanings must not reuse old loss-only checkpoints or _SUCCESS.
+  case "${id}" in
+    H0|HB|C2_D2HB|C3_W3HB|C5_F10HB) label="${label}_g2" ;;
+  esac
+  printf '%s\n' "${label}"
+}
+
 run_stage() {
   local id="$1" stage="$2" init_checkpoint="$3"
-  local output_id="${RUN_LABEL:-${id}}"
+  local output_id
+  output_id="$(output_id_for "${id}")"
   local out="${OUTPUT_ROOT}/${output_id}/${stage}"
   mkdir -p "${out}"
   if [[ -s "${out}/_SUCCESS" ]]; then
@@ -332,7 +354,7 @@ for id in "${IDS[@]}"; do
   [[ -n "${id}" ]] || continue
   run_stage "${id}" stage1 ""
   if [[ "${RUN_STAGE2}" == "1" ]]; then
-    output_id="${RUN_LABEL:-${id}}"
+    output_id="$(output_id_for "${id}")"
     stage1_ckpt="$(<"${OUTPUT_ROOT}/${output_id}/stage1/_SUCCESS")"
     run_stage "${id}" stage2_stop "${stage1_ckpt}"
   fi

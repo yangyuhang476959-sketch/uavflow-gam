@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=uavflow-gam
-#SBATCH --array=0-21%22
+#SBATCH --array=0-24%25
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
