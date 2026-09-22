@@ -37,7 +37,8 @@ split is for ablation/model selection. Retrain the selected configuration on
 Training endpoint rules are:
 
 - first normal episode window: five additional copies;
-- terminal same-frame zero-action window: five additional copies;
+- terminal same-frame zero-action window: zero extra copies in Stage 1,
+  five additional copies in Stage 2 only;
 - append K copies of final frame `FN` when `future/chunk=K`;
 - deterministically up- or down-sample the resulting partial/full absorbing
   pool to exactly 20% of training tickets;

@@ -39,7 +39,7 @@ dataset:
   endpoint_repeat_count: 0
   endpoint_self_pair_count: 0
   endpoint_self_pair_start_count: 0
-  endpoint_self_pair_end_count: 5
+  endpoint_self_pair_end_count: 0
   endpoint_terminal_window_repeat_count: 0
   endpoint_absorbing_window_count: 1
   endpoint_absorbing_max_starts: 5

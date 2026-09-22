@@ -237,7 +237,8 @@ output_id_for() {
     CA1_HB) label="${label}_layerca" ;;
     H0|HB|C2_D2HB|C3_W3HB|C5_F10HB) label="${label}_g2" ;;
   esac
-  printf '%s\n' "${label}"
+  # Changed training distribution: never resume the old Stage-1 end+5 runs.
+  printf '%s\n' "${label}_s1end0_s2end5"
 }
 
 run_stage() {
@@ -271,6 +272,7 @@ run_stage() {
   if [[ "${stage}" == "stage2_stop" ]]; then
     checkpoint_args+=(--init-checkpoint "${init_checkpoint}")
     stage_args+=(
+      --set 'dataset.endpoint_self_pair_end_count=5'
       --set 'model.stop_head_enabled=true'
       --set 'model.stop_head_mode=legacy_action_token'
       --set 'loss.stop_weight=1.0'
@@ -290,6 +292,7 @@ run_stage() {
       stage1_min_ratio=0.01
     fi
     stage_args+=(
+      --set 'dataset.endpoint_self_pair_end_count=0'
       --set "training.lr_schedule=${stage1_schedule}"
       --set "training.warmup_steps=${stage1_warmup}"
       --set "training.min_lr_ratio=${stage1_min_ratio}"

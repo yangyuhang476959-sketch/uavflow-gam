@@ -19,7 +19,7 @@ the row inherits every setting from `B0`.
 | LR | constant: deep 5e-5, Predictor 1e-5, Action head 5e-4 |
 | Stage 1 | policy + feature + depth, 5 epochs |
 | Stage 2 | joint main losses + action-hidden Stop, 5 epochs; cosine with 500-step warmup |
-| Data | fixed stratified 95/5 split; start+5, end+5, append K terminal FN frames |
+| Data | fixed stratified 95/5 split; start+5 in both stages, end+0 in Stage 1 / end+5 in Stage 2; absorbing balanced to 20% |
 
 ## Runs
 
@@ -102,7 +102,7 @@ comparison.
 The fixed endpoint weighting added on top is:
 
 - five extra first-window samples per episode;
-- five extra terminal same-frame zero-action samples per episode;
+- zero extra terminal same-frame samples in Stage 1; five zero-action copies per episode in Stage 2 only;
 - one K-dependent absorbing candidate pass, bidirectionally balanced to 20%
   (`endpoint_absorbing_window_count=1`,
   `endpoint_absorbing_train_fraction=0.20`).
