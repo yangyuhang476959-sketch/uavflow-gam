@@ -272,6 +272,7 @@ def main() -> None:
     torch.manual_seed(model_init_seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(model_init_seed)
+    from experiments.uavflow_predictor_idm.current_geometry import load_current_geometry_read
     model = UAVFlowPredictorIDM(
         da3=da3, idm=idm, action_dim=4,
         action_chunk_size=int(cfg.model.get("action_chunk_size", 1)),
@@ -301,6 +302,7 @@ def main() -> None:
         direct_action_enabled=bool(cfg.model.get("direct_action_enabled", False)),
         compute_idm_branch=bool(cfg.model.get("compute_idm_branch", True)),
         deep_action_enabled=bool(cfg.model.get("deep_action_enabled", False)),
+        current_geometry_action_enabled=bool(cfg.model.get("current_geometry_action_enabled", False)),
         train_deep_backbone=train_deep_parameters,
         deep_train_start_block=int(
             deep_lora_cfg.get("start_block", cfg.model.get("deep_train_start_block", da3.out_layers[0]))
@@ -327,6 +329,7 @@ def main() -> None:
     raw_model = model
     if args.init_checkpoint:
         init_ckpt = torch.load(args.init_checkpoint, map_location="cpu", weights_only=False)
+        load_current_geometry_read(raw_model, init_ckpt, required=raw_model.current_geometry_action_enabled)
         raw_model.predictor.load_state_dict(init_ckpt["predictor"], strict=True)
         if "direct_action_head" in init_ckpt:
             raw_model.direct_action_head.load_state_dict(init_ckpt["direct_action_head"], strict=True)
@@ -488,6 +491,7 @@ def main() -> None:
             "model.direct_action_enabled",
             "model.compute_idm_branch",
             "model.deep_action_enabled",
+            "model.current_geometry_action_enabled",
             "model.relative_pose_head_enabled",
             "loss.depth_scale_mode",
             "model.train_deep_backbone",
@@ -527,6 +531,9 @@ def main() -> None:
         for path in compatibility_paths:
             saved_value = nested_get(saved_cfg, path)
             current_value = nested_get(current_cfg, path)
+            if path == "model.current_geometry_action_enabled":
+                # Checkpoints predating CA1_HB omit this disabled-by-default flag.
+                saved_value, current_value = bool(saved_value), bool(current_value)
             if saved_value != current_value:
                 mismatches.append(f"{path}: checkpoint={saved_value!r}, current={current_value!r}")
         saved_world = ckpt.get("world_size")
@@ -545,6 +552,7 @@ def main() -> None:
                 + "\n  ".join(mismatches)
             )
         raw_model.predictor.load_state_dict(ckpt["predictor"])
+        load_current_geometry_read(raw_model, ckpt, required=True)
         raw_model.residual_gate_logit.data.copy_(ckpt["residual_gate_logit"])
         if "missing_action_embed" in ckpt:
             raw_model.missing_action_embed.data.copy_(ckpt["missing_action_embed"])
@@ -794,6 +802,10 @@ def main() -> None:
             "step": saved_step, "epoch": saved_epoch, "batch": saved_batch,
             "world_size": world, "train_size": len(train_set),
             "predictor": raw_model.predictor.state_dict(),
+            "current_geometry_read": (
+                raw_model.current_geometry_read.state_dict()
+                if raw_model.current_geometry_read is not None else None
+            ),
             "residual_gate_logit": raw_model.residual_gate_logit.detach().cpu(),
             "missing_action_embed": raw_model.missing_action_embed.detach().cpu(),
             "missing_pose_embed": raw_model.missing_pose_embed.detach().cpu(),

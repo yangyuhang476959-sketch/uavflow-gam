@@ -10,7 +10,7 @@ cp server.env.example server.env
 
 Defaults are relative to the cloned repository. Edit `server.env` only when the
 server uses shared mounts, or to select `SCHEDULER`. Then run everything,
-including the 21 production submissions:
+including the 22 production submissions:
 
 ```bash
 bash scripts/uavflow_handoff.sh all

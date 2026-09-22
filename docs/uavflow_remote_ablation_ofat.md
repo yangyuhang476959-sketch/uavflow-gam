@@ -46,14 +46,15 @@ the row inherits every setting from `B0`.
 | C3_W3HB | W3 + HB: dynamic multiplier 3 and current+future depth | Does mild dynamic emphasis help after geometry is stabilized? |
 | C4_F3W3 | F3 + W3: K=3 and dynamic multiplier 3 | Is near-future dynamic blur primarily horizon- or weight-limited? |
 | C5_F10HB | F10 + HB: K=10 and current+future depth | Can current geometry regularize the deliberately hard long horizon? |
+| CA1_HB | HB + one final action-to-current-deep cross-attention | Does directly reading current geometry help beyond its auxiliary loss? |
 
-Total: 21 Stage-1 runs: 16 clean main-effect/control rows plus five targeted
+Total: 22 Stage-1 runs: 16 clean main-effect/control rows plus six targeted
 interaction rows. Each automatically launches its matching five-epoch
 joint Stop Stage 2 from the selected Stage-1 checkpoint.
 
 `D1LOG` uses a normalized log clamp of `0.001`, which is `0.1 m` under
 the fixed `100 m` metric divisor. `W10` is retained as the strong dynamic-
-weight stress test, so the default compact matrix contains 21 runs.
+weight stress test, so the default compact matrix contains 22 runs.
 
 Do not confuse its per-pixel log-depth term with the `D2` log-scale loss:
 
@@ -70,7 +71,7 @@ H=1, K=5 this is `[F(t), F(t+5)]`; `current`, `future`, and `both` targets all
 use that same scale. `both` averages its two target losses rather than summing
 them, so it does not double the scale-loss coefficient.
 
-The 21-row compact matrix contains one clean baseline scheduler pair but does not
+The 22-row compact matrix contains one clean baseline scheduler pair but does not
 duplicate every scientific row under both schedules. The separate
 compute-rich launcher therefore uses a deduplicated 64-cell design containing
 all main effects and targeted two-factor/hard-setting interactions, without a

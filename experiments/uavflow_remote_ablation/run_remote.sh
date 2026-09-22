@@ -40,7 +40,7 @@ STAGE2_WARMUP_STEPS="${STAGE2_WARMUP_STEPS:-500}"
 STAGE2_MIN_LR_RATIO="${STAGE2_MIN_LR_RATIO:-0.05}"
 STAGE1_EPOCHS="${STAGE1_EPOCHS:-5}"
 STAGE2_EPOCHS="${STAGE2_EPOCHS:-5}"
-RUN_IDS="${RUN_IDS:-B0,S1COS,P1,L1,D1,D2,D1LOG,W3,W5,W10,H0,HB,F3,F7,F10,M1,C1_PL,C2_D2HB,C3_W3HB,C4_F3W3,C5_F10HB}"
+RUN_IDS="${RUN_IDS:-B0,S1COS,P1,L1,D1,D2,D1LOG,W3,W5,W10,H0,HB,F3,F7,F10,M1,C1_PL,C2_D2HB,C3_W3HB,C4_F3W3,C5_F10HB,CA1_HB}"
 RUN_STAGE2="${RUN_STAGE2:-1}"
 RUN_LABEL="${RUN_LABEL:-}"
 EXTRA_OVERRIDES_FILE="${EXTRA_OVERRIDES_FILE:-}"
@@ -141,6 +141,9 @@ variant_overrides() {
       ;;
     HB)
       printf '%s\n' 'loss.depth_target_mode=both'
+      ;;
+    CA1_HB)
+      printf '%s\n' 'loss.depth_target_mode=both' 'model.current_geometry_action_enabled=true'
       ;;
     F3|F7|F10)
       local k="${id#F}"

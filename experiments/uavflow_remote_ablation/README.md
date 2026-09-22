@@ -1,6 +1,6 @@
 # UAV-Flow remote ablation runner
 
-This directory runs the compact 21-experiment matrix described in
+This directory runs the compact 22-experiment matrix described in
 `docs/uavflow_remote_ablation_{ofat,detailed}.md`.
 
 ## Temporal contract
@@ -81,12 +81,12 @@ matrix is a single command:
 bash experiments/uavflow_remote_ablation/run_server.sh
 ```
 
-The command above is sequential. To run the 21 cells concurrently, use the
+The command above is sequential. To run the 22 cells concurrently, use the
 launcher matching the cluster scheduler; all launchers share the exact same
 cell enumeration in `compact_cells.sh`:
 
 ```bash
-# Slurm (21 array jobs, four GPUs each)
+# Slurm (22 array jobs, four GPUs each)
 sbatch experiments/uavflow_remote_ablation/submit_slurm_compact.sh
 
 # PBS Pro/OpenPBS (inherit the exported dataset/checkpoint paths)
@@ -101,8 +101,8 @@ bash experiments/uavflow_remote_ablation/run_local_gpu_pool.sh
 ```
 
 Each array cell invokes `run_compact_cell.sh INDEX`, sets exactly one
-`RUN_IDS`, and preserves global batch 24. On a 100-GPU allocation, 21 cells use
-84 GPUs in one wave. Cluster-specific queue, account, wall-time and memory
+`RUN_IDS`, and preserves global batch 24. On a 100-GPU allocation, 22 cells use
+88 GPUs in one wave. Cluster-specific queue, account, wall-time and memory
 directives may be added to the scheduler header without changing training.
 
 Stage 1 defaults to the earlier UAV runs' constant LR schedule. To retain the

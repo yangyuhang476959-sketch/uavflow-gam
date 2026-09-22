@@ -62,6 +62,7 @@ dataset:
   gt_depth_max_meters: 650.0
 
 model:
+  current_geometry_action_enabled: false
   context_lengths: [1]
   context_weights: [1.0]
   rollout_steps: 1

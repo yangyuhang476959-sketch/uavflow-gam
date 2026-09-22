@@ -14,6 +14,7 @@ from torch import nn
 from robot.modeling.action_head_v2 import ActionHeadV2
 from robot.modeling.future_predictor import GAMFuturePredictor
 from .idm import build_frozen_idm  # Backward-compatible re-export.
+from .current_geometry import CurrentGeometryRead
 
 
 class PatchMotionStopHead(nn.Module):
@@ -500,6 +501,7 @@ class UAVFlowPredictorIDM(nn.Module):
         residual_prediction: bool = True,
         residual_gate_init: float = 0.10,
         gradient_checkpointing: bool = True,
+        current_geometry_action_enabled: bool = False,
     ) -> None:
         super().__init__()
         self.da3 = da3
@@ -534,6 +536,9 @@ class UAVFlowPredictorIDM(nn.Module):
         self.direct_action_enabled = bool(direct_action_enabled)
         self.compute_idm_branch = bool(compute_idm_branch)
         self.deep_action_enabled = bool(deep_action_enabled)
+        self.current_geometry_action_enabled = bool(current_geometry_action_enabled)
+        if self.current_geometry_action_enabled and (not self.deep_action_enabled or self.rollout_steps != 1):
+            raise ValueError("Current geometry action read requires deep_action_enabled and rollout_steps=1")
         self.train_deep_backbone = bool(train_deep_backbone)
         self.deep_train_start_block = int(deep_train_start_block)
         self.depth_decode_enabled = bool(depth_decode_enabled)
@@ -711,6 +716,11 @@ class UAVFlowPredictorIDM(nn.Module):
         self.residual_gate_logit = nn.Parameter(
             torch.tensor(float(torch.logit(torch.tensor(gate)).item())),
             requires_grad=self.residual_prediction,
+        )
+        # Construct last: disabled ablations retain their previous RNG sequence.
+        self.current_geometry_read = (
+            CurrentGeometryRead(int(da3.embed_dim))
+            if self.current_geometry_action_enabled else None
         )
 
     @property
@@ -1005,6 +1015,8 @@ class UAVFlowPredictorIDM(nn.Module):
         force_action_history_missing: bool = False,
         force_pose_history_missing: bool = False,
     ) -> dict[str, object]:
+        if self.current_geometry_action_enabled and observed_shallow.shape[1] != 1:
+            raise ValueError("Current geometry action ablation supports H=1 only (avoid temporal leakage)")
         future, direct_action_tokens = self.rollout_shallow(
             observed_shallow,
             reference_shallow=reference_shallow,
@@ -1019,6 +1031,7 @@ class UAVFlowPredictorIDM(nn.Module):
             force_pose_history_missing=force_pose_history_missing,
         )
         deep_joint_features = None
+        current_geometry_features = None
         refined_action_tokens = None
         if self.deep_action_enabled or self.stop_head_enabled:
             if direct_action_tokens is None:
@@ -1039,6 +1052,14 @@ class UAVFlowPredictorIDM(nn.Module):
                 raise RuntimeError("DA3 joint propagation did not return action_tokens.")
             b, steps, views = direct_action_tokens.shape[:3]
             refined_action_tokens = deep_tokens.reshape(b, steps, views, -1)
+            if self.current_geometry_read is not None:
+                current_geometry_features = self.da3.propagate_shallow_visual_slots_grad(
+                    observed_shallow,
+                    gradient_checkpointing=self.deep_gradient_checkpointing,
+                )
+                prefix = 1 + int(getattr(self.da3, "num_register_tokens", 0))
+                patches = current_geometry_features["deep_levels"][-1][..., prefix:, :]
+                refined_action_tokens = self.current_geometry_read(refined_action_tokens, patches)
         direct_actions_norm = None
         if self.direct_action_enabled:
             if direct_action_tokens is None:
@@ -1134,6 +1155,7 @@ class UAVFlowPredictorIDM(nn.Module):
             "idm_actions_norm": idm_actions_norm,
             "all_window_actions_norm": all_window_actions_norm,
             "deep_joint_features": deep_joint_features,
+            "current_geometry_features": current_geometry_features,
             "stop_logits": stop_logits,
             "relative_pose": relative_pose,
             "depth_log_scale": depth_log_scale,

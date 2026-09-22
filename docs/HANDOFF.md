@@ -1,6 +1,6 @@
 # UAVFlow-GAM handoff
 
-This is the shortest path from a clean server to the compact 21-cell
+This is the shortest path from a clean server to the compact 22-cell
 experiment. For rationale and exact ablation semantics, read
 `REMOTE_TRAINING.md` and `uavflow_remote_ablation_ofat.md`.
 
@@ -77,7 +77,7 @@ trains the Stop head for five more epochs.
 Use exactly one launcher matching the cluster:
 
 ```bash
-# Slurm: 21 independent four-GPU jobs
+# Slurm: 22 independent four-GPU jobs
 sbatch experiments/uavflow_remote_ablation/submit_slurm_compact.sh
 
 # PBS Pro / OpenPBS
@@ -93,13 +93,14 @@ bash experiments/uavflow_remote_ablation/run_local_gpu_pool.sh
 
 Cluster-specific partition/account/wall-time directives belong in the header
 of the selected scheduler script. The experiment enumeration must remain in
-`compact_cells.sh` so all schedulers use the same 21 cells.
+`compact_cells.sh` so all schedulers use the same 22 cells.
 
 To run one cell manually:
 
 ```bash
 bash experiments/uavflow_remote_ablation/run_compact_cell.sh 0  # B0
 bash experiments/uavflow_remote_ablation/run_compact_cell.sh 20 # C5_F10HB
+bash experiments/uavflow_remote_ablation/run_compact_cell.sh 21 # CA1_HB (current geometry action read)
 ```
 
 ## 6. Resume and inspect

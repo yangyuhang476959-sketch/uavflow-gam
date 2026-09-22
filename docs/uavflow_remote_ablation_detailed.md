@@ -204,7 +204,7 @@ interactions:
 - `C4_F3W3`: K=3 + dynamic multiplier 3;
 - `C5_F10HB`: K=10 + current/future depth.
 
-This gives 21 Stage-1 runs, each followed by its matching Stage-2 joint Stop
+With the additional CA1_HB current-geometry action read control, this gives 22 Stage-1 runs, each followed by its matching Stage-2 joint Stop
 run. The five interactions were selected to resolve specific ambiguities in
 the main effects; this is not a Cartesian product.
 

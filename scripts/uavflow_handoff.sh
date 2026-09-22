@@ -128,7 +128,7 @@ Actions:
   audit     Verify all required files and episode counts
   smoke     Run a tiny two-GPU installation test
   prepare   setup + download + audit + smoke
-  submit    audit, then submit the 21-cell production matrix
+  submit    audit, then submit the 22-cell production matrix
   all       prepare + submit
   status    Show experiment progress
 EOF

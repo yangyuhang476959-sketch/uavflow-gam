@@ -1206,12 +1206,16 @@ def forward_batch(
                     )
                     losses.append(_ue_loss(future_pred_depth, future_start))
                 if target_mode in {"current", "both"}:
-                    current_features = da3.propagate_shallow_visual_slots_grad(
-                        observed,
-                        gradient_checkpointing=bool(
-                            getattr(model_ref, "deep_gradient_checkpointing", False)
-                        ),
-                    )
+                    # CA1_HB already needs this pass for action. Reuse its graph
+                    # for current depth rather than executing DA3 a third time.
+                    current_features = output.get("current_geometry_features")
+                    if current_features is None:
+                        current_features = da3.propagate_shallow_visual_slots_grad(
+                            observed,
+                            gradient_checkpointing=bool(
+                                getattr(model_ref, "deep_gradient_checkpointing", False)
+                            ),
+                        )
                     current_pred_depth = _decode_visual_depth_levels(
                         da3,
                         current_features["deep_levels"],
