@@ -24,11 +24,15 @@ class FakeDA3(nn.Module):
         self.current_calls = 0
 
     def propagate_shallow_with_actions_grad(self, future, action, **kwargs):
+        if "current_geometry_read" in kwargs:
+            for patches in kwargs["current_geometry_by_layer"].values():
+                action = kwargs["current_geometry_read"](action, patches)
         return {"action_tokens": action * self.scale}
 
     def propagate_shallow_visual_slots_grad(self, observed, **kwargs):
         self.current_calls += 1
-        return {"deep_levels": [torch.cat([observed, observed], -1) * self.scale]}
+        level = torch.cat([observed, observed], -1) * self.scale
+        return {"deep_levels": [level], "layer_patches": {0: level[..., 3:, :], 1: level[..., 3:, :]}}
 
 
 def model(enabled):
@@ -50,6 +54,22 @@ class Tests(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(42)
         torch.set_num_threads(2)
+
+    def test_per_layer_routing_and_checkpoint_rejection(self):
+        net = model(True)
+        net.current_geometry_read_mode = "per_layer"
+        x = torch.randn(2, 1, 1, 7, 16, requires_grad=True)
+        out = net(x, reference_shallow=x, lang_feats=torch.zeros(2, 2, 16), lang_padding_mask=None)
+        self.assertEqual(net.da3.current_calls, 1)
+        self.assertIsNotNone(out["current_geometry_features"])
+        out["actions_norm"].square().mean().backward()
+        self.assertGreater(net.current_geometry_read.gate.grad.abs().item(), 0)
+        with self.assertRaisesRegex(ValueError, "read mode changed"):
+            load_current_geometry_read(net, {"current_geometry_read": net.current_geometry_read.state_dict()}, required=True)
+        load_current_geometry_read(net, {
+            "current_geometry_read_mode": "per_layer",
+            "current_geometry_read": net.current_geometry_read.state_dict(),
+        }, required=True)
 
     def test_read_shape_gradients_and_identity(self):
         read = CurrentGeometryRead(16, width=32, heads=4)

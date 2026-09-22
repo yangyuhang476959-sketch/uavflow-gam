@@ -304,6 +304,7 @@ def main() -> None:
         compute_idm_branch=bool(cfg.model.get("compute_idm_branch", True)),
         deep_action_enabled=bool(cfg.model.get("deep_action_enabled", False)),
         current_geometry_action_enabled=bool(cfg.model.get("current_geometry_action_enabled", False)),
+        current_geometry_read_mode=str(cfg.model.get("current_geometry_read_mode", "terminal")),
         geometry_architecture=str(cfg.model.get("geometry_architecture", "legacy")),
         train_deep_backbone=train_deep_parameters,
         deep_train_start_block=int(
@@ -495,6 +496,7 @@ def main() -> None:
             "model.compute_idm_branch",
             "model.deep_action_enabled",
             "model.current_geometry_action_enabled",
+            "model.current_geometry_read_mode",
             "model.geometry_architecture",
             "model.relative_pose_head_enabled",
             "loss.depth_scale_mode",
@@ -540,6 +542,8 @@ def main() -> None:
                 saved_value, current_value = bool(saved_value), bool(current_value)
             if path == "model.geometry_architecture":
                 saved_value, current_value = saved_value or "legacy", current_value or "legacy"
+            if path == "model.current_geometry_read_mode":
+                saved_value, current_value = saved_value or "terminal", current_value or "terminal"
             if saved_value != current_value:
                 mismatches.append(f"{path}: checkpoint={saved_value!r}, current={current_value!r}")
         saved_world = ckpt.get("world_size")
@@ -810,6 +814,7 @@ def main() -> None:
             "world_size": world, "train_size": len(train_set),
             "predictor": raw_model.predictor.state_dict(),
             "geometry_architecture_state": architecture_state(raw_model),
+            "current_geometry_read_mode": raw_model.current_geometry_read_mode,
             "current_geometry_read": (
                 raw_model.current_geometry_read.state_dict()
                 if raw_model.current_geometry_read is not None else None

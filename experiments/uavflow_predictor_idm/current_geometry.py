@@ -36,6 +36,9 @@ def load_current_geometry_read(model, checkpoint, *, required):
     """Used for exact resume and Stage-1 -> Stage-2 transfer."""
     if model.current_geometry_read is None:
         return
+    saved_mode = checkpoint.get("current_geometry_read_mode", "terminal")
+    if saved_mode != model.current_geometry_read_mode:
+        raise ValueError("Current-geometry read mode changed; do not resume terminal CA as per-layer CA")
     state = checkpoint.get("current_geometry_read")
     if state is None:
         if required:

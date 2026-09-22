@@ -152,7 +152,7 @@ variant_overrides() {
       printf '%s\n' 'loss.depth_target_mode=both' 'model.geometry_architecture=dual_action_bridge'
       ;;
     CA1_HB)
-      printf '%s\n' 'loss.depth_target_mode=both' 'model.current_geometry_action_enabled=true'
+      printf '%s\n' 'loss.depth_target_mode=both' 'model.current_geometry_action_enabled=true' 'model.current_geometry_read_mode=per_layer'
       ;;
     F3|F7|F10)
       local k="${id#F}"
@@ -234,6 +234,7 @@ output_id_for() {
   local id="$1" label="${RUN_LABEL:-$1}"
   # Revised meanings must not reuse old loss-only checkpoints or _SUCCESS.
   case "${id}" in
+    CA1_HB) label="${label}_layerca" ;;
     H0|HB|C2_D2HB|C3_W3HB|C5_F10HB) label="${label}_g2" ;;
   esac
   printf '%s\n' "${label}"

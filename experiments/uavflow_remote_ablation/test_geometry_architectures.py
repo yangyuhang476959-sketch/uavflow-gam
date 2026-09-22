@@ -173,6 +173,46 @@ class Tests(unittest.TestCase):
         self.assertTrue(torch.equal(local[0], m[:n, :n]))
         self.assertTrue(torch.equal(local[1], m[n:, n:]))
 
+    def test_per_layer_ca_affects_next_visual_layer(self):
+        from robot.modeling.da3_giant_encoder import DA3GiantEncoder
+        from experiments.uavflow_predictor_idm.current_geometry import CurrentGeometryRead
+        trans = nn.Module()
+        trans.blocks = nn.ModuleList([nn.Linear(8, 8) for _ in range(4)])
+        trans.num_register_tokens, trans.alt_start, trans.rope_start = 2, 0, 0
+        trans.rope, trans.cat_token = None, True
+        trans.norm = nn.LayerNorm(8)
+        trans._prepare_rope = lambda *args: (None, None)
+        # Deterministic small token mixer exercising the actual encoder loops.
+        trans.process_attention = lambda x, blk, **kw: x + blk(x.mean(2, keepdim=True))
+        backbone = nn.Module()
+        backbone.pretrained = trans
+        enc = types.SimpleNamespace(
+            backbone=backbone, embed_dim=8, PATCH_SIZE=14, temporal_embed=None,
+            out_layers=[0, 1, 2, 3], _deep_prefix_lengths=lambda **kw: None,
+            _build_camera_tokens=lambda b, v, dev, dtype: torch.zeros(b, v, 8, device=dev, dtype=dtype),
+        )
+        current = torch.randn(2, 1, 1, 7, 8, requires_grad=True)
+        visual = torch.randn_like(current, requires_grad=True)
+        action = torch.randn(2, 1, 1, 8, requires_grad=True)
+        memories = DA3GiantEncoder.propagate_shallow_visual_slots_grad(
+            enc, current, gradient_checkpointing=True, return_layer_patches=True)
+        self.assertEqual(set(memories["layer_patches"]), {0, 1, 2, 3})
+        read = CurrentGeometryRead(8, width=16, heads=2)
+        args = dict(decode_visuals=False, return_multi_level=True,
+                    current_geometry_by_layer=memories["layer_patches"], current_geometry_read=read)
+        run = DA3GiantEncoder._propagate_shallow_with_actions_impl
+        plain = run(enc, visual, action, **args)
+        ckpt = run(enc, visual, action, gradient_checkpointing=True, **args)
+        torch.testing.assert_close(plain["action_tokens"], ckpt["action_tokens"])
+        early_grad = torch.autograd.grad(ckpt["level_feats"][0][0].sum(), current,
+                                         retain_graph=True, allow_unused=True)[0]
+        self.assertTrue(early_grad is None or early_grad.abs().sum() == 0)
+        late_loss = ckpt["level_feats"][-1][0].square().mean()
+        late_grad = torch.autograd.grad(late_loss, current, retain_graph=True)[0]
+        self.assertGreater(late_grad.abs().sum().item(), 0)
+        plain_grad = torch.autograd.grad(plain["level_feats"][-1][0].square().mean(), current)[0]
+        torch.testing.assert_close(late_grad, plain_grad)
+
     def test_current_never_receives_future_or_actions_across_layers(self):
         block = Block()
         x = torch.randn(2, 2, 5, 8, requires_grad=True)

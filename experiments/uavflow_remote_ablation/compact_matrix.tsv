@@ -20,7 +20,7 @@ C2_D2HB	qwen	off	scale_separated	both	1	5	1	constant	scale separation by depth t
 C3_W3HB	qwen	off	relative	both	3	5	1	constant	dynamic emphasis by depth target interaction	dual_observed
 C4_F3W3	qwen	off	relative	future	3	3	1	constant	short horizon by dynamic emphasis interaction	legacy
 C5_F10HB	qwen	off	relative	both	1	10	1	constant	long horizon by current-depth anchor interaction	dual_observed
-CA1_HB	qwen	off	relative	both	1	5	1	constant	C: legacy separate current/future passes with terminal action CA	legacy
+CA1_HB	qwen	off	relative	both	1	5	1	constant	C: separate current/future passes with shared per-layer action CA	legacy
 HC_DIRECT	qwen	off	relative	current	1	5	1	constant	B: bypass causal Predictor, retain reference/language action adapter	direct_current
 HE_DUALPRED	qwen	off	relative	both	1	5	1	constant	E: shared Predictor reconstructs current and predicts future; joint decode	dual_predicted
 HF_BRIDGE	qwen	off	relative	both	1	5	1	constant	F: observed current read only by actions; future-action bidirectional	dual_action_bridge

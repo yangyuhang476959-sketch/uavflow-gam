@@ -64,6 +64,7 @@ dataset:
 model:
   geometry_architecture: legacy
   current_geometry_action_enabled: false
+  current_geometry_read_mode: terminal
   context_lengths: [1]
   context_weights: [1.0]
   rollout_steps: 1

@@ -505,6 +505,7 @@ class UAVFlowPredictorIDM(nn.Module):
         residual_gate_init: float = 0.10,
         gradient_checkpointing: bool = True,
         current_geometry_action_enabled: bool = False,
+        current_geometry_read_mode: str = "terminal",
         geometry_architecture: str = "legacy",
     ) -> None:
         super().__init__()
@@ -541,6 +542,9 @@ class UAVFlowPredictorIDM(nn.Module):
         self.compute_idm_branch = bool(compute_idm_branch)
         self.deep_action_enabled = bool(deep_action_enabled)
         self.current_geometry_action_enabled = bool(current_geometry_action_enabled)
+        self.current_geometry_read_mode = str(current_geometry_read_mode)
+        if self.current_geometry_read_mode not in {"terminal", "per_layer"}:
+            raise ValueError("current_geometry_read_mode must be terminal or per_layer")
         self.geometry_architecture = str(geometry_architecture)
         if self.geometry_architecture not in GEOMETRY_ARCHITECTURES:
             raise ValueError(f"Unknown geometry_architecture={self.geometry_architecture}")
@@ -1102,6 +1106,15 @@ class UAVFlowPredictorIDM(nn.Module):
             deep_visuals = future
             deep_actions = direct_action_tokens
             deep_kwargs = {}
+            if self.current_geometry_read is not None and self.current_geometry_read_mode == "per_layer":
+                current_geometry_features = self.da3.propagate_shallow_visual_slots_grad(
+                    observed_shallow, gradient_checkpointing=self.deep_gradient_checkpointing,
+                    return_layer_patches=True,
+                )
+                deep_kwargs.update(
+                    current_geometry_by_layer=current_geometry_features["layer_patches"],
+                    current_geometry_read=self.current_geometry_read,
+                )
             if is_dual:
                 current = observed_shallow if predicted_current is None else predicted_current
                 seed = direct_action_tokens if current_action_tokens is None else current_action_tokens
@@ -1131,7 +1144,7 @@ class UAVFlowPredictorIDM(nn.Module):
                 refined_action_tokens = deep_tokens.reshape(b, steps, views, -1)
                 if self.geometry_architecture in {"current_prediction", "direct_current"}:
                     current_depth_output = deep_joint_features
-            if self.current_geometry_read is not None:
+            if self.current_geometry_read is not None and self.current_geometry_read_mode == "terminal":
                 current_geometry_features = self.da3.propagate_shallow_visual_slots_grad(
                     observed_shallow,
                     gradient_checkpointing=self.deep_gradient_checkpointing,

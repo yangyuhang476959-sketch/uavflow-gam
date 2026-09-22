@@ -9,7 +9,7 @@ five-epoch joint Stop stages remain; Stage 2 uses cosine decay.
 |---|---|---|---|
 | A / H0 | Predictor reconstructs current shallow feature | none | Current + action |
 | B / HC_DIRECT | observed shallow, no Predictor execution | none | Current + action |
-| C / CA1_HB | observed shallow | predicted shallow | Separate deep passes; final action reads current patches through CA |
+| C / CA1_HB | observed shallow | predicted shallow | Separate deep passes; after each block action reads matching current patches through shared CA |
 | D / HB | observed shallow | predicted shallow | One full-interaction dual-view deep pass |
 | E / HE_DUALPRED | predicted shallow | predicted shallow | One full-interaction dual-view deep pass |
 | F / HF_BRIDGE | observed shallow | predicted shallow | One masked dual-view deep pass; action bridges views |
@@ -55,6 +55,10 @@ checks architecture. Checkpoints save its mode and new adapter/role weights.
 External inference loaders must pass `model.geometry_architecture` and call
 `load_architecture_state`, plus C's existing `load_current_geometry_read`.
 Training handles both Stage-1/2 transfer and exact resume.
+
+C uses `current_geometry_read_mode=per_layer` and output suffix `_layerca`.
+Old terminal checkpoints cannot silently resume this changed architecture.
+See CURRENT_GEOMETRY_ABLATION.md for per-layer communication details.
 
 Detailed-64 intentionally remains a **legacy loss-target matrix**, not a
 64-cell expansion of A–F: it includes multi-window combinations unsupported

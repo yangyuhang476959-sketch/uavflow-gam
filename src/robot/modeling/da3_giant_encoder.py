@@ -1518,6 +1518,8 @@ class DA3GiantEncoder(nn.Module):
         profile: Optional[Dict[str, object]] = None,
         dino_tokens: Optional[torch.Tensor] = None,
         dual_state_attention: str = "full",
+        current_geometry_by_layer=None,
+        current_geometry_read=None,
     ) -> Dict[str, torch.Tensor]:
         """Resume DA3 from shallow visual tokens plus supplied action seeds.
 
@@ -1529,6 +1531,11 @@ class DA3GiantEncoder(nn.Module):
         """
         _cuda_profile_mark(profile, "deep_start")
         b, steps, v_count, n_visual, dim = visual_tokens.shape
+        if current_geometry_read is not None:
+            if steps != 1 or v_count != 1 or step_valid_mask is not None:
+                raise ValueError("Per-layer current CA requires H=1, V=1, no prefix compaction")
+            if current_geometry_by_layer is None:
+                raise ValueError("Per-layer current CA requires matching layer memories")
         if dual_state_attention not in {"full", "action_bridge"}:
             raise ValueError(f"Unknown dual_state_attention: {dual_state_attention}")
         if dual_state_attention == "action_bridge" and (steps != 1 or v_count != 2):
@@ -1729,6 +1736,17 @@ class DA3GiantEncoder(nn.Module):
                     current_x = trans.process_attention(
                         current_x, blk, attn_type=attn_type, pos=pos_emb
                     )
+            if current_geometry_read is not None:
+                memory = current_geometry_by_layer[i]
+                action_now = current_x[:, :, 1].reshape(b, steps, v_count, dim)
+                action_now = (
+                    torch_checkpoint(current_geometry_read, action_now, memory, use_reentrant=False)
+                    if use_checkpoint else current_geometry_read(action_now, memory)
+                )
+                current_x = torch.cat([
+                    current_x[:, :, :1], action_now.reshape(b, total_view, 1, dim),
+                    current_x[:, :, 2:],
+                ], dim=2)
             if attn_type == "local":
                 local_x = current_x
             if (
@@ -1790,6 +1808,7 @@ class DA3GiantEncoder(nn.Module):
         self,
         visual_tokens: torch.Tensor,
         gradient_checkpointing: bool = True,
+        return_layer_patches: bool = False,
     ) -> Dict[str, object]:
         """Resume frozen DA3 from the pre-global boundary without action tokens.
 
@@ -1835,6 +1854,7 @@ class DA3GiantEncoder(nn.Module):
         )
 
         deep_by_layer: Dict[int, torch.Tensor] = {}
+        layer_patches = {}
         start_block = int(trans.alt_start)
         if start_block < 0:
             raise ValueError("DA3 backbone has no alt_start; cannot resume shallow boundary.")
@@ -1875,6 +1895,11 @@ class DA3GiantEncoder(nn.Module):
                 )
             if attn_type == "local":
                 local_x = current_x
+            if return_layer_patches:
+                layer_patches[i] = torch.cat([
+                    local_x[:, :, 1 + num_register_tokens:],
+                    current_x[:, :, 1 + num_register_tokens:],
+                ], dim=-1).reshape(b, steps, views, num_patches, 2 * dim)
             if i in wanted:
                 raw = (
                     torch.cat([local_x, current_x], dim=-1)
@@ -1891,6 +1916,7 @@ class DA3GiantEncoder(nn.Module):
         return {
             "shallow": visual_tokens,
             "deep_levels": [deep_by_layer[int(i)] for i in self.out_layers],
+            "layer_patches": layer_patches,
         }
 
     @torch.no_grad()
@@ -1925,6 +1951,8 @@ class DA3GiantEncoder(nn.Module):
         profile: Optional[Dict[str, object]] = None,
         dino_tokens: Optional[torch.Tensor] = None,
         dual_state_attention: str = "full",
+        current_geometry_by_layer=None,
+        current_geometry_read=None,
     ) -> Dict[str, torch.Tensor]:
         return self._propagate_shallow_with_actions_impl(
             visual_tokens,
@@ -1938,6 +1966,8 @@ class DA3GiantEncoder(nn.Module):
             profile=profile,
             dino_tokens=dino_tokens,
             dual_state_attention=dual_state_attention,
+            current_geometry_by_layer=current_geometry_by_layer,
+            current_geometry_read=current_geometry_read,
         )
 
     def _propagate_and_decode_impl(

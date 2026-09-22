@@ -46,7 +46,7 @@ the row inherits every setting from `B0`.
 | C3_W3HB | W3 + HB: dynamic multiplier 3 and current+future depth | Does mild dynamic emphasis help after geometry is stabilized? |
 | C4_F3W3 | F3 + W3: K=3 and dynamic multiplier 3 | Is near-future dynamic blur primarily horizon- or weight-limited? |
 | C5_F10HB | F10 + HB: K=10 and current+future depth | Can current geometry regularize the deliberately hard long horizon? |
-| CA1_HB | C: separate current/future passes, terminal action-to-current CA | Separate versus joint geometry processing |
+| CA1_HB | C: separate current/future passes, shared per-layer action-to-current CA | Can current geometry improve future geometry via actions? |
 | HC_DIRECT | B: bypass Predictor, observed current + language/F0 action adapter | Is the feature Predictor necessary? |
 | HE_DUALPRED | E: predicted current and future in joint deep pass | Observed versus predicted current |
 | HF_BRIDGE | F: action-only bridge between observed current and predicted future | Is direct visual interaction necessary? |
