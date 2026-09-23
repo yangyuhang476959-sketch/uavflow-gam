@@ -1,0 +1,26 @@
+priority	run_id	script	phase	question
+1	B0	01_B0.sh	core	Qwen no-pose relative future-K5 baseline
+2	P1	02_P1_pose.sh	core	Direct numeric pose main effect
+3	L1	03_L1_t5.sh	core	Frozen T5 versus frozen Qwen VLM
+4	D1LOG	04_D1LOG_metric_log.sh	core	Fixed metric depth with log-depth stabilization
+5	D2	05_D2_scale_separated.sh	core	Relative shape plus learned scene scale
+6	W3	06_W3_dynamic3.sh	core	Three-times dynamic-pixel weighting
+7	H0	07_H0_current.sh	core	Current geometry reconstruction only
+8	HB	08_HB_current_future.sh	core	Observed Current plus predicted Future joint deep pass
+9	F3	09_F3_short_horizon.sh	core	Shorter action and geometry horizon K3
+10	M1	10_M1_multiwindow.sh	core	GAM-style contexts H1-H4
+11	HE_DUALPRED	11_HE_DUALPRED.sh	architecture	Predict both Current and Future before joint deep decoding
+12	HF_BRIDGE	12_HF_BRIDGE.sh	architecture	Current is read-only context for Future and Action
+13	CA1_HB	13_CA1_HB.sh	architecture	Per-layer Action cross-attention to Current
+14	HC_DIRECT	14_HC_DIRECT.sh	architecture	Bypass causal Predictor for Current geometry
+15	D1	15_D1_metric_no_log.sh	control	Fixed metric without log loss; isolates D1LOG log term
+16	S1COS	16_S1COS.sh	control	Stage-1 cosine versus constant schedule
+17	W5	17_W5_dynamic5.sh	strength	Five-times dynamic-pixel weighting
+18	W10	18_W10_dynamic10.sh	strength	Ten-times dynamic-pixel weighting
+19	F7	19_F7_horizon7.sh	horizon	Medium-long action and geometry horizon K7
+20	F10	20_F10_horizon10.sh	horizon	Long action and geometry horizon K10
+21	C1_PL	21_C1_pose_t5.sh	interaction	Pose by language-encoder interaction
+22	C2_D2HB	22_C2_scale_both.sh	interaction	Scale separation by Current-plus-Future interaction
+23	C3_W3HB	23_C3_dynamic3_both.sh	interaction	Dynamic weighting by Current-plus-Future interaction
+24	C4_F3W3	24_C4_horizon3_dynamic3.sh	interaction	Short horizon by dynamic weighting interaction
+25	C5_F10HB	25_C5_horizon10_both.sh	interaction	Long horizon stabilized by Current depth

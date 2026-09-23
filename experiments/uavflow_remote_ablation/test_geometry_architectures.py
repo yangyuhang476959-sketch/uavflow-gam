@@ -123,7 +123,7 @@ class Tests(unittest.TestCase):
             self.assertEqual(flags.get("model.geometry_architecture", "legacy"), row["geometry_architecture"])
         for run_id in ["H0", "HB", "C2_D2HB", "C3_W3HB", "C5_F10HB"]:
             name = subprocess.check_output(["bash", "-c", outputs + '\noutput_id_for "$1"', "test", run_id], text=True).strip()
-            self.assertEqual(name, run_id + "_g2")
+            self.assertEqual(name, run_id + "_g2_simpleprompt_s1end0_s2end5")
 
     def test_real_encoder_loop_checkpoint_mask(self):
         from robot.modeling.da3_giant_encoder import DA3GiantEncoder
