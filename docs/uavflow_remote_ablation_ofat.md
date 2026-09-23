@@ -7,7 +7,7 @@ the row inherits every setting from `B0`.
 
 | Field | Value |
 |---|---|
-| Conditioner | frozen Qwen3.5-2B VLM, current image + OpenVLA-style instruction/state prompt |
+| Conditioner | frozen Qwen3.5-2B VLM, current image + raw dataset instruction; no textual pose |
 | Direct numeric pose | off |
 | Context | H=1 plus fixed F0 reference |
 | Coupled future scale | K=5: predict 5 x 4-DoF actions and geometry at F(t+5) |

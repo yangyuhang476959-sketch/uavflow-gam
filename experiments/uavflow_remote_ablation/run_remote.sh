@@ -238,7 +238,7 @@ output_id_for() {
     H0|HB|C2_D2HB|C3_W3HB|C5_F10HB) label="${label}_g2" ;;
   esac
   # Changed training distribution: never resume the old Stage-1 end+5 runs.
-  printf '%s\n' "${label}_s1end0_s2end5"
+  printf '%s\n' "${label}_simpleprompt_s1end0_s2end5"
 }
 
 run_stage() {

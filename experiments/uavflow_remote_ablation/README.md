@@ -21,7 +21,8 @@ then deterministically up- or down-samples their union to 20% of the final
 training tickets. Both stages repeat the first normal window five extra times.
 Stage 1 adds no pure terminal self-pair repeats; Stage 2 adds five per episode
 (FN -> FN, all K actions zero). Neither stage repeats the last moving window.
-The output suffix `_s1end0_s2end5` prevents resuming older end+5 Stage-1 runs.
+The output suffix `_simpleprompt_s1end0_s2end5` prevents resuming older
+OpenVLA-prompt or end+5 Stage-1 runs.
 
 The multi-window `M1` row needs four stride-5 contexts and therefore requests
 more raw anchors, but explicitly caps terminal absorbing starts at K=5.

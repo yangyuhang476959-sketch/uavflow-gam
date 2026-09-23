@@ -7,7 +7,7 @@ improve UAV navigation without turning the study into a factorial grid. The
 reference run (`B0`) is:
 
 - frozen Qwen3.5-2B VLM conditioner;
-- current image plus the OpenVLA-style instruction/state prompt, with no
+- current image plus the raw dataset instruction, with no textual state and no
   separate numeric pose token;
 - one observed current anchor (`H=1`) plus fixed first-frame reference;
 - coupled future/chunk scale K=5: five 4-DoF actions and geometry at `F(t+5)`;

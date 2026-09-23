@@ -7,7 +7,7 @@ Stage 2 for five epochs. Interrupted jobs resume from their own output folder.
 
 | Priority | Script | Question |
 |---:|---|---|
-| 1 | `01_B0.sh` | Qwen/no-pose/relative/future baseline |
+| 1 | `01_B0.sh` | Qwen current image + raw instruction, no pose, relative/future baseline |
 | 2 | `02_P1_pose.sh` | Does direct numeric pose help? |
 | 3 | `03_L1_t5.sh` | Frozen T5 versus frozen Qwen VLM |
 | 4 | `04_D1LOG_metric_log.sh` | Fixed metric depth with linear/log/gradient loss |
@@ -27,6 +27,10 @@ bash experiments/uavflow_remote_ablation/cloud_jobs_10/01_B0.sh
 The scripts inherit paths and credentials from repository `server.env`. A
 cloud scheduler may set `CUDA_VISIBLE_DEVICES`; otherwise the launcher uses
 devices `0,1,2,3,4,5,6,7`. Do not combine numbered scripts in one allocation.
+
+The Qwen baseline receives only the current image and raw dataset instruction.
+It has neither textual numeric state nor a dedicated pose token. `P1` changes
+only the latter by adding the normalized numeric pose token.
 
 ## Memory expectation
 

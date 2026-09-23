@@ -10,7 +10,9 @@ stage1:
   qwen_layers: [23]
   qwen_attention_implementation: sdpa
   qwen_use_reference_image: false
-  qwen_prompt_mode: current_image_openvla
+  # Clean VLM baseline: current image followed by the raw dataset instruction.
+  # Numeric pose is introduced only by the dedicated P1 pose-token ablation.
+  qwen_prompt_mode: current_image_instruction
   qwen_token_selection: text_after_image
   t5_model: checkpoints/t5-base
 
