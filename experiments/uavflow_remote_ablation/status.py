@@ -12,9 +12,9 @@ def main() -> None:
     parser.add_argument("root")
     args = parser.parse_args()
     root = Path(args.root).expanduser()
-    print(f"{'ID':<6} {'STAGE':<12} {'STATUS':<10} CHECKPOINT")
+    print(f"{'ID':<6} {'STAGE':<20} {'STATUS':<10} CHECKPOINT")
     for run in sorted(path for path in root.iterdir() if path.is_dir()):
-        for stage_name in ("stage1", "stage2_stop"):
+        for stage_name in ("stage1", "stage2_stop_clip_lr", "stage2_stop"):
             stage = run / stage_name
             if not stage.exists():
                 continue
@@ -29,7 +29,7 @@ def main() -> None:
             else:
                 status = "created"
                 checkpoint = "-"
-            print(f"{run.name:<6} {stage_name:<12} {status:<10} {checkpoint}")
+            print(f"{run.name:<6} {stage_name:<20} {status:<10} {checkpoint}")
 
 
 if __name__ == "__main__":

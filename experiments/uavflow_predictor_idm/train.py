@@ -382,10 +382,13 @@ def main() -> None:
         id(parameter) for parameter in raw_model.direct_action_head.parameters()
         if parameter.requires_grad
     }
-    direct_head_ids.update(
+    separate_stop_lr = cfg.training.get("stop_head_lr") is not None
+    stop_head_ids = {
         id(parameter) for parameter in raw_model.stop_head.parameters()
         if parameter.requires_grad
-    )
+    }
+    if not separate_stop_lr:
+        direct_head_ids.update(stop_head_ids)
     direct_head_ids.update(
         id(parameter) for parameter in raw_model.relative_pose_head.parameters()
         if parameter.requires_grad
@@ -400,10 +403,13 @@ def main() -> None:
     }
     predictor_trainable = [
         p for p in trainable
-        if id(p) not in direct_head_ids and id(p) not in backbone_ids
+        if id(p) not in direct_head_ids
+        and id(p) not in backbone_ids
+        and id(p) not in stop_head_ids
     ]
     direct_head_trainable = [p for p in trainable if id(p) in direct_head_ids]
     backbone_trainable = [p for p in trainable if id(p) in backbone_ids]
+    stop_head_trainable = [p for p in trainable if id(p) in stop_head_ids]
     predictor_lr_mult = float(cfg.training.get("predictor_lr_mult", 1.0))
     head_lr_mult = float(cfg.training.get("direct_action_head_lr_mult", 1.0))
     optimizer_groups = [{
@@ -422,6 +428,16 @@ def main() -> None:
             "params": direct_head_trainable,
             "lr": float(cfg.training.lr) * head_lr_mult,
             "lr_multiplier": head_lr_mult,
+        })
+    if separate_stop_lr and stop_head_trainable:
+        base_lr = float(cfg.training.lr)
+        stop_head_lr = float(cfg.training.stop_head_lr)
+        if base_lr <= 0 or stop_head_lr <= 0:
+            raise ValueError("training.lr and training.stop_head_lr must be positive")
+        optimizer_groups.append({
+            "params": stop_head_trainable,
+            "lr": stop_head_lr,
+            "lr_multiplier": stop_head_lr / base_lr,
         })
     optimizer = torch.optim.AdamW(
         optimizer_groups, weight_decay=float(cfg.training.weight_decay)
@@ -522,6 +538,7 @@ def main() -> None:
             "training.batch_size",
             "training.direct_action_head_lr_mult",
             "training.predictor_lr_mult",
+            "training.stop_head_lr",
         )
 
         def nested_get(mapping, path):

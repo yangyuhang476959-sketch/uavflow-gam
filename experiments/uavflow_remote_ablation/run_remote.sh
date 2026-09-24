@@ -38,6 +38,9 @@ STAGE1_MIN_LR_RATIO="${STAGE1_MIN_LR_RATIO:-${MIN_LR_RATIO:-0.05}}"
 STAGE2_LR_SCHEDULE="${STAGE2_LR_SCHEDULE:-cosine}"
 STAGE2_WARMUP_STEPS="${STAGE2_WARMUP_STEPS:-500}"
 STAGE2_MIN_LR_RATIO="${STAGE2_MIN_LR_RATIO:-0.05}"
+STAGE2_EXISTING_LR_FACTOR="${STAGE2_EXISTING_LR_FACTOR:-0.1}"
+STAGE2_STOP_HEAD_LR="${STAGE2_STOP_HEAD_LR:-1.0e-4}"
+STAGE2_BASE_LR="$(awk -v lr="${BASE_LR}" -v factor="${STAGE2_EXISTING_LR_FACTOR}" 'BEGIN { if (lr <= 0 || factor <= 0) exit 1; printf "%.10g", lr * factor }')"
 STAGE1_EPOCHS="${STAGE1_EPOCHS:-5}"
 STAGE2_EPOCHS="${STAGE2_EPOCHS:-5}"
 RUN_IDS="${RUN_IDS:-B0,S1COS,P1,L1,D1,D2,D1LOG,W3,W5,W10,H0,HB,F3,F7,F10,M1,C1_PL,C2_D2HB,C3_W3HB,C4_F3W3,C5_F10HB,CA1_HB,HC_DIRECT,HE_DUALPRED,HF_BRIDGE}"
@@ -75,6 +78,7 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 echo "optimizer: per_gpu_batch=${BATCH_SIZE} global_batch=$((BATCH_SIZE * NPROC)) deep_lr=${BASE_LR} predictor_lr=$(awk -v x="${BASE_LR}" 'BEGIN {printf "%.8g", x*0.2}') head_lr=$(awk -v x="${BASE_LR}" 'BEGIN {printf "%.8g", x*10}')"
 echo "stage1_schedule=${STAGE1_LR_SCHEDULE} warmup=${STAGE1_WARMUP_STEPS} min_ratio=${STAGE1_MIN_LR_RATIO}"
 echo "stage2_stop_schedule=${STAGE2_LR_SCHEDULE} warmup=${STAGE2_WARMUP_STEPS} min_ratio=${STAGE2_MIN_LR_RATIO}"
+echo "stage2_lrs: deep=${STAGE2_BASE_LR} predictor=$(awk -v x="${STAGE2_BASE_LR}" 'BEGIN {printf "%.8g", x*0.2}') action_head=$(awk -v x="${STAGE2_BASE_LR}" 'BEGIN {printf "%.8g", x*10}') stop_head=${STAGE2_STOP_HEAD_LR}"
 
 COMMON_OVERRIDES=(
   --set "stage1.da3_checkpoint=${DA3_CHECKPOINT}"
@@ -245,7 +249,9 @@ run_stage() {
   local id="$1" stage="$2" init_checkpoint="$3"
   local output_id
   output_id="$(output_id_for "${id}")"
-  local out="${OUTPUT_ROOT}/${output_id}/${stage}"
+  local stage_dir="${stage}"
+  [[ "${stage}" == "stage2_stop" ]] && stage_dir=stage2_stop_clip_lr
+  local out="${OUTPUT_ROOT}/${output_id}/${stage_dir}"
   mkdir -p "${out}"
   if [[ -s "${out}/_SUCCESS" ]]; then
     echo "[$(date '+%F %T')] skip completed ${id}/${stage}"
@@ -277,6 +283,8 @@ run_stage() {
       --set 'model.stop_head_mode=legacy_action_token'
       --set 'loss.stop_weight=1.0'
       --set 'loss.stop_pos_weight=5.0'
+      --set "training.lr=${STAGE2_BASE_LR}"
+      --set "training.stop_head_lr=${STAGE2_STOP_HEAD_LR}"
       --set "training.lr_schedule=${STAGE2_LR_SCHEDULE}"
       --set "training.warmup_steps=${STAGE2_WARMUP_STEPS}"
       --set "training.min_lr_ratio=${STAGE2_MIN_LR_RATIO}"
