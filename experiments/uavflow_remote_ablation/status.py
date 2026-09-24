@@ -15,7 +15,8 @@ def main() -> None:
     print(f"{'ID':<6} {'STAGE':<20} {'STATUS':<10} CHECKPOINT")
     for run in sorted(path for path in root.iterdir() if path.is_dir()):
         for stage_name in (
-            "stage1", "stage2_stop_actionpose_clip_lr", "stage2_stop_clip_lr", "stage2_stop"
+            "stage1", "stage2_stop_actionpose_stoplr5e4", "stage2_stop_actionpose_clip_lr",
+            "stage2_stop_clip_lr", "stage2_stop"
         ):
             stage = run / stage_name
             if not stage.exists():

@@ -39,7 +39,7 @@ STAGE2_LR_SCHEDULE="${STAGE2_LR_SCHEDULE:-cosine}"
 STAGE2_WARMUP_STEPS="${STAGE2_WARMUP_STEPS:-500}"
 STAGE2_MIN_LR_RATIO="${STAGE2_MIN_LR_RATIO:-0.05}"
 STAGE2_EXISTING_LR_FACTOR="${STAGE2_EXISTING_LR_FACTOR:-0.1}"
-STAGE2_STOP_HEAD_LR="${STAGE2_STOP_HEAD_LR:-1.0e-4}"
+STAGE2_STOP_HEAD_LR="${STAGE2_STOP_HEAD_LR:-5.0e-4}"
 STAGE2_BASE_LR="$(awk -v lr="${BASE_LR}" -v factor="${STAGE2_EXISTING_LR_FACTOR}" 'BEGIN { if (lr <= 0 || factor <= 0) exit 1; printf "%.10g", lr * factor }')"
 STAGE1_EPOCHS="${STAGE1_EPOCHS:-5}"
 STAGE2_EPOCHS="${STAGE2_EPOCHS:-5}"
@@ -250,7 +250,7 @@ run_stage() {
   local output_id
   output_id="$(output_id_for "${id}")"
   local stage_dir="${stage}"
-  [[ "${stage}" == "stage2_stop" ]] && stage_dir=stage2_stop_actionpose_clip_lr
+  [[ "${stage}" == "stage2_stop" ]] && stage_dir=stage2_stop_actionpose_stoplr5e4
   local out="${OUTPUT_ROOT}/${output_id}/${stage_dir}"
   mkdir -p "${out}"
   if [[ -s "${out}/_SUCCESS" ]]; then
