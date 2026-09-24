@@ -186,6 +186,10 @@ def main() -> None:
     pose_normalizer = None
     needs_pose_targets = (
         bool(cfg.model.get("use_pose_history", False))
+        or (
+            bool(cfg.model.get("stop_head_enabled", False))
+            and str(cfg.model.get("stop_head_mode", "")) == "action_hidden_pose"
+        )
         or bool(cfg.model.get("relative_pose_head_enabled", False))
         or float(cfg.loss.get("action_rollout_pose_weight", 0.0)) > 0.0
     )

@@ -47,13 +47,14 @@ class TinyDA3(nn.Module):
         raise AssertionError("Architecture should reuse its joint/current decode, not run a second current pass")
 
 
-def build(mode, stop=False):
+def build(mode, stop=False, stop_mode="legacy_action_token"):
     net = UAVFlowPredictorIDM(
         da3=TinyDA3(), idm=None, action_dim=4, action_chunk_size=5,
         d_model=256, depth=1, num_heads=4, language_dim=16, language_len=2,
         direct_action_enabled=True, deep_action_enabled=True, compute_idm_branch=False,
         gradient_checkpointing=False, geometry_architecture=mode,
         depth_decode_enabled=True, stop_head_enabled=stop,
+        stop_head_mode=stop_mode,
         use_fixed_first_frame=True, use_reference_type_embedding=True,
     )
     def rollout(self, observed, **kwargs):
@@ -94,6 +95,77 @@ class Tests(unittest.TestCase):
     def setUp(self):
         torch.set_num_threads(2)
         torch.manual_seed(42)
+
+    def test_stop_only_pose_does_not_change_actions(self):
+        for mode, steps in (("legacy", 3), ("dual_observed", 1)):
+            with self.subTest(mode=mode):
+                net = build(mode, stop=True, stop_mode="action_hidden_pose")
+                self.assertFalse(net.use_pose_history)
+                x = torch.randn(2, steps, 1, 7, 16)
+                kwargs = dict(
+                    reference_shallow=x[:, :1],
+                    lang_feats=torch.randn(2, 2, 16),
+                    lang_padding_mask=torch.ones(2, 2, dtype=torch.bool),
+                )
+                pose_a = torch.zeros(2, steps, 5)
+                pose_b = pose_a.clone()
+                pose_b[..., 0] = 2.0
+                first = net(x, stop_pose=pose_a, **kwargs)
+                second = net(x, stop_pose=pose_b, **kwargs)
+                self.assertEqual(first["stop_logits"].shape, (2, steps))
+                self.assertTrue(torch.equal(first["actions_norm"], second["actions_norm"]))
+                self.assertFalse(torch.equal(first["stop_logits"], second["stop_logits"]))
+                second["stop_logits"].sum().backward()
+                self.assertGreater(net.stop_head.pose_proj[0].weight.grad.abs().sum().item(), 0)
+                with self.assertRaisesRegex(ValueError, "stop-only current pose"):
+                    net(x, **kwargs)
+
+    def test_stop_only_pose_uses_current_anchor(self):
+        net = build("legacy", stop=True, stop_mode="action_hidden_pose")
+        raw_pose = torch.tensor([
+            [[1., 2., 3., 0., 1.], [8., 9., 10., 0., 1.]],
+            [[4., 5., 6., 0., 1.], [11., 12., 13., 0., 1.]],
+        ])
+        batch = {
+            "all_view_images": torch.ones(2, 2, 1, 3, 2, 2),
+            "episode_first_image": torch.ones(2, 1, 3, 2, 2),
+            "task_description": ["move", "turn"],
+            "action_stats_key": ["sim", "sim"],
+            "actions": torch.zeros(2, 1, 5, 4),
+            "action_loss_mask": torch.ones(2, 1, 5, 4, dtype=torch.bool),
+            "stop_target": torch.zeros(2, 1),
+            "episode_pose": raw_pose,
+            "gt_depth_meters": torch.full((2, 2, 1, 2, 2), 3.),
+            "gt_depth_mask": torch.ones(2, 2, 1, 2, 2, dtype=torch.bool),
+        }
+        captured = []
+        hook = net.stop_head.register_forward_pre_hook(
+            lambda _module, inputs: captured.append(inputs[1].detach().clone())
+        )
+        class ShiftPoseNormalizer:
+            def normalize(self, value):
+                return value + 10.
+        try:
+            with patch(
+                "experiments.uavflow_predictor_idm.objectives.encode_stage2_condition",
+                return_value={
+                    "last_hidden_state": torch.ones(2, 3, 16),
+                    "attention_mask": torch.ones(2, 3, dtype=torch.bool),
+                },
+            ):
+                forward_batch(
+                    model=net, da3=net.da3, text=None,
+                    normalizer=IdentityNormalizer(),
+                    pose_normalizer=ShiftPoseNormalizer(), batch=batch,
+                    context_len=1, rollout_steps=1,
+                    feature_horizon_weights=[1], feature_patch_weight=1,
+                    feature_cls_weight=0, feature_register_weight=0,
+                    deep_feature_enabled=False, deep_feature_patch_weight=1,
+                    deep_feature_cls_weight=0, stop_pos_weight=5, amp=False,
+                )
+        finally:
+            hook.remove()
+        torch.testing.assert_close(captured[0], raw_pose[:, :1] + 10.)
 
     def test_real_predictor_two_roles(self):
         net = build("dual_predicted")

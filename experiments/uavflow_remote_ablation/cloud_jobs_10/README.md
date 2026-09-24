@@ -13,9 +13,11 @@ Stage 2 for five epochs. Interrupted jobs resume from their own output folder.
 Stage 2 uses the CLIP Stop fine-tuning ratio: all existing trainable groups
 run at one tenth of their Stage-1 peak learning rates (Predictor `1e-6`,
 deep DA3 `5e-6`, Action head `5e-5` at the defaults). Its newly initialized
-Stop head has an independent `1e-4` peak learning rate. Both stages retain
+Stop head has an independent `1e-4` peak learning rate and receives its own
+normalized current-pose input, independent of the main backbone's pose setting.
+Both stages retain
 their respective schedules; Stage 2 uses 500 warmup steps then cosine decay.
-The Stage-2 output is `stage2_stop_clip_lr/`, so older Stage-2 checkpoints
+The Stage-2 output is `stage2_stop_actionpose_clip_lr/`, so older Stage-2 checkpoints
 made with the former learning rates cannot be silently resumed.
 
 | Priority | Script | Question |

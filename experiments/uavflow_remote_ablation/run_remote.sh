@@ -250,7 +250,7 @@ run_stage() {
   local output_id
   output_id="$(output_id_for "${id}")"
   local stage_dir="${stage}"
-  [[ "${stage}" == "stage2_stop" ]] && stage_dir=stage2_stop_clip_lr
+  [[ "${stage}" == "stage2_stop" ]] && stage_dir=stage2_stop_actionpose_clip_lr
   local out="${OUTPUT_ROOT}/${output_id}/${stage_dir}"
   mkdir -p "${out}"
   if [[ -s "${out}/_SUCCESS" ]]; then
@@ -280,7 +280,7 @@ run_stage() {
     stage_args+=(
       --set 'dataset.endpoint_self_pair_end_count=5'
       --set 'model.stop_head_enabled=true'
-      --set 'model.stop_head_mode=legacy_action_token'
+      --set 'model.stop_head_mode=action_hidden_pose'
       --set 'loss.stop_weight=1.0'
       --set 'loss.stop_pos_weight=5.0'
       --set "training.lr=${STAGE2_BASE_LR}"

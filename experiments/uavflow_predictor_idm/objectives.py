@@ -936,6 +936,15 @@ def forward_batch(
     # rollout=3 compatibility path exposes the three original open-loop actions.
     action_start = 0 if dense_context else int(context_len) - 1
     action_steps = int(context_len) if dense_context else int(rollout_steps)
+    stop_pose = None
+    if getattr(model_ref, "stop_head_enabled", False) and getattr(
+        model_ref, "stop_head_mode", ""
+    ) == "action_hidden_pose":
+        if pose_normalizer is None or "episode_pose" not in batch:
+            raise ValueError("Action-hidden Stop requires episode pose and training pose statistics.")
+        stop_pose = pose_normalizer.normalize(
+            batch["episode_pose"][:, action_start : action_start + action_steps].float()
+        )
     target_raw_full = batch["actions"][:, action_start : action_start + action_steps].float()
     action_mask_full = batch["action_loss_mask"][:, action_start : action_start + action_steps]
     chunk_size = int(getattr(model_ref, "action_chunk_size", 1))
@@ -955,6 +964,7 @@ def forward_batch(
             observed_action_history_valid_mask=history_valid,
             observed_pose_history=pose_history,
             reference_pose=reference_pose,
+            stop_pose=stop_pose,
             lang_feats=language["last_hidden_state"],
             lang_padding_mask=language["attention_mask"],
             conditioning_generator=conditioning_generator,

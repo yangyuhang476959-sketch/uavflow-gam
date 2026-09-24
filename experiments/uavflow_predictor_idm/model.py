@@ -440,6 +440,37 @@ class HybridPatchActionStopHead(nn.Module):
         return self.output(hidden).reshape(b, h)
 
 
+class ActionHiddenPoseStopHead(nn.Module):
+    """CLIP-style Stop readout from refined action state and stop-only pose."""
+
+    def __init__(self, action_dim: int, model_dim: int, pose_dim: int = 5) -> None:
+        super().__init__()
+        self.action_proj = nn.Sequential(
+            nn.LayerNorm(action_dim), nn.Linear(action_dim, model_dim), nn.GELU(),
+        )
+        self.pose_proj = nn.Sequential(
+            nn.Linear(pose_dim, model_dim), nn.GELU(),
+            nn.Linear(model_dim, model_dim),
+        )
+        self.output = nn.Sequential(
+            nn.LayerNorm(model_dim), nn.Linear(model_dim, model_dim),
+            nn.GELU(), nn.Linear(model_dim, 1),
+        )
+        nn.init.normal_(self.output[-1].weight, std=1e-3)
+        nn.init.zeros_(self.output[-1].bias)
+
+    def forward(self, action_hidden: torch.Tensor, stop_pose: torch.Tensor) -> torch.Tensor:
+        expected = (*action_hidden.shape[:-1], 5)
+        if stop_pose.shape != expected:
+            raise ValueError(
+                f"Action-hidden Stop requires normalized pose {expected}, "
+                f"got {tuple(stop_pose.shape)}."
+            )
+        hidden = self.action_proj(action_hidden)
+        hidden = hidden + self.pose_proj(stop_pose.to(hidden.dtype))
+        return self.output(hidden).squeeze(-1)
+
+
 class UAVFlowPredictorIDM(nn.Module):
     """Predict one future shallow frame and decode its transition with an IDM.
 
@@ -676,6 +707,10 @@ class UAVFlowPredictorIDM(nn.Module):
             )
             nn.init.zeros_(self.stop_head[-1].weight)
             nn.init.constant_(self.stop_head[-1].bias, -3.0)
+        elif self.stop_head_mode == "action_hidden_pose":
+            self.stop_head = ActionHiddenPoseStopHead(
+                action_dim=int(da3.embed_dim), model_dim=int(stop_model_dim),
+            )
         elif self.stop_head_mode == "patch_motion":
             if not self.use_fixed_first_frame or not self.use_pose_history:
                 raise ValueError(
@@ -705,7 +740,7 @@ class UAVFlowPredictorIDM(nn.Module):
         else:
             raise ValueError(
                 f"Unsupported stop_head_mode={self.stop_head_mode!r}; "
-                "expected 'legacy_action_token', 'patch_motion', or "
+                "expected 'legacy_action_token', 'action_hidden_pose', 'patch_motion', or "
                 "'hybrid_action_feature'."
             )
         for parameter in self.stop_head.parameters():
@@ -1052,6 +1087,7 @@ class UAVFlowPredictorIDM(nn.Module):
         observed_action_history_valid_mask: torch.Tensor | None = None,
         observed_pose_history: torch.Tensor | None = None,
         reference_pose: torch.Tensor | None = None,
+        stop_pose: torch.Tensor | None = None,
         lang_feats: torch.Tensor,
         lang_padding_mask: torch.Tensor | None,
         conditioning_generator: torch.Generator | None = None,
@@ -1181,6 +1217,12 @@ class UAVFlowPredictorIDM(nn.Module):
                         refined_action_tokens
                         if self.stop_head_mode == "hybrid_action_feature" else None
                     ),
+                )
+            elif self.stop_head_mode == "action_hidden_pose":
+                if stop_pose is None:
+                    raise ValueError("Action-hidden Stop requires stop-only current pose.")
+                stop_logits = self.stop_head(
+                    refined_action_tokens.mean(dim=2), stop_pose,
                 )
             else:
                 stop_logits = self.stop_head(refined_action_tokens.mean(dim=2)).squeeze(-1)

@@ -23,7 +23,9 @@ Stage 1 adds no pure terminal self-pair repeats; Stage 2 adds five per episode
 (FN -> FN, all K actions zero). Neither stage repeats the last moving window.
 Stage 2 lowers the existing Predictor, deep DA3, and Action-head peak learning
 rates to one tenth of Stage 1, while its separate Stop head uses `1e-4`.
-Its checkpoint directory is `stage2_stop_clip_lr/`.
+The Stop head separately reads the normalized episode-relative current pose;
+this does not change the main Action/Predictor pose ablation. Its checkpoint
+directory is `stage2_stop_actionpose_clip_lr/`.
 The output suffix `_simpleprompt_s1end0_s2end5` prevents resuming older
 OpenVLA-prompt or end+5 Stage-1 runs.
 
