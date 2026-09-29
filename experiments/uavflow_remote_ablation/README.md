@@ -9,11 +9,11 @@ horizon, GAM `3:1:3` action/feature/depth loss, full-rank DA3 blocks 13+, no
 first-frame duplication, and the natural five terminal absorbing windows. No
 artificial 20% terminal rebalance is applied.
 
-Stage 1 trains action/feature/depth for 10 epochs at constant LR. During
+Stage 1 trains action/feature/depth for 20 epochs at constant LR. During
 validation it atomically maintains `best_action.pt` using the lowest H=1
 validation Action loss. Stage 2 starts from that checkpoint (not blindly from
 the final epoch) and jointly fine-tunes the same policy plus the Stop head for
-10 epochs with cosine decay. Only Stop receives its separate normalized pose
+20 epochs with cosine decay. Only Stop receives its separate normalized pose
 branch; this does not alter the main pose ablation. For five-slot policies,
 Stop preserves order by concatenating the five refined states before its MLP.
 

@@ -85,9 +85,9 @@ line as an independent 8-GPU job. Every entrypoint performs:
 
 1. runtime and full depth-layout audit;
 2. locked creation/reuse of one shared split;
-3. Stage 1: 10 epochs action + feature + depth, constant LR;
+3. Stage 1: 20 epochs action + feature + depth, constant LR;
 4. selection of `best_action.pt` by minimum H=1 validation Action loss;
-5. Stage 2: 10 epochs joint policy + ordered concat-MLP Stop, cosine LR;
+5. Stage 2: 20 epochs joint policy + ordered concat-MLP Stop, cosine LR;
 6. exact same-stage optimizer/scheduler/data-cursor resume after interruption.
 
 Completed stages have `_SUCCESS` and are skipped on re-submission. Results are

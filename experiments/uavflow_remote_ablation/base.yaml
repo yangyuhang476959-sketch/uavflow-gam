@@ -200,7 +200,7 @@ training:
   direct_action_head_lr_mult: 10.0
   weight_decay: 0.0
   warmup_steps: 0
-  max_epochs: 10
+  max_epochs: 20
   max_steps: 1
   scheduler_total_steps: 0
   min_lr_ratio: 0.05
