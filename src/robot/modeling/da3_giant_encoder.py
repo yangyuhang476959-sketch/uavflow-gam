@@ -1527,7 +1527,9 @@ class DA3GiantEncoder(nn.Module):
             visual_tokens: (B, steps, V, 1+R+P, D) in `[CLS, registers, patches]`
                 order, normally from `encode_shallow_visual_slots()` or the
                 gam predictor.
-            action_tokens: (B, steps, V, D) action seeds inserted before block 13.
+            action_tokens: ``(B, steps, V, D)`` for the legacy single action
+                token, or ``(B, steps, V, K, D)`` for K parallel chunk tokens.
+                Tokens are inserted after the camera token before block 13.
         """
         _cuda_profile_mark(profile, "deep_start")
         b, steps, v_count, n_visual, dim = visual_tokens.shape
@@ -1542,9 +1544,21 @@ class DA3GiantEncoder(nn.Module):
             raise ValueError("action_bridge requires H=1 and two state views")
         if dim != self.embed_dim:
             raise ValueError(f"Expected visual dim {self.embed_dim}, got {dim}.")
-        if action_tokens.shape != (b, steps, v_count, dim):
+        legacy_single_action = action_tokens.ndim == 4
+        if legacy_single_action:
+            expected = (b, steps, v_count, dim)
+            action_count = 1
+        elif action_tokens.ndim == 5:
+            expected = (b, steps, v_count, action_tokens.shape[-2], dim)
+            action_count = int(action_tokens.shape[-2])
+            if action_count <= 0:
+                raise ValueError("At least one parallel action token is required.")
+        else:
+            expected = (b, steps, v_count, dim)
+            action_count = 0
+        if action_tokens.shape != expected:
             raise ValueError(
-                f"action_tokens shape {tuple(action_tokens.shape)} != {(b, steps, v_count, dim)}"
+                f"action_tokens shape {tuple(action_tokens.shape)} != {expected}"
             )
         prefix_lengths = self._deep_prefix_lengths(
             step_valid_mask=step_valid_mask,
@@ -1597,7 +1611,7 @@ class DA3GiantEncoder(nn.Module):
         backbone_dtype = next(self.backbone.parameters()).dtype
         current_x = visual_tokens.reshape(b, total_view, n_visual, dim).to(backbone_dtype).clone()
         local_x = current_x.clone()
-        action_x = action_tokens.reshape(b, total_view, 1, dim).to(backbone_dtype)
+        action_x = action_tokens.reshape(b, total_view, action_count, dim).to(backbone_dtype)
         dino_memory = None
         if dino_tokens is not None:
             if dino_tokens.shape[:3] != (b, steps, v_count):
@@ -1633,7 +1647,7 @@ class DA3GiantEncoder(nn.Module):
         local_x = torch.cat([local_x[:, :, :1], action_x, local_x[:, :, 1:]], dim=2)
         if pos_all is not None:
             act_pos = torch.zeros(
-                b, total_view, 1, 2,
+                b, total_view, action_count, 2,
                 device=pos_all.device, dtype=pos_all.dtype,
             )
             pos_all = torch.cat([pos_all[:, :, :1], act_pos, pos_all[:, :, 1:]], dim=2)
@@ -1641,8 +1655,8 @@ class DA3GiantEncoder(nn.Module):
                 [pos_nodiff_all[:, :, :1], act_pos, pos_nodiff_all[:, :, 1:]], dim=2
             )
 
-        token_count = n_visual + 1
-        patch_start = 2 + num_register_tokens
+        token_count = n_visual + action_count
+        patch_start = 1 + action_count + num_register_tokens
         channels = self.embed_dim * 2
         level_feats = []
         start_block = int(trans.alt_start)
@@ -1736,16 +1750,26 @@ class DA3GiantEncoder(nn.Module):
                     current_x = trans.process_attention(
                         current_x, blk, attn_type=attn_type, pos=pos_emb
                     )
-            if current_geometry_read is not None:
+            if current_geometry_read is not None and i in current_geometry_by_layer:
                 memory = current_geometry_by_layer[i]
-                action_now = current_x[:, :, 1].reshape(b, steps, v_count, dim)
+                action_now = current_x[:, :, 1:1 + action_count].reshape(
+                    b, steps, v_count, action_count, dim
+                )
                 action_now = (
-                    torch_checkpoint(current_geometry_read, action_now, memory, use_reentrant=False)
-                    if use_checkpoint else current_geometry_read(action_now, memory)
+                    torch_checkpoint(
+                        lambda action, patches, layer=i: current_geometry_read(
+                            action, patches, layer_index=layer
+                        ),
+                        action_now, memory, use_reentrant=False,
+                    )
+                    if use_checkpoint else current_geometry_read(
+                        action_now, memory, layer_index=i
+                    )
                 )
                 current_x = torch.cat([
-                    current_x[:, :, :1], action_now.reshape(b, total_view, 1, dim),
-                    current_x[:, :, 2:],
+                    current_x[:, :, :1],
+                    action_now.reshape(b, total_view, action_count, dim),
+                    current_x[:, :, 1 + action_count:],
                 ], dim=2)
             if attn_type == "local":
                 local_x = current_x
@@ -1754,10 +1778,14 @@ class DA3GiantEncoder(nn.Module):
                 and hasattr(self, "deep_dino_action_adapters")
                 and str(i) in self.deep_dino_action_adapters
             ):
-                action_now = current_x[:, :, 1:2].reshape(b * total_view, 1, dim)
+                action_now = current_x[:, :, 1:1 + action_count].reshape(
+                    b * total_view, action_count, dim
+                )
                 action_now = self.deep_dino_action_adapters[str(i)](action_now, dino_memory)
                 current_x = current_x.clone()
-                current_x[:, :, 1:2] = action_now.reshape(b, total_view, 1, dim)
+                current_x[:, :, 1:1 + action_count] = action_now.reshape(
+                    b, total_view, action_count, dim
+                )
             # Capture multi-level features when either consumer requests them:
             #   * decode_visuals -> DPT depth/RGB head needs them downstream
             #   * return_multi_level -> Path B deep feature distillation
@@ -1793,7 +1821,12 @@ class DA3GiantEncoder(nn.Module):
         _cuda_profile_mark(profile, "deep_dpt_done")
 
         cs_final = current_x.reshape(bv, token_count, -1)
-        result["action_tokens"] = trans.norm(cs_final[:, 1])
+        action_output = trans.norm(cs_final[:, 1:1 + action_count])
+        # Preserve the released GAM contract for every existing checkpoint.
+        # New parallel policies retain the explicit K dimension.
+        result["action_tokens"] = (
+            action_output[:, 0] if legacy_single_action else action_output
+        )
         _cuda_profile_mark(profile, "deep_final_done")
         # Optional: expose deep multi-level (OUT_LAYERS) features for
         # teacher-vs-student feature distillation (Path B feature reg).
@@ -1809,6 +1842,8 @@ class DA3GiantEncoder(nn.Module):
         visual_tokens: torch.Tensor,
         gradient_checkpointing: bool = True,
         return_layer_patches: bool = False,
+        layer_patch_indices: Optional[Sequence[int]] = None,
+        layer_patch_mode: str = "concat",
     ) -> Dict[str, object]:
         """Resume frozen DA3 from the pre-global boundary without action tokens.
 
@@ -1853,6 +1888,13 @@ class DA3GiantEncoder(nn.Module):
             b, total_views, image_h, image_w, visual_tokens.device
         )
 
+        layer_patch_mode = str(layer_patch_mode).lower()
+        if layer_patch_mode not in {"concat", "current"}:
+            raise ValueError("layer_patch_mode must be 'concat' or 'current'")
+        requested_patch_layers = (
+            None if layer_patch_indices is None
+            else {int(index) for index in layer_patch_indices}
+        )
         deep_by_layer: Dict[int, torch.Tensor] = {}
         layer_patches = {}
         start_block = int(trans.alt_start)
@@ -1895,11 +1937,19 @@ class DA3GiantEncoder(nn.Module):
                 )
             if attn_type == "local":
                 local_x = current_x
-            if return_layer_patches:
-                layer_patches[i] = torch.cat([
-                    local_x[:, :, 1 + num_register_tokens:],
-                    current_x[:, :, 1 + num_register_tokens:],
-                ], dim=-1).reshape(b, steps, views, num_patches, 2 * dim)
+            if return_layer_patches and (
+                requested_patch_layers is None or i in requested_patch_layers
+            ):
+                current_patches = current_x[:, :, 1 + num_register_tokens:]
+                if layer_patch_mode == "concat":
+                    patches = torch.cat([
+                        local_x[:, :, 1 + num_register_tokens:], current_patches,
+                    ], dim=-1)
+                else:
+                    patches = current_patches
+                layer_patches[i] = patches.reshape(
+                    b, steps, views, num_patches, patches.shape[-1]
+                )
             if i in wanted:
                 raw = (
                     torch.cat([local_x, current_x], dim=-1)

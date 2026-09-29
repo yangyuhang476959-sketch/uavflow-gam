@@ -1,26 +1,11 @@
-id	language	direct_pose	depth_scale	depth_target	dynamic_weight	chunk_K	context_H	stage1_schedule	purpose	geometry_architecture
-B0	qwen	off	relative	future	1	5	1	constant	baseline	legacy
-S1COS	qwen	off	relative	future	1	5	1	cosine	stage1 schedule control	legacy
-P1	qwen	on	relative	future	1	5	1	constant	direct numeric pose main effect	legacy
-L1	t5	off	relative	future	1	5	1	constant	language encoder main effect	legacy
-D1	qwen	off	fixed_metric	future	1	5	1	constant	fixed metric depth main effect	legacy
-D2	qwen	off	scale_separated	future	1	5	1	constant	shape and scale separation main effect	legacy
-D1LOG	qwen	off	fixed_metric	future	1	5	1	constant	fixed metric with balanced linear/log value loss and GAM gradient	legacy
-W3	qwen	off	relative	future	3	5	1	constant	mild dynamic emphasis	legacy
-W5	qwen	off	relative	future	5	5	1	constant	medium dynamic emphasis	legacy
-W10	qwen	off	relative	future	10	5	1	constant	strong dynamic emphasis	legacy
-H0	qwen	off	relative	current	1	5	1	constant	A: reconstruct current feature and decode current depth	current_prediction
-HB	qwen	off	relative	both	1	5	1	constant	D: observed current plus predicted future jointly decoded	dual_observed
-F3	qwen	off	relative	future	1	3	1	constant	short coupled action and geometry horizon	legacy
-F7	qwen	off	relative	future	1	7	1	constant	medium-long coupled horizon	legacy
-F10	qwen	off	relative	future	1	10	1	constant	long coupled horizon	legacy
-M1	qwen	off	relative	future	1	5	1,2,3,4	constant	GAM multi-window context	legacy
-C1_PL	t5	on	relative	future	1	5	1	constant	pose by language interaction	legacy
-C2_D2HB	qwen	off	scale_separated	both	1	5	1	constant	scale separation by depth target interaction	dual_observed
-C3_W3HB	qwen	off	relative	both	3	5	1	constant	dynamic emphasis by depth target interaction	dual_observed
-C4_F3W3	qwen	off	relative	future	3	3	1	constant	short horizon by dynamic emphasis interaction	legacy
-C5_F10HB	qwen	off	relative	both	1	10	1	constant	long horizon by current-depth anchor interaction	dual_observed
-CA1_HB	qwen	off	relative	both	1	5	1	constant	C: separate current/future passes with shared per-layer action CA	legacy
-HC_DIRECT	qwen	off	relative	current	1	5	1	constant	B: bypass causal Predictor, retain reference/language action adapter	direct_current
-HE_DUALPRED	qwen	off	relative	both	1	5	1	constant	E: shared Predictor reconstructs current and predicts future; joint decode	dual_predicted
-HF_BRIDGE	qwen	off	relative	both	1	5	1	constant	F: observed current read only by actions; future-action bidirectional	dual_action_bridge
+id	family	language	qwen_tuning	user_prompt	assistant_slots	gam_numeric_pose	current_depth	action_reads_current	action_decode	purpose
+G0	GAM	t5	frozen	raw_instruction	0	off	off	off	full	Exact GAM-style T5/no-pose reference
+G1	GAM	t5	frozen	raw_instruction	0	on	off	off	full	Direct numeric-pose main effect
+C0	Condition	qwen	frozen	image_raw_instruction	0	off	off	off	full	Frozen VLM condition replaces T5
+C1	Condition	qwen	frozen	image_raw_instruction	0	on	off	off	full	Frozen VLM condition plus numeric pose
+Q0	Query-VLA	qwen	lora32	image_state_action_question	0	off	on	on	full	External five-query semantic and geometry banks
+S0	Slot-VLA	qwen	lora32	image_state_action_question	5	off	off	off	full	Five Qwen action slots without Current branch
+S1	Slot-VLA	qwen	lora32	image_state_action_question	5	off	on	off	full	Current depth as auxiliary supervision only
+S2	Slot-VLA	qwen	lora32	image_state_action_question	5	off	on	on	full	Main slot model with Current Geometry Bank
+R1	Slot-VLA	qwen	lora32	image_state_action_question	5	off	on	on	geometry_residual	VLA base action plus zero-initialized geometry correction
+DV	Dual-view diagnostic	qwen	lora32	image_state_action_question	0	off	on	joint_dual	learned_fusion	Current/Future branch supervision and learned fusion

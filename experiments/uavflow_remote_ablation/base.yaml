@@ -14,6 +14,16 @@ stage1:
   # Numeric pose is introduced only by the dedicated P1 pose-token ablation.
   qwen_prompt_mode: current_image_instruction
   qwen_token_selection: text_after_image
+  # Optional VLM adaptation, matching OpenVLA-UAV's rank-32 / alpha-16 scale.
+  # Architecture-only comparisons keep this false; enable in a dedicated run.
+  qwen_lora_enabled: false
+  qwen_lora_rank: 32
+  qwen_lora_alpha: 16
+  qwen_lora_dropout: 0.0
+  qwen_action_placeholder_count: 0
+  # causal | full_attention_bidir. The latter changes only Qwen's ordinary
+  # full-attention layers; recurrent linear-attention layers stay causal.
+  qwen_action_attention_mode: causal
   t5_model: checkpoints/t5-base
 
 dataset:
@@ -37,6 +47,7 @@ dataset:
   action_convention: yaw4d
   action_delta_mode: openvla_yaw_only
   openvla_uav_compatible: true
+  openvla_prompt_pose_mode: preprocessed
   terminal_zero_action: true
   endpoint_repeat_count: 0
   endpoint_self_pair_count: 0
@@ -45,11 +56,13 @@ dataset:
   endpoint_terminal_window_repeat_count: 0
   endpoint_absorbing_window_count: 1
   endpoint_absorbing_max_starts: 5
-  endpoint_absorbing_train_fraction: 0.20
+  # Keep the naturally occurring K terminal/absorbing windows. Do not
+  # rebalance them to an artificial fixed percentage.
+  endpoint_absorbing_train_fraction: 0.0
   stop_absorbing_positive: true
   stop_target_mode: current
   stop_soft_target_fraction: 0.0
-  episode_start_repeat_count: 5
+  episode_start_repeat_count: 0
   episode_start_train_fraction: 0.0
   yaw_repair_enabled: true
   yaw_repair_deg: 45
@@ -65,8 +78,28 @@ dataset:
 
 model:
   geometry_architecture: legacy
+  vlm_action_seed_enabled: false
+  causal_action_decoder_enabled: false
+  causal_action_bins: 256
+  causal_action_model_dim: 512
+  causal_action_num_heads: 8
+  causal_action_num_layers: 2
+  parallel_vla_gfm_enabled: false
+  parallel_vla_gfm_mode: external_query
+  parallel_vla_gfm_width: 512
+  parallel_vla_gfm_heads: 8
+  parallel_current_depth_enabled: true
+  parallel_current_geometry_read_enabled: true
+  # full: geometry predicts the complete action; geometry_residual: VLA emits
+  # the base action and geometry predicts only a zero-initialized correction.
+  parallel_action_decode_mode: full
+  parallel_action_post_bidir_layers: 0
   current_geometry_action_enabled: false
   current_geometry_read_mode: terminal
+  # Geometry Bank schedule/representation for parallel VLA-GFM.  The legacy
+  # value preserves existing checkpoints; recommended runs override this with
+  # Main experiments use the four native DA3 output levels and current-only patches.
+  current_geometry_bank_mode: output_current
   context_lengths: [1]
   context_weights: [1.0]
   rollout_steps: 1
@@ -123,6 +156,9 @@ loss:
   action_weight: 3.0
   action_direct_weight: 0.0
   action_refine_weight: 1.0
+  # Dual-view only: branch auxiliary mass alpha. The objective divides by
+  # (1+alpha), so the outer GAM action weight remains exactly 3.
+  dual_branch_action_aux_weight: 0.5
   feature_weight: 1.0
   feature_patch_weight: 1.0
   feature_cls_weight: 0.0
@@ -164,7 +200,7 @@ training:
   direct_action_head_lr_mult: 10.0
   weight_decay: 0.0
   warmup_steps: 0
-  max_epochs: 5
+  max_epochs: 10
   max_steps: 1
   scheduler_total_steps: 0
   min_lr_ratio: 0.05

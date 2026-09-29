@@ -37,6 +37,12 @@ class FrozenQwen35Conditioner(nn.Module):
         use_reference_image: bool = True,
         prompt_mode: str = "temporal_pair",
         token_selection: str = "all",
+        lora_enabled: bool = False,
+        lora_rank: int = 32,
+        lora_alpha: float = 16.0,
+        lora_dropout: float = 0.0,
+        action_placeholder_count: int = 0,
+        action_attention_mode: str = "causal",
     ) -> None:
         super().__init__()
         self.encoder = FrozenQwen35SemanticEncoder(
@@ -45,11 +51,16 @@ class FrozenQwen35Conditioner(nn.Module):
             attention_implementation=attention_implementation,
             prompt_mode=prompt_mode,
             token_selection=token_selection,
+            lora_enabled=lora_enabled,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            action_placeholder_count=action_placeholder_count,
+            action_attention_mode=action_attention_mode,
         )
         self.use_reference_image = bool(use_reference_image)
         self.hidden_size = int(self.encoder.hidden_size)
 
-    @torch.no_grad()
     def encode_tokens(
         self,
         texts: Sequence[str],
@@ -64,11 +75,14 @@ class FrozenQwen35Conditioner(nn.Module):
                 "[B,2,V,3,H,W]."
             )
         current_states = None
-        if self.encoder.prompt_mode == "current_image_openvla":
+        if self.encoder.prompt_mode in {
+            "current_image_action_question",
+            "current_image_openvla",
+        }:
             if current_pose is None:
                 raise ValueError(
-                    "current_image_openvla requires current_pose for the "
-                    "Current State prompt field."
+                    f"{self.encoder.prompt_mode} requires current_pose for "
+                    "the Current State prompt field."
                 )
             pose = current_pose.detach().float()
             if pose.ndim != 2 or pose.shape[0] != len(texts):
@@ -121,6 +135,16 @@ def build_stage2_conditioner(stage1_cfg, model_cfg) -> nn.Module:
             ),
             prompt_mode=str(stage1_cfg.get("qwen_prompt_mode", "temporal_pair")),
             token_selection=str(stage1_cfg.get("qwen_token_selection", "all")),
+            lora_enabled=bool(stage1_cfg.get("qwen_lora_enabled", False)),
+            lora_rank=int(stage1_cfg.get("qwen_lora_rank", 32)),
+            lora_alpha=float(stage1_cfg.get("qwen_lora_alpha", 16)),
+            lora_dropout=float(stage1_cfg.get("qwen_lora_dropout", 0.0)),
+            action_placeholder_count=int(
+                stage1_cfg.get("qwen_action_placeholder_count", 0)
+            ),
+            action_attention_mode=str(
+                stage1_cfg.get("qwen_action_attention_mode", "causal")
+            ),
         )
     return TextConditioner(
         encoder_type=encoder_type,

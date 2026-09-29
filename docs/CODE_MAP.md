@@ -17,12 +17,13 @@ The run configuration is loaded with OmegaConf and command-line overrides use
 ## Remote execution path
 
 ```text
-scripts/uavflow_handoff.sh
-  -> scripts/setup_uavflow_remote.sh
-  -> scripts/download_uavflow_assets.sh
+scripts/setup_uavflow_remote.py
+scripts/download_uavflow_assets.py
   -> scripts/verify_uavflow_remote.py
-  -> experiments/uavflow_remote_ablation/run_server.sh
+  -> experiments/uavflow_remote_ablation/jobs_v2/<one experiment>.py
+  -> experiments/uavflow_remote_ablation/run_experiment.py
 ```
 
 Generated checkpoints, logs and evaluation media are intentionally not part of
-this source release. Machine-specific paths are supplied through `server.env`.
+this source release. Machine-specific paths are supplied through the exported
+variables in `docs/REMOTE_TRAINING.md`.

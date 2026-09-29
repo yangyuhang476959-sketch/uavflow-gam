@@ -10,6 +10,7 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader
 
 from robot.data.dataset import ActionNormalizer
+from robot.modeling.action_head_causal_token import normalized_token_cross_entropy
 from robot.modeling.da3_giant_encoder import DA3GiantEncoder
 from robot.modeling.lora import LoRALinear
 
@@ -831,6 +832,7 @@ def forward_batch(
     amp: bool,
     action_direct_weight: float = 1.0,
     action_refine_weight: float = 1.0,
+    dual_branch_action_aux_weight: float = 0.5,
     depth_target_source: str = "ue_gt",
     depth_scale_mode: str = "per_frame_median",
     depth_target_mode: str = "future",
@@ -874,6 +876,11 @@ def forward_batch(
         "cuda", dtype=torch.bfloat16, enabled=bool(amp and images.is_cuda)
     ):
         encoded_shallow = da3.encode_shallow_visual_slots(flat, T=encoded_steps, V=views)["visual_tokens"]
+    # Qwen is usually frozen, but the optional OpenVLA-UAV-scale LoRA must
+    # retain its graph. The conditioner itself selects no_grad in frozen mode.
+    with torch.amp.autocast(
+        "cuda", dtype=torch.bfloat16, enabled=bool(amp and images.is_cuda)
+    ):
         language = encode_stage2_condition(
             text,
             list(batch["task_description"]),
@@ -967,6 +974,7 @@ def forward_batch(
             stop_pose=stop_pose,
             lang_feats=language["last_hidden_state"],
             lang_padding_mask=language["attention_mask"],
+            action_targets_norm=target_norm_full,
             conditioning_generator=conditioning_generator,
         )
         geometry_architecture = getattr(model_ref, "geometry_architecture", "legacy")
@@ -985,14 +993,47 @@ def forward_batch(
         zero = output["actions_norm"].new_zeros(())
         direct_prediction = output.get("direct_actions_norm")
         refine_prediction = output.get("refine_actions_norm")
+        token_logits = output.get("action_token_logits")
+        token_targets = output.get("action_token_target_ids")
         action_direct = (
             masked_action_l1(direct_prediction, target_norm_full, action_mask_full)
             if isinstance(direct_prediction, torch.Tensor) else zero
         )
-        action_refine = (
-            masked_action_l1(refine_prediction, target_norm_full, action_mask_full)
-            if isinstance(refine_prediction, torch.Tensor) else zero
-        )
+        if isinstance(token_logits, torch.Tensor):
+            if not isinstance(token_targets, torch.Tensor):
+                raise RuntimeError("Causal action logits require teacher-forced target token IDs.")
+            action_refine = normalized_token_cross_entropy(
+                token_logits, token_targets, action_mask_full
+            )
+        else:
+            action_refine = (
+                masked_action_l1(refine_prediction, target_norm_full, action_mask_full)
+                if isinstance(refine_prediction, torch.Tensor) else zero
+            )
+        dual_action_current = zero
+        dual_action_future = zero
+        dual_predictions = output.get("dual_refine_actions_norm")
+        if isinstance(dual_predictions, torch.Tensor):
+            if dual_predictions.ndim != 5 or dual_predictions.shape[2] != 2:
+                raise ValueError(
+                    "dual_refine_actions_norm must be [B,T,2,K,A], got "
+                    f"{tuple(dual_predictions.shape)}"
+                )
+            dual_action_current = masked_action_l1(
+                dual_predictions[:, :, 0], target_norm_full, action_mask_full
+            )
+            dual_action_future = masked_action_l1(
+                dual_predictions[:, :, 1], target_norm_full, action_mask_full
+            )
+            alpha = float(dual_branch_action_aux_weight)
+            if alpha < 0.0:
+                raise ValueError("dual_branch_action_aux_weight must be non-negative")
+            # Preserve the external GAM action weight: auxiliary branch losses
+            # redistribute L_action rather than increasing its total scale.
+            action_refine = (
+                action_refine
+                + 0.5 * alpha * (dual_action_current + dual_action_future)
+            ) / (1.0 + alpha)
         if not isinstance(direct_prediction, torch.Tensor) and not isinstance(
             refine_prediction, torch.Tensor
         ):
@@ -1110,12 +1151,24 @@ def forward_batch(
                 "total": zero, "patch": zero, "cls": zero,
                 "cosine": zero, "per_level": zero.new_zeros(0),
             }
+        depth_branches = {}
         if depth_enabled:
             target_mode = str(depth_target_mode).lower()
             if geometry_architecture in {"current_prediction", "direct_current"} and target_mode != "current":
                 raise ValueError("Current architectures require loss.depth_target_mode=current")
-            if geometry_architecture.startswith("dual_") and target_mode != "both":
+            if geometry_architecture in {
+                "dual_observed", "dual_predicted", "dual_action_bridge"
+            } and target_mode != "both":
                 raise ValueError("Dual architectures require loss.depth_target_mode=both")
+            if (
+                geometry_architecture == "dual_vla_gfm"
+                and target_mode in {"current", "both"}
+                and not bool(getattr(model_ref, "parallel_current_depth_enabled", True))
+            ):
+                raise ValueError(
+                    "dual_vla_gfm current depth target requires "
+                    "model.parallel_current_depth_enabled=true"
+                )
             if target_mode not in {"future", "current", "both"}:
                 raise ValueError(
                     f"Unsupported depth_target_mode={depth_target_mode!r}; "
@@ -1235,7 +1288,8 @@ def forward_batch(
                     future_start = (
                         feature_target_offset if dense_context else int(context_len)
                     )
-                    losses.append(_ue_loss(future_pred_depth, future_start))
+                    depth_branches["future"] = _ue_loss(future_pred_depth, future_start)
+                    losses.append(depth_branches["future"])
                 if target_mode in {"current", "both"}:
                     # CA1_HB already needs this pass for action. Reuse its graph
                     # for current depth rather than executing DA3 a third time.
@@ -1257,7 +1311,8 @@ def forward_batch(
                             da3, current_features["deep_levels"],
                             batch_size=batch_size, steps=action_steps, views=views,
                         )
-                    losses.append(_ue_loss(current_pred_depth, 0))
+                    depth_branches["current"] = _ue_loss(current_pred_depth, 0)
+                    losses.append(depth_branches["current"])
                 depth_values = {
                     key: sum(item[key] for item in losses) / float(len(losses))
                     for key in losses[0]
@@ -1326,10 +1381,35 @@ def forward_batch(
     valid_slot = mask_chunk.bool().all(dim=-1)
     zero_slot = (raw_chunk.abs().amax(dim=-1) <= 1.0e-8) & valid_slot
     zero_slot_fraction = zero_slot.float().sum() / valid_slot.float().sum().clamp_min(1.0)
+    # Detached sufficient statistics: aggregate sums, never average batch stds.
+    with torch.no_grad():
+        pred = prediction_raw.detach().float().reshape(-1, prediction_raw.shape[-1])
+        truth = target_raw_full.detach().float().reshape_as(pred)
+        weights = action_mask_full.detach().float().reshape_as(pred)
+        action_moments = torch.stack([
+            weights.sum(0), (pred * weights).sum(0),
+            (pred.square() * weights).sum(0), (truth * weights).sum(0),
+            (truth.square() * weights).sum(0),
+            ((pred - truth).abs() * weights).sum(0),
+        ])
+    branch_metrics = {
+        f"depth_{branch}_{key}": metrics.get(key, zero).detach()
+        for branch, metrics in depth_branches.items()
+        for key in ("total", "linear_l1", "log_l1", "grad", "valid_ratio", "semantic_ratio")
+    }
     return {
+        **branch_metrics,
+        "action_raw_moments": action_moments,
         "feature": feature_values["total"],
         "action_direct": action_direct,
         "action_refine": action_refine,
+        "action_dual_current": dual_action_current,
+        "action_dual_future": dual_action_future,
+        "action_dual_future_gate": (
+            output["dual_action_future_weight"].mean()
+            if isinstance(output.get("dual_action_future_weight"), torch.Tensor)
+            else zero
+        ),
         "feature_patch": feature_values["patch"],
         "feature_cls": feature_values["cls"],
         "feature_register": feature_values["register"],
@@ -1424,6 +1504,7 @@ def evaluate(
     amp: bool,
     action_direct_weight: float = 1.0,
     action_refine_weight: float = 1.0,
+    dual_branch_action_aux_weight: float = 0.5,
     depth_target_source: str = "ue_gt",
     depth_scale_mode: str = "per_frame_median",
     depth_target_mode: str = "future",
@@ -1443,6 +1524,12 @@ def evaluate(
 ) -> dict[str, float]:
     model.eval()
     sums = {h: torch.zeros(37, device=device) for h in contexts}
+    from experiments.uavflow_predictor_idm.logging_metrics import action_statistics
+    moment_sums = {h: torch.zeros(6, 4, dtype=torch.float64, device=device) for h in contexts}
+    branch_keys = [f"depth_{branch}_{key}" for branch in ("current", "future")
+                   for key in ("total", "linear_l1", "log_l1", "grad", "valid_ratio", "semantic_ratio")]
+    branch_sums = {h: torch.zeros(len(branch_keys), device=device) for h in contexts}
+    dual_action_sums = {h: torch.zeros(3, device=device) for h in contexts}
     # Per rollout step: total feature MSE, patch MSE, CLS MSE, cosine.
     model_ref = model.module if hasattr(model, "module") else model
     dense_context = bool(getattr(model_ref, "dense_context_supervision", False))
@@ -1493,6 +1580,7 @@ def evaluate(
                 amp=amp,
                 action_direct_weight=action_direct_weight,
                 action_refine_weight=action_refine_weight,
+                dual_branch_action_aux_weight=dual_branch_action_aux_weight,
                 depth_target_source=depth_target_source,
                 depth_scale_mode=depth_scale_mode,
                 depth_target_mode=depth_target_mode,
@@ -1557,6 +1645,15 @@ def evaluate(
                 values["depth_scene_scale_mean"],
             ]) * count
             sums[context][36] += count
+            moment_sums[context] += values["action_raw_moments"].double()
+            for index, key in enumerate(branch_keys):
+                if key in values:
+                    branch_sums[context][index] += values[key] * count
+            dual_action_sums[context] += torch.stack([
+                values["action_dual_current"],
+                values["action_dual_future"],
+                values["action_dual_future_gate"],
+            ]) * count
             pose_axis_sums[context] += torch.cat([
                 values["relative_pose_translation_axes"],
                 values["action_rollout_pose_translation_axes"],
@@ -1592,6 +1689,12 @@ def evaluate(
                 threshold_counts[2] += (~stop_prediction & stop_positive).sum()
                 threshold_counts[3] += (~stop_prediction & ~stop_positive).sum()
     if dist.is_initialized():
+        for value in moment_sums.values():
+            dist.all_reduce(value)
+        for value in branch_sums.values():
+            dist.all_reduce(value)
+        for value in dual_action_sums.values():
+            dist.all_reduce(value)
         for value in sums.values():
             dist.all_reduce(value)
         for value in horizon_sums.values():
@@ -1609,8 +1712,25 @@ def evaluate(
     result: dict[str, float] = {}
     for context, value in sums.items():
         count = value[36].clamp_min(1.0)
+        for metric, vector in action_statistics(moment_sums[context]).items():
+            for axis, scalar in zip(("x", "y", "z", "yaw"), vector):
+                result[f"H{context}_action_raw_{metric}_{axis}"] = float(scalar)
+        for index, key in enumerate(branch_keys):
+            branch = key.split("_")[1]
+            if (getattr(model_ref, "depth_decode_enabled", False)
+                    and depth_target_source == "ue_gt" and depth_target_mode in (branch, "both")):
+                result[f"H{context}_{key}"] = float(branch_sums[context][index] / count)
         result |= {
             f"H{context}_action": float((value[0] / count).item()),
+            f"H{context}_action_dual_current": float(
+                (dual_action_sums[context][0] / count).item()
+            ),
+            f"H{context}_action_dual_future": float(
+                (dual_action_sums[context][1] / count).item()
+            ),
+            f"H{context}_action_dual_future_gate": float(
+                (dual_action_sums[context][2] / count).item()
+            ),
             f"H{context}_direct_action": float((value[0] / count).item()),
             f"H{context}_feature": float((value[1] / count).item()),
             f"H{context}_feat_patch": float((value[2] / count).item()),

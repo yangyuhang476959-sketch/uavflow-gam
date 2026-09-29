@@ -83,6 +83,15 @@ class Tests(unittest.TestCase):
             read.gate.zero_()
         self.assertTrue(torch.equal(read(actions, patches), actions))
 
+    def test_current_only_memory_is_half_width(self):
+        read = CurrentGeometryRead(16, width=32, heads=4, memory_dim=16)
+        actions = torch.randn(2, 1, 1, 5, 16, requires_grad=True)
+        patches = torch.randn(2, 1, 1, 7, 16, requires_grad=True)
+        result = read(actions, patches, layer_index=19)
+        self.assertEqual(result.shape, actions.shape)
+        result.square().mean().backward()
+        self.assertGreater(patches.grad.abs().sum().item(), 0)
+
     def test_forward_cache_and_unchanged_old_parameters(self):
         torch.manual_seed(7)
         baseline = model(False)
@@ -114,6 +123,7 @@ class Tests(unittest.TestCase):
         optimizer.step()
         buffer = io.BytesIO()
         torch.save({"current_geometry_read": first.current_geometry_read.state_dict(),
+                    "current_geometry_bank_mode": first.current_geometry_bank_mode,
                     "optimizer": optimizer.state_dict()}, buffer)
         buffer.seek(0)
         ckpt = torch.load(buffer, weights_only=False)
@@ -127,16 +137,19 @@ class Tests(unittest.TestCase):
             load_current_geometry_read(second, {}, required=True)
         load_current_geometry_read(model(False), {}, required=True)
 
-    def test_matrix_appended_without_reindex(self):
+    def test_v2_matrix_is_exact_and_residual_is_matched(self):
         root = Path(__file__).parent
         with (root / "compact_matrix.tsv").open() as stream:
             rows = list(csv.DictReader(stream, delimiter="\t"))
-        self.assertEqual(len(rows), 25)
-        self.assertEqual(rows[20]["id"], "C5_F10HB")
-        self.assertEqual(rows[21]["id"], "CA1_HB")
-        hb = next(row for row in rows if row["id"] == "HB")
-        for key in hb.keys() - {"id", "purpose", "geometry_architecture"}:
-            self.assertEqual(hb[key], rows[21][key])
+        self.assertEqual(
+            [row["id"] for row in rows],
+            ["G0", "G1", "C0", "C1", "Q0", "S0", "S1", "S2", "R1", "DV"],
+        )
+        s2 = next(row for row in rows if row["id"] == "S2")
+        r1 = next(row for row in rows if row["id"] == "R1")
+        for key in s2.keys() - {"id", "purpose", "action_decode"}:
+            self.assertEqual(s2[key], r1[key])
+        self.assertEqual(r1["action_decode"], "geometry_residual")
 
 
 if __name__ == "__main__":

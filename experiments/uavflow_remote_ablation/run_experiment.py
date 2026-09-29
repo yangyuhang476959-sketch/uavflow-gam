@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+"""Run one VLA--GAM matrix cell on one 8-GPU node.
+
+The scheduler-facing command is always Python. The process performs the data
+audit, creates/reuses one immutable split, resumes interrupted epoch
+checkpoints, and runs Stage 1 then joint Stop Stage 2.
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import os
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+from experiments.uavflow_remote_ablation.matrix_v2 import EXPERIMENTS, overrides
+
+
+ROOT = Path(__file__).resolve().parents[2]
+CONFIG = ROOT / "experiments/uavflow_remote_ablation/base.yaml"
+
+
+def required_path(env: str, default: Path | None = None) -> Path:
+    value = os.environ.get(env)
+    path = Path(value).expanduser().resolve() if value else default
+    if path is None or not path.exists():
+        raise FileNotFoundError(f"Set {env}; missing path: {path}")
+    return path
+
+
+def latest_checkpoint(directory: Path) -> Path | None:
+    last = directory / "last.pt"
+    if last.is_file() and last.stat().st_size:
+        return last
+    candidates = sorted(directory.glob("ckpt_*.pt"))
+    return candidates[-1] if candidates else None
+
+
+def tee_run(command: list[str], *, env: dict[str, str], log: Path) -> None:
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with log.open("a", encoding="utf-8") as stream:
+        process = subprocess.Popen(
+            command, cwd=ROOT, env=env, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1,
+        )
+        assert process.stdout is not None
+        for line in process.stdout:
+            sys.stdout.write(line)
+            stream.write(line)
+            stream.flush()
+        status = process.wait()
+    if status:
+        raise subprocess.CalledProcessError(status, command)
+
+
+def set_args(values: list[str] | tuple[str, ...]) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        result += ["--set", value]
+    return result
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("experiment", choices=tuple(EXPERIMENTS))
+    parser.add_argument("--stage", choices=("both", "stage1", "stage2"), default="both")
+    parser.add_argument("--max-trajectories", type=int)
+    args = parser.parse_args()
+
+    python = Path(os.environ.get("PYTHON_BIN", sys.executable)).resolve()
+    sim = required_path("UAVFLOW_SIM_ROOT", ROOT / "data_remote/UAV-Flow-Sim")
+    depth = required_path(
+        "UAVFLOW_DEPTH_ROOT", ROOT / "data_remote/UAV-Flow-Sim-Depth"
+    )
+    da3 = required_path("DA3_CHECKPOINT", ROOT / "checkpoints/track4world_da3.pth")
+    qwen = required_path("QWEN_MODEL", ROOT / "checkpoints/qwen3.5-2b")
+    t5 = required_path("T5_MODEL", ROOT / "checkpoints/t5-base")
+    output_root = Path(
+        os.environ.get("OUTPUT_ROOT", ROOT / "results/vla_gam_matrix_v2")
+    ).resolve()
+    split = Path(
+        os.environ.get("SPLIT_FILE", output_root / "shared_split_seed42.json")
+    ).resolve()
+    nproc = int(os.environ.get("NPROC", "8"))
+    global_batch = int(os.environ.get("GLOBAL_BATCH_SIZE", "32"))
+    if global_batch % nproc:
+        raise ValueError("GLOBAL_BATCH_SIZE must be divisible by NPROC")
+    per_gpu_batch = global_batch // nproc
+    cuda_devices = os.environ.get(
+        "CUDA_DEVICES", ",".join(str(index) for index in range(nproc))
+    )
+    stage1_epochs = int(os.environ.get("STAGE1_EPOCHS", "10"))
+    stage2_epochs = int(os.environ.get("STAGE2_EPOCHS", "10"))
+    base_lr = float(os.environ.get("BASE_LR", "5e-5"))
+
+    env = os.environ.copy()
+    env.update({
+        "CUDA_VISIBLE_DEVICES": cuda_devices,
+        "PYTHONPATH": f"{ROOT / 'src'}:{ROOT}:" + env.get("PYTHONPATH", ""),
+        "PYTORCH_CUDA_ALLOC_CONF": env.get(
+            "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"
+        ),
+    })
+    subprocess.run([
+        str(python), str(ROOT / "scripts/verify_uavflow_remote.py"),
+        "--sim-root", str(sim), "--depth-root", str(depth),
+        "--da3-checkpoint", str(da3), "--qwen-model", str(qwen),
+        "--t5-model", str(t5),
+    ], cwd=ROOT, env=env, check=True)
+
+    common = [
+        f"stage1.da3_checkpoint={da3}",
+        f"stage1.idm_checkpoint={ROOT / 'results/robot/unused-idm.pt'}",
+        f"stage1.action_stats_dir={ROOT / 'data/uavflow_stats_sim_openvla_yaw4d'}",
+        f"stage1.qwen_model={qwen}", f"stage1.t5_model={t5}",
+        f"dataset.parquet_root={sim}",
+        f"dataset.gt_depth_root={depth / 'hybrid'}",
+        f"dataset.gt_depth_fallback_roots=['{depth / 'replay'}']",
+        f"dataset.instruction_overrides_path={depth / 'metadata/instruction_overrides.json'}",
+        f"training.batch_size={per_gpu_batch}",
+        f"training.num_workers={int(os.environ.get('NUM_WORKERS', '4'))}",
+        f"training.lr={base_lr}", "training.save_latest_every=0",
+        f"dataset.split_file={split}",
+    ]
+    if args.max_trajectories is not None:
+        common.append(f"dataset.max_trajectories={args.max_trajectories}")
+
+    split.parent.mkdir(parents=True, exist_ok=True)
+    with (split.with_suffix(split.suffix + ".lock")).open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not split.is_file() or not split.stat().st_size:
+            split_common = [item for item in common if not item.startswith("dataset.split_file=")]
+            subprocess.run([
+                str(python),
+                str(ROOT / "experiments/uavflow_remote_ablation/prepare_split.py"),
+                "--config", str(CONFIG), "--output", str(split),
+                *set_args(split_common),
+            ], cwd=ROOT, env=env, check=True)
+
+    experiment_root = output_root / args.experiment
+    variant = list(overrides(args.experiment))
+
+    def run_stage(stage: str, init: Path | None = None) -> Path:
+        stage_dir = experiment_root / stage
+        success = stage_dir / "_SUCCESS"
+        if success.is_file() and success.read_text().strip():
+            return Path(success.read_text().strip())
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        resume = latest_checkpoint(stage_dir)
+        stage_values = [f"training.results_dir={stage_dir}"]
+        checkpoint: list[str] = []
+        if resume is not None:
+            checkpoint = ["--resume", str(resume)]
+        elif init is not None:
+            checkpoint = ["--init-checkpoint", str(init)]
+        if stage == "stage1":
+            stage_values += [
+                "model.stop_head_enabled=false", "loss.stop_weight=0.0",
+                "training.lr_schedule=constant", "training.warmup_steps=0",
+                f"training.max_epochs={stage1_epochs}",
+            ]
+        else:
+            stage_values += [
+                "model.stop_head_enabled=true",
+                "model.stop_head_mode=action_hidden_pose",
+                "loss.stop_weight=1.0", "loss.stop_pos_weight=5.0",
+                f"training.lr={base_lr * 0.1}", "training.stop_head_lr=5e-4",
+                "training.lr_schedule=cosine", "training.warmup_steps=500",
+                "training.min_lr_ratio=0.05",
+                f"training.max_epochs={stage2_epochs}",
+            ]
+        command = [
+            str(python), "-m", "torch.distributed.run", "--standalone",
+            f"--nproc_per_node={nproc}",
+            str(ROOT / "experiments/uavflow_predictor_idm/train.py"),
+            "--config", str(CONFIG), *checkpoint,
+            *set_args(common + variant + stage_values),
+        ]
+        state = stage_dir / "run_state.txt"
+        state.write_text(
+            f"experiment={args.experiment}\nstage={stage}\nstart={datetime.now().isoformat()}\n"
+            f"nproc={nproc}\nper_gpu_batch={per_gpu_batch}\nglobal_batch={global_batch}\n"
+            f"split_sha256={hashlib.sha256(split.read_bytes()).hexdigest()}\n"
+        )
+        tee_run(command, env=env, log=stage_dir / "console.log")
+        final = latest_checkpoint(stage_dir)
+        if final is None:
+            raise RuntimeError(f"No checkpoint produced in {stage_dir}")
+        success.write_text(str(final) + "\n")
+        with state.open("a") as stream:
+            stream.write(f"status=complete\ncheckpoint={final}\nend={datetime.now().isoformat()}\n")
+        return final
+
+    stage1_checkpoint: Path | None = None
+    if args.stage in {"both", "stage1"}:
+        stage1_checkpoint = run_stage("stage1")
+    if args.stage in {"both", "stage2"}:
+        if stage1_checkpoint is None:
+            marker = experiment_root / "stage1/_SUCCESS"
+            if not marker.is_file():
+                raise FileNotFoundError("Stage 2 requires completed Stage 1")
+            stage1_checkpoint = Path(marker.read_text().strip())
+        run_stage("stage2_stop", init=stage1_checkpoint)
+
+
+if __name__ == "__main__":
+    main()

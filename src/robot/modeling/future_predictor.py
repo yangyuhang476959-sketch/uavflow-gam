@@ -279,6 +279,7 @@ class ShallowRoPE(nn.Module):
         num_prefix_visual: int,
         device: torch.device,
         include_proprio_slot: bool = True,
+        num_action_slots: int = 1,
     ) -> torch.Tensor:
         """Return integer positions for every token in the sequence.
 
@@ -295,7 +296,11 @@ class ShallowRoPE(nn.Module):
             IntTensor (L, 4) with columns (t, v, y, x).
         """
         tokens_per_view = num_prefix_visual + num_patches
-        tokens_per_step = V * tokens_per_view + (2 if bool(include_proprio_slot) else 1)
+        if int(num_action_slots) <= 0:
+            raise ValueError("num_action_slots must be positive")
+        tokens_per_step = V * tokens_per_view + (
+            (1 if bool(include_proprio_slot) else 0) + int(num_action_slots)
+        )
         L = H * tokens_per_step
 
         pos = torch.empty(L, 4, device=device, dtype=torch.long)
@@ -331,12 +336,15 @@ class ShallowRoPE(nn.Module):
                 pos[idx, 2] = 0
                 pos[idx, 3] = 0
                 idx += 1
-            # Prev-action slot: (t, V+1, 0, 0) with proprio, else (t, V, 0, 0)
-            pos[idx, 0] = t
-            pos[idx, 1] = V + (1 if bool(include_proprio_slot) else 0)
-            pos[idx, 2] = 0
-            pos[idx, 3] = 0
-            idx += 1
+            # Action-plan slots share the non-spatial action axis. Their
+            # learned slot/order embeddings distinguish the K chunk steps;
+            # assigning fake image coordinates here would be incorrect.
+            for _ in range(int(num_action_slots)):
+                pos[idx, 0] = t
+                pos[idx, 1] = V + (1 if bool(include_proprio_slot) else 0)
+                pos[idx, 2] = 0
+                pos[idx, 3] = 0
+                idx += 1
         assert idx == L
         return pos
 
@@ -887,6 +895,7 @@ class GAMFuturePredictor(nn.Module):
         condition_mode: str = "cross_attn",
         input_proj_norm: str = "ln",
         gradient_checkpointing: bool = False,
+        num_action_slots: int = 1,
     ):
         super().__init__()
         self.d_da3 = int(d_da3)
@@ -918,9 +927,14 @@ class GAMFuturePredictor(nn.Module):
         self.proprio_dim = int(proprio_dim)
         self.action_dim = int(action_dim)
         self.action_chunk_size = int(action_chunk_size)
+        self.num_action_slots = int(num_action_slots)
+        if self.num_action_slots <= 0:
+            raise ValueError("num_action_slots must be positive")
         self.action_history_dim = self.action_dim * self.action_chunk_size
         self.use_proprio_input = bool(use_proprio_input)
-        self.extra_tokens_per_step = 2 if self.use_proprio_input else 1
+        self.extra_tokens_per_step = (
+            (1 if self.use_proprio_input else 0) + self.num_action_slots
+        )
         self.use_gradient_checkpointing = bool(gradient_checkpointing)
 
         condition_mode = str(condition_mode).strip().lower()
@@ -1002,6 +1016,14 @@ class GAMFuturePredictor(nn.Module):
             nn.SiLU(),
             nn.Linear(d_model, d_model),
         )
+        if self.num_action_slots > 1:
+            self.action_slot_embed = nn.Parameter(
+                torch.zeros(1, 1, self.num_action_slots, d_model)
+            )
+            nn.init.normal_(self.action_slot_embed, std=0.02)
+        else:
+            # Preserve the exact released K=1 predictor state_dict.
+            self.register_parameter("action_slot_embed", None)
 
         # --- Transformer stack ---
         # cross_attn: per-block self-attn + cross-attn-to-language + FFN.
@@ -1471,6 +1493,7 @@ class GAMFuturePredictor(nn.Module):
         past_action_history: Optional[torch.Tensor] = None, # (B, H, chunk, action_dim)
         past_action_history_valid_mask: Optional[torch.Tensor] = None,
         missing_action_embed: Optional[torch.Tensor] = None,
+        action_slot_seed: Optional[torch.Tensor] = None,
         step_role_embeddings: Optional[torch.Tensor] = None,  # (B,H,d_model)
         lang_feats: Optional[torch.Tensor] = None,
         lang_padding_mask: Optional[torch.Tensor] = None,
@@ -1527,7 +1550,41 @@ class GAMFuturePredictor(nn.Module):
             dtype=context.dtype,
             valid_mask=past_action_history_valid_mask,
             missing_action_embed=missing_action_embed,
-        ).unsqueeze(2)   # (B, H, 1, d_model)
+        ).unsqueeze(2).expand(-1, -1, self.num_action_slots, -1).contiguous()
+        if self.action_slot_embed is not None:
+            action_history_tokens = action_history_tokens + self.action_slot_embed.to(
+                device=device, dtype=context.dtype
+            )
+        if action_slot_seed is not None:
+            seed = action_slot_seed.to(device=device, dtype=context.dtype)
+            if seed.ndim == 2 and self.num_action_slots == 1:
+                if seed.shape != (b, self.d_model):
+                    raise ValueError(
+                        f"action_slot_seed shape {tuple(seed.shape)} != {(b, self.d_model)}."
+                    )
+                # The VLM describes the current observation/instruction.  In a
+                # fixed-F0 sequence it must initialize only the final/current
+                # action slot, never the synthetic reference slot.
+                expanded = torch.zeros(
+                    b, H, self.d_model, device=device, dtype=context.dtype
+                )
+                expanded[:, -1] = seed
+                seed = expanded.unsqueeze(2)
+            elif seed.ndim == 3 and seed.shape == (b, H, self.d_model) and self.num_action_slots == 1:
+                seed = seed.unsqueeze(2)
+            elif seed.ndim == 3 and seed.shape == (b, self.num_action_slots, self.d_model):
+                expanded = torch.zeros(
+                    b, H, self.num_action_slots, self.d_model,
+                    device=device, dtype=context.dtype,
+                )
+                expanded[:, -1] = seed
+                seed = expanded
+            elif seed.shape != (b, H, self.num_action_slots, self.d_model):
+                raise ValueError(
+                    "action_slot_seed must be [B,D] (K=1), [B,H,D] (K=1), "
+                    f"[B,K,D], or [B,H,K,D]; got {tuple(seed.shape)}"
+                )
+            action_history_tokens = action_history_tokens + seed
 
         # 3. Assemble per-step blocks and flatten across steps.
         if proprio_tokens is not None:
@@ -1562,6 +1619,7 @@ class GAMFuturePredictor(nn.Module):
             num_prefix_visual=self.num_prefix_visual,
             device=device,
             include_proprio_slot=self.use_proprio_input,
+            num_action_slots=self.num_action_slots,
         )
 
         # 5. Resolve language conditioning. Three paths:
@@ -1734,10 +1792,10 @@ class GAMFuturePredictor(nn.Module):
         visual_h_raw = x[:, :, : V * P].reshape(b, H, V, P, self.d_model)
         if self.use_proprio_input:
             proprio_h = x[:, :, V * P]
-            action_history_h = x[:, :, V * P + 1]
+            action_history_h = x[:, :, V * P + 1:V * P + 1 + self.num_action_slots]
         else:
             proprio_h = None
-            action_history_h = x[:, :, V * P]
+            action_history_h = x[:, :, V * P:V * P + self.num_action_slots]
 
         # 9. Pre-norm output heads. Action token comes from the *dedicated
         #    action slot* hidden (action_history_h), separate from visual CLS.
@@ -1750,13 +1808,15 @@ class GAMFuturePredictor(nn.Module):
         proprio_h_norm = self.out_proprio_norm(proprio_h) if proprio_h is not None else None
 
         z_next_all = self.future_visual_proj(visual_h).to(past_visual_tokens.dtype)
-        action_token_per_step = self.action_proj(action_h)                     # (B, H, d_da3)
+        action_token_per_step = self.action_proj(action_h)                     # (B,H,K,d_da3)
         action_token_all = (
             action_token_per_step.unsqueeze(2)
-            .expand(-1, -1, V, -1)
+            .expand(-1, -1, V, -1, -1)
             .contiguous()
             .to(past_visual_tokens.dtype)
-        )                                                                       # (B, H, V, d_da3)
+        )                                                                       # (B,H,V,K,d_da3)
+        if self.num_action_slots == 1:
+            action_token_all = action_token_all.squeeze(3)                    # legacy contract
         s_next_all = (
             self.future_proprio_proj(proprio_h_norm).to(past_visual_tokens.dtype)
             if proprio_h_norm is not None
@@ -1764,9 +1824,10 @@ class GAMFuturePredictor(nn.Module):
         )
         if view_keep is not None:
             z_next_all = z_next_all * view_keep[:, :, :, None, None].to(dtype=z_next_all.dtype)
-            action_token_all = action_token_all * view_keep[:, :, :, None].to(
-                dtype=action_token_all.dtype
-            )
+            view_weight = view_keep[:, :, :, None].to(dtype=action_token_all.dtype)
+            if action_token_all.ndim == 5:
+                view_weight = view_weight.unsqueeze(-1)
+            action_token_all = action_token_all * view_weight
 
         # 10. Optional SIGReg on pooled predicted-future-visual.
         sigreg_loss = None
@@ -1787,7 +1848,10 @@ class GAMFuturePredictor(nn.Module):
             "predicted_next_visual_tokens": z_next_all,
             "predicted_next_proprio": s_next_all,
             "predicted_action_tokens": action_token_all,
-            "encoded_prev_action_tokens": action_history_h,
+            "encoded_prev_action_tokens": (
+                action_history_h.squeeze(2)
+                if self.num_action_slots == 1 else action_history_h
+            ),
             "encoded_proprio_tokens": proprio_h,
             "sigreg_loss": sigreg_loss,
         }

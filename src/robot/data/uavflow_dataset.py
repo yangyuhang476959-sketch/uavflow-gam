@@ -284,6 +284,7 @@ class UAVFlowParquetDataset(Dataset):
                  dataset_name="uavflow", max_trajectories=None, source_fps=1.0,
                  expected_shards=None, action_stats_key=None, translation_scale=1.0,
                  openvla_uav_compatible=False, terminal_zero_action=False,
+                 openvla_prompt_pose_mode="preprocessed",
                  endpoint_repeat_count=None, endpoint_self_pair_count=0,
                  endpoint_self_pair_start_count=None, endpoint_self_pair_end_count=None,
                  endpoint_terminal_window_repeat_count=0,
@@ -381,6 +382,12 @@ class UAVFlowParquetDataset(Dataset):
         self.translation_scale=float(translation_scale)
         self.fps=float(source_fps)
         self.openvla_uav_compatible=bool(openvla_uav_compatible)
+        self.openvla_prompt_pose_mode=str(openvla_prompt_pose_mode).strip().lower()
+        if self.openvla_prompt_pose_mode not in {"preprocessed", "evaluator_yaw4d"}:
+            raise ValueError(
+                "openvla_prompt_pose_mode must be 'preprocessed' or "
+                f"'evaluator_yaw4d', got {openvla_prompt_pose_mode!r}."
+            )
         delta_mode_aliases = {
             "openvla": "openvla_yaw_only",
             "yaw_only": "openvla_yaw_only",
@@ -510,7 +517,11 @@ class UAVFlowParquetDataset(Dataset):
                         text=meta.get("instruction_unified") or meta.get("instruction") or ""
                         logs[tid]=(meta.get("raw_logs",[]),self.instruction_overrides.get(tid,text))
                         preprocessed=np.asarray(meta.get("preprocessed_logs",[]),dtype=np.float32)
-                        if preprocessed.ndim == 2 and preprocessed.shape[1] >= 5:
+                        if (
+                            self.openvla_prompt_pose_mode == "preprocessed"
+                            and preprocessed.ndim == 2
+                            and preprocessed.shape[1] >= 5
+                        ):
                             # Exact OpenVLA-UAV Current State: first-frame
                             # camera coordinates in centimetres, yaw in degrees.
                             openvla_prompt_poses[tid]=preprocessed[:,[0,1,2,4]]
@@ -1043,7 +1054,21 @@ class UAVFlowParquetDataset(Dataset):
         episode_pose=torch.from_numpy(np.stack([
             self._episode_pose_at(raw, idx) for idx in anchor_indices
         ])).float()
-        if tid in self.openvla_prompt_poses:
+        if self.openvla_prompt_pose_mode == "evaluator_yaw4d":
+            # Match closed-loop inference exactly: first-frame-local yaw-only
+            # coordinates in native simulator centimetres plus yaw in degrees.
+            prompt_rows=[]
+            for idx in anchor_indices:
+                delta=_delta(
+                    raw[0],raw[idx],"yaw4d",
+                    action_delta_mode="openvla_yaw_only",
+                )
+                prompt_rows.append([
+                    float(delta[0]),float(delta[1]),float(delta[2]),
+                    math.degrees(float(delta[3])),
+                ])
+            openvla_prompt_pose=torch.tensor(prompt_rows,dtype=torch.float32)
+        elif tid in self.openvla_prompt_poses:
             openvla_prompt_pose=torch.from_numpy(
                 self.openvla_prompt_poses[tid][anchor_indices].copy()
             ).float()

@@ -1,206 +1,105 @@
-# Remote UAV-Flow training
+# Remote training handoff
 
-This document reproduces the compact 25-run ablation and the optional
-compute-rich matrix on a clean GPU server. Large datasets and checkpoints are
-not stored in Git.
+This release runs the ten-cell VLA--GAM matrix. Every experiment is one Python
+command intended for one complete 8x64GB GPU node.
 
-## 1. Clone and create the environment
+## 1. Environment
 
 ```bash
 git clone https://github.com/yangyuhang476959-sketch/uavflow-gam.git UAVFlow-GAM
 cd UAVFlow-GAM
-
 conda env create -f environment-uavflow.yml
 conda activate uav-gam
-bash scripts/setup_uavflow_remote.sh
+python scripts/setup_uavflow_remote.py
 ```
 
-The validated environment uses Python 3.12, PyTorch 2.5.1+cu124,
-torchvision 0.20.1+cu124, NumPy 1.26.4 and SciPy 1.15.3. Override
-`TORCH_INDEX_URL` when the server requires a different CUDA wheel. The setup
-also pins DA3's eager-import dependencies in the same transaction; it does not
-install the unrelated heavy Open3D/gsplat application stack.
+The setup pins PyTorch 2.5.1/cu124, NumPy 1.26.4, SciPy 1.15.3 and every DA3
+eager-import dependency in one resolver transaction. It checks the NumPy /
+SciPy / PyTorch ABI and imports DA3 before returning successfully.
 
-## 2. Download public data and model weights
+## 2. Data and checkpoints
 
-The default endpoint uses the mainland-accessible Hugging Face mirror:
+Mainland-accessible download:
 
 ```bash
-export HF_ENDPOINT=https://hf-mirror.com
-export DATA_ROOT=$PWD/data_remote
-export MODEL_ROOT=$PWD/checkpoints
-bash scripts/download_uavflow_assets.sh
+python scripts/download_uavflow_assets.py \
+  --hf-endpoint https://hf-mirror.com \
+  --depth-repo acetaffy123/UAV-Flow-Sim-Depth
 ```
 
-This downloads:
+The official RGB/parquet data and public model weights use the HF mirror. The
+derived depth archive uses ModelScope and is extracted into:
 
-- official `wangxiangyu0814/UAV-Flow-Sim` (21 parquet shards);
-- `Qwen/Qwen3.5-2B`;
-- `google-t5/t5-base`;
-- `checkpoints/track4world_da3.pth` from the GAM training assets.
-
-The derived calibrated/hybrid depth repository is hosted on ModelScope. The
-download script uses it by default:
-
-```bash
-export DEPTH_HUB=modelscope                 # or: huggingface
-export DEPTH_DATASET_REPO=acetaffy123/UAV-Flow-Sim-Depth
-bash scripts/download_uavflow_assets.sh
+```text
+data_remote/UAV-Flow-Sim-Depth/
+  replay/<episode>/depth.npy                 # 6,990 episodes
+  hybrid/{person,robotic_dog,vehicle}/*.npz # 3,119 episodes
+  metadata/instruction_overrides.json
 ```
 
-For an offline transfer, copy the six `tar.zst` shards plus `metadata/` into
-`$DATA_ROOT/UAV-Flow-Sim-Depth-Archive`, then run:
+The loader gives hybrid labels priority and falls back to replay. These 10,109
+episodes are the required calibrated/replayed plus dynamic-object-corrected
+depth set; the earlier uncalibrated root is not used.
 
-```bash
-python scripts/extract_uavflow_depth.py \
-  --dataset-root "$DATA_ROOT/UAV-Flow-Sim-Depth-Archive" \
-  --output "$DATA_ROOT/UAV-Flow-Sim-Depth"
-```
-
-The extracted depth directory is approximately 20.6 GiB. It contains 10,109
-episodes and seven load-time instruction corrections; never edit the official
-parquet files.
-
-## 3. Audit before spending GPU time
-
-```bash
-python scripts/verify_uavflow_remote.py \
-  --sim-root "$DATA_ROOT/UAV-Flow-Sim" \
-  --depth-root "$DATA_ROOT/UAV-Flow-Sim-Depth" \
-  --da3-checkpoint "$PWD/checkpoints/track4world_da3.pth" \
-  --qwen-model "$MODEL_ROOT/qwen3.5-2b" \
-  --t5-model "$MODEL_ROOT/t5-base"
-```
-
-The audit requires exactly 21 parquet shards, 10,109 unique depth episodes
-(6,990 replay plus 3,119 hybrid), the canonical `hybrid/` and `replay/` trees,
-all model configs and seven instruction overrides. It also imports DA3,
-checks NumPy/SciPy/PyTorch interoperability and samples both depth formats
-through `UAVFlowParquetDataset._depth()`.
-
-## 4. Export the portable path contract
+## 3. Paths and audit
 
 ```bash
 export PROJECT_ROOT=$PWD
-export UAVFLOW_SIM_ROOT="$DATA_ROOT/UAV-Flow-Sim"
-export UAVFLOW_DEPTH_ROOT="$DATA_ROOT/UAV-Flow-Sim-Depth"
-export DA3_CHECKPOINT="$PWD/checkpoints/track4world_da3.pth"
-export QWEN_MODEL="$MODEL_ROOT/qwen3.5-2b"
-export T5_MODEL="$MODEL_ROOT/t5-base"
-export PYTHON_BIN="$(command -v python)"
-export TORCHRUN_BIN="$(command -v torchrun)"
-export OUTPUT_ROOT=$PWD/results/remote_ablation
+export UAVFLOW_SIM_ROOT=$PWD/data_remote/UAV-Flow-Sim
+export UAVFLOW_DEPTH_ROOT=$PWD/data_remote/UAV-Flow-Sim-Depth
+export DA3_CHECKPOINT=$PWD/checkpoints/track4world_da3.pth
+export QWEN_MODEL=$PWD/checkpoints/qwen3.5-2b
+export T5_MODEL=$PWD/checkpoints/t5-base
+export OUTPUT_ROOT=$PWD/results/vla_gam_matrix_v2
+export NPROC=8
+export GLOBAL_BATCH_SIZE=32
+
+python scripts/verify_uavflow_remote.py \
+  --sim-root "$UAVFLOW_SIM_ROOT" \
+  --depth-root "$UAVFLOW_DEPTH_ROOT" \
+  --da3-checkpoint "$DA3_CHECKPOINT" \
+  --qwen-model "$QWEN_MODEL" \
+  --t5-model "$T5_MODEL"
 ```
 
-The launcher recognizes both the published `hybrid/ + replay/` layout and the
-older local consolidated layout. Published depth automatically uses hybrid as
-the primary source, replay as fallback and the packaged correction file.
+The audit requires 21 parquet shards, 6,990 replay episodes, 3,119 hybrid
+episodes, seven instruction corrections and working pinned imports.
 
-## 5. Smoke test
-
-The production effective batch is 24. A two-GPU smoke test deliberately uses
-global batch 4 and is not a scientific result:
+## 4. Submit one command per node
 
 ```bash
-CUDA_DEVICES=0,1 NPROC=2 GLOBAL_BATCH_SIZE=4 BATCH_SIZE=2 \
-MAX_TRAJECTORIES=20 STAGE1_EPOCHS=1 RUN_STAGE2=0 RUN_IDS=B0,F3 \
-OUTPUT_ROOT=/tmp/uavflow_smoke \
-bash experiments/uavflow_remote_ablation/run_remote.sh
+python experiments/uavflow_remote_ablation/jobs_v2/01_g0.py
+python experiments/uavflow_remote_ablation/jobs_v2/02_g1.py
+python experiments/uavflow_remote_ablation/jobs_v2/03_c0.py
+python experiments/uavflow_remote_ablation/jobs_v2/04_c1.py
+python experiments/uavflow_remote_ablation/jobs_v2/05_q0.py
+python experiments/uavflow_remote_ablation/jobs_v2/06_s0.py
+python experiments/uavflow_remote_ablation/jobs_v2/07_s1.py
+python experiments/uavflow_remote_ablation/jobs_v2/08_s2.py
+python experiments/uavflow_remote_ablation/jobs_v2/09_r1.py
+python experiments/uavflow_remote_ablation/jobs_v2/10_dv.py
 ```
 
-## 6. Compact 25-run experiment
+Do not submit all ten commands into one node. The cluster should enqueue each
+line as an independent 8-GPU job. Every entrypoint performs:
 
-Production defaults are four GPUs, batch 6/GPU, no accumulation and global
-batch 24. This lets all 25 compact cells occupy 100 GPUs in one wave. Stage 1
-and Stage 2 each train five physical epochs.
+1. runtime and full depth-layout audit;
+2. locked creation/reuse of one shared split;
+3. Stage 1: 10 epochs action + feature + depth, constant LR;
+4. Stage 2: 10 epochs joint policy + Stop, cosine LR;
+5. exact same-stage optimizer/scheduler/data-cursor resume after interruption.
+
+Completed stages have `_SUCCESS` and are skipped on re-submission. Results are
+stored as `results/vla_gam_matrix_v2/<ID>/{stage1,stage2_stop}`.
+
+## 5. Minimal smoke job
 
 ```bash
-CUDA_DEVICES=0,1,2,3 \
-NPROC=4 GLOBAL_BATCH_SIZE=24 BATCH_SIZE=6 \
-bash experiments/uavflow_remote_ablation/run_server.sh
+STAGE1_EPOCHS=1 NPROC=2 GLOBAL_BATCH_SIZE=4 CUDA_DEVICES=0,1 \
+python experiments/uavflow_remote_ablation/jobs_v2/09_r1.py \
+  --stage stage1 --max-trajectories 20
 ```
 
-The command above runs all cells sequentially on one four-GPU worker. On a
-cluster, submit one four-GPU array job per cell using the matching scheduler:
-
-```bash
-# Slurm: 25 jobs x 4 GPUs = 100 GPUs in one wave
-sbatch experiments/uavflow_remote_ablation/submit_slurm_compact.sh
-
-# PBS Pro / OpenPBS
-qsub -V experiments/uavflow_remote_ablation/submit_pbs_compact.sh
-
-# IBM LSF
-bsub < experiments/uavflow_remote_ablation/submit_lsf_compact.sh
-```
-
-On a single machine, enumerate each independent four-GPU group. The example
-below runs two cells concurrently and automatically schedules the remaining
-cells when a worker becomes free:
-
-```bash
-GPU_GROUPS='0,1,2,3;4,5,6,7' \
-bash experiments/uavflow_remote_ablation/run_local_gpu_pool.sh
-```
-
-All four launch modes use the same ordered list in `compact_cells.sh`; array
-index 0 is `B0`, index 20 is `C5_F10HB`, and index 21 is `CA1_HB`. Every cell preserves global batch
-24 and writes to a separate output directory.
-
-The compact matrix contains 16 main-effect/control rows, five selected
-interactions and six A–F geometry architectures. See docs/DEPTH_ARCHITECTURES.md and
-`docs/CURRENT_GEOMETRY_ABLATION.md` for its implementation and
-`docs/uavflow_remote_ablation_ofat.md` for the exact list and
-`docs/uavflow_remote_ablation_detailed.md` for data/loss semantics.
-
-Each stage writes its resolved configuration, split, logs, epoch checkpoints,
-run state and `_SUCCESS`. Re-running the same command skips completed stages
-and resumes an interrupted stage from its latest checkpoint.
-
-Inspect progress:
-
-```bash
-python experiments/uavflow_remote_ablation/status.py "$OUTPUT_ROOT"
-```
-
-Run a selected subset:
-
-```bash
-RUN_IDS=B0,C3_W3HB,C5_F10HB \
-bash experiments/uavflow_remote_ablation/run_server.sh
-```
-
-## 7. Optional compute-rich matrix
-
-The interaction-aware detailed launcher contains 64 deduplicated cells. It is
-not a full Cartesian product. One eight-GPU node can run it sequentially:
-
-```bash
-MATRIX_ROOT=$PWD/results/uavflow_compute_rich \
-bash experiments/uavflow_remote_ablation/run_compute_rich_matrix.sh
-```
-
-Across eight separate eight-GPU nodes, assign one shard per node:
-
-```bash
-MATRIX_SHARD_COUNT=8 MATRIX_SHARD_INDEX=<0..7> \
-MATRIX_ROOT=$PWD/results/uavflow_compute_rich \
-bash experiments/uavflow_remote_ablation/run_compute_rich_matrix.sh
-```
-
-All nodes must see the same shared `MATRIX_ROOT` and dataset paths. A file lock
-creates one immutable split, and each manifest row records the interaction
-blocks that selected it.
-
-## 8. What is and is not aligned
-
-- Dataset split: fixed stratified 95/5 split for all ablations.
-- Batch: global 24, chosen between OpenVLA-UAV global 32 and GAM post-train
-  global 12; it exactly matches GAM pre-training.
-- Stage 1: constant schedule except the explicit `S1COS` control.
-- Stage 2: 500-step warmup plus cosine, held fixed for every row.
-- Qwen/T5/DA3 language and visual backbones are loaded from local paths; no
-  training job silently downloads a different revision.
-- Final comparison with OpenVLA-UAV should retrain the selected configuration
-  on 100% training episodes after ablation selection. The 5% validation split
-  exists for controlled model selection and is not claimed as OpenVLA's split.
+This checks construction and one tiny training run; it is not a scientific
+result and must use a separate `OUTPUT_ROOT` if a production run already
+exists.

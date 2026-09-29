@@ -2911,6 +2911,9 @@ def build_robot_dataset(dataset_cfg: Dict[str, Any], is_eval: bool = False) -> D
             eval_ratio=float(dataset_cfg.get("eval_ratio", 0.05)),
             source_fps=float(dataset_cfg.get("source_fps", 1.0)),
             openvla_uav_compatible=bool(dataset_cfg.get("openvla_uav_compatible", False)),
+            openvla_prompt_pose_mode=str(
+                dataset_cfg.get("openvla_prompt_pose_mode", "preprocessed")
+            ),
             terminal_zero_action=bool(dataset_cfg.get("terminal_zero_action", False)),
             endpoint_repeat_count=dataset_cfg.get("endpoint_repeat_count", None),
             endpoint_self_pair_count=int(dataset_cfg.get("endpoint_self_pair_count", 0)),
@@ -2986,6 +2989,9 @@ def build_robot_dataset(dataset_cfg: Dict[str, Any], is_eval: bool = False) -> D
             action_stats_key=dataset_cfg.get("action_stats_key"),
             translation_scale=float(dataset_cfg.get("translation_scale", 1.0)),
             openvla_uav_compatible=bool(dataset_cfg.get("openvla_uav_compatible", False)),
+            openvla_prompt_pose_mode=str(
+                dataset_cfg.get("openvla_prompt_pose_mode", "preprocessed")
+            ),
             terminal_zero_action=bool(dataset_cfg.get("terminal_zero_action", False)),
             endpoint_repeat_count=dataset_cfg.get("endpoint_repeat_count", None),
             endpoint_self_pair_count=int(dataset_cfg.get("endpoint_self_pair_count", 0)),

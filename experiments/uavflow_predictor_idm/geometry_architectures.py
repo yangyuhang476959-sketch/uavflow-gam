@@ -4,9 +4,40 @@ from torch import nn
 
 GEOMETRY_ARCHITECTURES = {
     "legacy", "current_prediction", "direct_current", "dual_observed",
-    "dual_predicted", "dual_action_bridge",
+    "dual_predicted", "dual_action_bridge", "dual_vla_gfm",
 }
 DUAL_ARCHITECTURES = {"dual_observed", "dual_predicted", "dual_action_bridge"}
+
+
+class DualActionFusion(nn.Module):
+    """Learn a per-plan-step Current/Future mixture instead of a fixed mean.
+
+    The scalar gate is shared across hidden channels but differs per sample and
+    temporal prediction step.  A zero-initialized final layer starts from the
+    legacy 50/50 mixture while allowing training to select the reliable branch.
+    """
+
+    def __init__(self, hidden_dim: int) -> None:
+        super().__init__()
+        width = max(int(hidden_dim) // 4, 128)
+        self.gate = nn.Sequential(
+            nn.LayerNorm(2 * int(hidden_dim)),
+            nn.Linear(2 * int(hidden_dim), width),
+            nn.SiLU(),
+            nn.Linear(width, 1),
+        )
+        nn.init.zeros_(self.gate[-1].weight)
+        nn.init.zeros_(self.gate[-1].bias)
+
+    def forward(self, current: torch.Tensor, future: torch.Tensor):
+        if current.shape != future.shape or current.ndim != 3:
+            raise ValueError(
+                "Dual action branches must be matching [B,T,D] tensors; got "
+                f"{tuple(current.shape)} and {tuple(future.shape)}"
+            )
+        future_weight = self.gate(torch.cat([current, future], dim=-1)).sigmoid()
+        fused = (1.0 - future_weight) * current + future_weight * future
+        return fused, future_weight
 
 
 class DirectCurrentActionSeed(nn.Module):
@@ -70,6 +101,13 @@ def architecture_state(model):
                                 else model.direct_current_seed.state_dict()),
         "prediction_roles": (None if model.prediction_roles is None
                              else model.prediction_roles.detach().cpu()),
+        "dual_action_fusion": (
+            None if getattr(model, "dual_action_fusion", None) is None
+            else model.dual_action_fusion.state_dict()
+        ),
+        "parallel_action_decode_mode": getattr(
+            model, "parallel_action_decode_mode", "full"
+        ),
     }
 
 
@@ -81,8 +119,22 @@ def load_architecture_state(model, checkpoint):
         return
     if state["mode"] != model.geometry_architecture:
         raise ValueError("Geometry architecture changed; checkpoint is not compatible")
+    saved_decode = state.get("parallel_action_decode_mode", "full")
+    current_decode = getattr(model, "parallel_action_decode_mode", "full")
+    if saved_decode != current_decode:
+        raise ValueError(
+            "Parallel action decode mode changed: "
+            f"checkpoint={saved_decode}, current={current_decode}"
+        )
     if model.direct_current_seed is not None:
         model.direct_current_seed.load_state_dict(state["direct_current_seed"], strict=True)
     if model.prediction_roles is not None:
         with torch.no_grad():
             model.prediction_roles.copy_(state["prediction_roles"])
+    if getattr(model, "dual_action_fusion", None) is not None:
+        fusion_state = state.get("dual_action_fusion")
+        # Old dual-view checkpoints used an exact 50/50 mean.  The fusion
+        # module is zero-initialized to that same behavior, so read-only
+        # evaluation/init transfer remains backward compatible.
+        if fusion_state is not None:
+            model.dual_action_fusion.load_state_dict(fusion_state, strict=True)

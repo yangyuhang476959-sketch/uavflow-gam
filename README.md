@@ -1,7 +1,8 @@
 # UAVFlow-GAM
 
-Compact matrix: **25 cells**. Six A–F geometry architectures replace the two
-old depth architecture controls; see [architecture design](docs/DEPTH_ARCHITECTURES.md).
+Active matrix: **10 cells** covering GAM/T5, frozen VLM conditioning,
+Query-VLA, Slot-VLA, Current Geometry Bank, geometry-action residual, and a
+dual-view diagnostic.
 
 Minimal research code for transferring Geometric Action Models to
 UAV-Flow-Sim. This repository contains only the source, configurations and
@@ -27,19 +28,16 @@ and its application order.
 - `scripts/`: environment setup, data download/audit and one-command handoff.
 - `data/instruction_overrides.json`: seven reviewed instruction corrections.
 - `data/uavflow_stats_sim_openvla_yaw4d/`: fixed action normalization statistics.
-- `experiments/uavflow_remote_ablation/`: restartable compact-25 and
-  compute-rich remote launchers.
+- `experiments/uavflow_remote_ablation/`: restartable ten-cell remote matrix;
+  each cluster job is one Python command on one 8-GPU node.
 
 ## Remote experiment quick start
 
-The publication-ready setup, download, audit and multi-GPU commands are in
-[`docs/REMOTE_TRAINING.md`](docs/REMOTE_TRAINING.md). The compact matrix is
-specified in [`docs/uavflow_remote_ablation_ofat.md`](docs/uavflow_remote_ablation_ofat.md),
-with full semantics and the optional 64-cell interaction-aware design in
-[`docs/uavflow_remote_ablation_detailed.md`](docs/uavflow_remote_ablation_detailed.md).
-For a concise handoff checklist, use [`docs/HANDOFF.md`](docs/HANDOFF.md).
-For the minimal copy-paste path, use
-[`docs/ONE_CLICK_COMMANDS.md`](docs/ONE_CLICK_COMMANDS.md).
+The publication-ready setup, download, audit, exact matrix and ten independent
+multi-GPU commands are in [`docs/REMOTE_TRAINING.md`](docs/REMOTE_TRAINING.md).
+Architecture details are in
+[`docs/vla_gfm_action_tokens.md`](docs/vla_gfm_action_tokens.md).
+The remote-training document is also the concise handoff and copy-paste guide.
 
 The derived depth sidecars are published as
 [`acetaffy123/UAV-Flow-Sim-Depth`](https://modelscope.cn/datasets/acetaffy123/UAV-Flow-Sim-Depth/files).
@@ -60,6 +58,6 @@ calibration before depth is rendered in UE.
 
 ## Reproducibility status
 
-Machine-specific paths are supplied through `server.env`. Large checkpoints,
-depth arrays and all generated experiment outputs are deliberately excluded
-from Git.
+Machine-specific paths are supplied through the environment variables listed
+in `docs/REMOTE_TRAINING.md`. Large checkpoints, depth arrays and all generated
+experiment outputs are deliberately excluded from Git.

@@ -2,17 +2,121 @@
 
 The prompt follows OpenVLA-UAV's concise action question, with only one extra
 hint that identifies the first of the two images as the episode's first frame.
-Only selected language-model layers are retained; Qwen itself is always
-frozen and runs under ``torch.no_grad``.
+Only selected language-model layers are retained. Qwen is frozen by default;
+the optional dependency-free LoRA path keeps only its low-rank adapters
+trainable and preserves their gradients through feature extraction.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
+from contextlib import nullcontext
+from types import MethodType
 
 import torch
 from PIL import Image
 from torch import nn
+from robot.modeling.lora import LoRALinear
+
+
+def _replace_action_placeholder_embeddings(
+    output: torch.Tensor,
+    token_ids: torch.Tensor,
+    placeholder_ids: Sequence[int],
+    placeholder_embeddings: torch.Tensor,
+) -> torch.Tensor:
+    """Replace only added action-token rows while preserving their gradient."""
+    if placeholder_embeddings.shape != (len(placeholder_ids), output.shape[-1]):
+        raise ValueError(
+            "Action-placeholder embedding shape mismatch: "
+            f"got {tuple(placeholder_embeddings.shape)}, expected "
+            f"({len(placeholder_ids)},{output.shape[-1]})"
+        )
+    replaced = output
+    for index, token_id in enumerate(placeholder_ids):
+        value = placeholder_embeddings[index].to(
+            device=output.device, dtype=output.dtype
+        )
+        replaced = torch.where(
+            token_ids.eq(int(token_id)).unsqueeze(-1), value, replaced
+        )
+    return replaced
+
+
+def _qwen35_text_forward_with_action_block(
+    module,
+    input_ids=None,
+    attention_mask=None,
+    position_ids=None,
+    past_key_values=None,
+    inputs_embeds=None,
+    use_cache=None,
+    **kwargs,
+):
+    """Make only Qwen full-attention action rows/columns bidirectional.
+
+    Qwen3.5's recurrent GatedDeltaNet layers retain their pretrained causal
+    recurrence. Feature extraction is full-sequence and cache-free.
+    """
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ModelOutputWithPast
+
+    if (input_ids is None) == (inputs_embeds is None):
+        raise ValueError("Specify exactly one of input_ids or inputs_embeds")
+    if use_cache or past_key_values is not None:
+        raise ValueError("Action-block Qwen forward supports cache-free execution only")
+    if inputs_embeds is None:
+        inputs_embeds = module.embed_tokens(input_ids)
+    batch, length = inputs_embeds.shape[:2]
+    if position_ids is None:
+        position_ids = torch.arange(length, device=inputs_embeds.device)
+        position_ids = position_ids.view(1, 1, -1).expand(4, batch, -1)
+    elif position_ids.ndim == 2:
+        position_ids = position_ids[None].expand(4, position_ids.shape[0], -1)
+    if position_ids.ndim == 3 and position_ids.shape[0] == 4:
+        text_position_ids = position_ids[0]
+        rope_position_ids = position_ids[1:]
+    else:
+        text_position_ids = None
+        rope_position_ids = position_ids
+
+    keep = (
+        torch.ones(batch, length, device=inputs_embeds.device, dtype=torch.bool)
+        if attention_mask is None else attention_mask.to(dtype=torch.bool)
+    )
+    if keep.ndim != 2 or keep.shape != (batch, length):
+        raise ValueError("Action-block Qwen expects a 2-D padding mask")
+    action = getattr(module, "_uav_action_token_mask", None)
+    if action is None or action.shape != keep.shape:
+        raise RuntimeError("Missing Qwen action-token mask for bidirectional full attention")
+    action = action.to(device=inputs_embeds.device, dtype=torch.bool)
+    indices = torch.arange(length, device=inputs_embeds.device)
+    causal = indices.view(1, -1) <= indices.view(-1, 1)
+    allowed = causal.view(1, 1, length, length).expand(batch, 1, -1, -1).clone()
+    allowed |= action[:, None, :, None] & action[:, None, None, :]
+    allowed &= keep[:, None, :, None] & keep[:, None, None, :]
+
+    hidden_states = inputs_embeds
+    position_embeddings = module.rotary_emb(hidden_states, rope_position_ids)
+    linear_mask = module._update_linear_attn_mask(attention_mask, past_key_values)
+    for index, decoder_layer in enumerate(module.layers[:module.config.num_hidden_layers]):
+        layer_mask = (
+            linear_mask
+            if module.config.layer_types[index] == "linear_attention"
+            else allowed
+        )
+        hidden_states = decoder_layer(
+            hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=layer_mask,
+            position_ids=text_position_ids,
+            past_key_values=None,
+            use_cache=False,
+            **kwargs,
+        )
+    hidden_states = module.norm(hidden_states)
+    return Qwen3_5ModelOutputWithPast(
+        last_hidden_state=hidden_states, past_key_values=None,
+    )
 
 
 class FrozenQwen35SemanticEncoder(nn.Module):
@@ -26,6 +130,12 @@ class FrozenQwen35SemanticEncoder(nn.Module):
         attention_implementation: str = "sdpa",
         prompt_mode: str = "temporal_pair",
         token_selection: str = "all",
+        lora_enabled: bool = False,
+        lora_rank: int = 32,
+        lora_alpha: float = 16.0,
+        lora_dropout: float = 0.0,
+        action_placeholder_count: int = 0,
+        action_attention_mode: str = "causal",
     ) -> None:
         super().__init__()
         from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
@@ -39,23 +149,106 @@ class FrozenQwen35SemanticEncoder(nn.Module):
             dtype=torch.bfloat16,
             attn_implementation=attention_implementation,
         ).eval().requires_grad_(False)
+        self.lora_enabled = bool(lora_enabled)
+        if self.lora_enabled:
+            target_suffixes = {
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "gate_proj", "up_proj", "down_proj",
+            }
+            replacements = []
+            language_model = self.qwen.model.language_model
+            for name, module in language_model.named_modules():
+                if isinstance(module, nn.Linear) and name.rsplit(".", 1)[-1] in target_suffixes:
+                    replacements.append((name, module))
+            for name, module in replacements:
+                parent_name, child_name = name.rsplit(".", 1)
+                parent = language_model.get_submodule(parent_name)
+                setattr(parent, child_name, LoRALinear(
+                    module, rank=int(lora_rank), alpha=float(lora_alpha),
+                    dropout=float(lora_dropout),
+                ))
+            if not replacements:
+                raise RuntimeError("Qwen LoRA enabled but no target Linear modules were found")
+            self.lora_module_count = len(replacements)
+        else:
+            self.lora_module_count = 0
+        self.action_placeholder_count = int(action_placeholder_count)
+        if self.action_placeholder_count < 0:
+            raise ValueError("action_placeholder_count must be non-negative")
+        self.action_placeholder_tokens = [
+            f"<|uav_action_{index:03d}|>"
+            for index in range(self.action_placeholder_count)
+        ]
+        if self.action_placeholder_tokens:
+            added = self.processor.tokenizer.add_special_tokens({
+                "additional_special_tokens": self.action_placeholder_tokens,
+            })
+            if added:
+                self.qwen.resize_token_embeddings(len(self.processor.tokenizer))
+            # Resizing may create fresh trainable embedding/head parameters.
+            # Freeze those without disabling LoRA modules installed above.
+            self.qwen.get_input_embeddings().requires_grad_(False)
+            output_embeddings = self.qwen.get_output_embeddings()
+            if output_embeddings is not None:
+                output_embeddings.requires_grad_(False)
+        self.action_placeholder_ids = tuple(
+            int(self.processor.tokenizer.convert_tokens_to_ids(token))
+            for token in self.action_placeholder_tokens
+        )
+        self.action_placeholder_embeddings = None
+        self._action_embedding_hook = None
+        if self.action_placeholder_ids:
+            embedding = self.qwen.get_input_embeddings()
+            initial = embedding.weight.detach()[
+                list(self.action_placeholder_ids)
+            ].clone()
+            # The base embedding matrix remains frozen, but the new action
+            # rows must be checkpointed and learnable. A separate parameter
+            # avoids accidentally updating every Qwen vocabulary row.
+            self.action_placeholder_embeddings = nn.Parameter(initial)
+
+            def replace_action_embeddings(_module, hook_inputs, output):
+                return _replace_action_placeholder_embeddings(
+                    output,
+                    hook_inputs[0],
+                    self.action_placeholder_ids,
+                    self.action_placeholder_embeddings,
+                )
+
+            self._action_embedding_hook = embedding.register_forward_hook(
+                replace_action_embeddings
+            )
+        self.action_attention_mode = str(action_attention_mode).lower()
+        if self.action_attention_mode not in {"causal", "full_attention_bidir"}:
+            raise ValueError(
+                "action_attention_mode must be causal or full_attention_bidir"
+            )
+        if self.action_attention_mode != "causal":
+            if not self.action_placeholder_ids:
+                raise ValueError("Action-block attention requires action placeholders")
+            language_model = self.qwen.model.language_model
+            language_model.forward = MethodType(
+                _qwen35_text_forward_with_action_block, language_model
+            )
         self.hidden_size = int(self.qwen.config.text_config.hidden_size)
         self.image_token_id = int(self.qwen.config.image_token_id)
         self.prompt_mode = str(prompt_mode)
         if self.prompt_mode not in {
             "temporal_pair",
             "current_image_instruction",
+            "current_image_action_question",
             "current_image_openvla",
         }:
             raise ValueError(
                 "prompt_mode must be 'temporal_pair', "
-                "'current_image_instruction', or 'current_image_openvla'; "
+                "'current_image_instruction', 'current_image_action_question', "
+                "or 'current_image_openvla'; "
                 f"got {self.prompt_mode!r}."
             )
         self.token_selection = str(token_selection)
-        if self.token_selection not in {"all", "text_after_image"}:
+        if self.token_selection not in {"all", "text_after_image", "action_placeholders"}:
             raise ValueError(
-                "token_selection must be 'all' or 'text_after_image', got "
+                "token_selection must be all, text_after_image, or action_placeholders; got "
                 f"{self.token_selection!r}."
             )
         self.layer_indices = tuple(int(index) for index in layer_indices)
@@ -101,7 +294,6 @@ class FrozenQwen35SemanticEncoder(nn.Module):
         )
         return Image.fromarray(array, mode="RGB")
 
-    @torch.no_grad()
     def forward(
         self,
         images: torch.Tensor,
@@ -122,6 +314,7 @@ class FrozenQwen35SemanticEncoder(nn.Module):
             1
             if self.prompt_mode in {
                 "current_image_instruction",
+                "current_image_action_question",
                 "current_image_openvla",
             }
             else 2
@@ -140,24 +333,59 @@ class FrozenQwen35SemanticEncoder(nn.Module):
             raise ValueError(
                 f"Expected {batch_size} instructions, got {len(instructions)}."
             )
-        if self.prompt_mode == "current_image_openvla":
+        if self.prompt_mode in {
+            "current_image_action_question",
+            "current_image_openvla",
+        }:
             if current_states is None or len(current_states) != batch_size:
                 raise ValueError(
-                    "current_image_openvla requires one [x,y,z,yaw_deg] "
-                    "state per image."
+                    f"{self.prompt_mode} requires one [x,y,z,yaw_deg] "
+                    "OpenVLA-compatible state per image."
                 )
 
         conversations = []
+        # Only the internal Slot-VLA variants own assistant-side action
+        # placeholders. External Query-VLA uses the same image + corrected
+        # state + action-question user prompt, but must not receive an empty
+        # assistant/generation-prefix token. Ordinary frozen Condition remains
+        # image + raw instruction.
+        uses_assistant_action_slots = bool(
+            self.action_placeholder_tokens
+            and self.token_selection == "action_placeholders"
+        )
         for batch_index, instruction in enumerate(instructions):
-            instruction_text = str(instruction).strip().rstrip(".?!")
+            # Preserve the dataset instruction itself (apart from terminal
+            # punctuation needed to embed it in the action question).
+            instruction_text = str(instruction).strip()
+            instruction_stem = instruction_text.rstrip(".?!")
             if self.prompt_mode in {
                 "current_image_instruction",
+                "current_image_action_question",
                 "current_image_openvla",
             }:
-                # Minimal OpenVLA-style conditioning: visual input first,
-                # followed only by the dataset instruction. Chat-template
-                # control tokens are the sole unavoidable textual overhead.
+                # Visual input always comes first. Ordinary Condition uses the
+                # raw instruction; Query/Slot VLA use the shared state-aware
+                # OpenVLA-style action question below.
                 prompt_text = instruction_text
+                if self.prompt_mode == "current_image_action_question":
+                    state = [float(value) for value in current_states[batch_index]]
+                    if len(state) != 4:
+                        raise ValueError(
+                            "Action-question prompt state must be "
+                            f"[x,y,z,yaw_deg], got {state}."
+                        )
+                    proprio_str = ",".join(
+                        str(round(value, 1)) for value in state
+                    )
+                    # Query-VLA and Slot-VLA share this user prompt.  Pose is
+                    # the corrected OpenVLA-compatible episode-relative state:
+                    # xyz in centimetres, yaw in degrees.  Unlike the legacy
+                    # OpenVLA string below, intentionally omit literal In/Out.
+                    prompt_text = (
+                        f"Current State: {proprio_str}.\n"
+                        "What action should the uav take to "
+                        f"{instruction_stem}?"
+                    )
                 if self.prompt_mode == "current_image_openvla":
                     state = [float(value) for value in current_states[batch_index]]
                     if len(state) != 4:
@@ -172,7 +400,7 @@ class FrozenQwen35SemanticEncoder(nn.Module):
                     prompt_text = (
                         f"In: Current State: {proprio_str}, "
                         "What action should the uav take to "
-                        f"{instruction_text}?\nOut:"
+                        f"{instruction_stem}?\nOut:"
                     )
                 content = [
                     {
@@ -189,7 +417,7 @@ class FrozenQwen35SemanticEncoder(nn.Module):
                             "You started from the first image and are now "
                             "at the second image. "
                             "What action should the uav take to "
-                            f"{instruction_text}?"
+                            f"{instruction_stem}?"
                         ),
                     },
                     {
@@ -201,11 +429,23 @@ class FrozenQwen35SemanticEncoder(nn.Module):
                         "image": self._to_pil(images[batch_index, 1, 0]),
                     },
                 ]
-            conversations.append([{"role": "user", "content": content}])
+            messages = [{"role": "user", "content": content}]
+            if uses_assistant_action_slots:
+                messages.append({
+                    "role": "assistant",
+                    "content": [{
+                        "type": "text",
+                        "text": "".join(self.action_placeholder_tokens),
+                    }],
+                })
+            conversations.append(messages)
 
         inputs = self.processor.apply_chat_template(
             conversations,
-            add_generation_prompt=True,
+            # Slot-VLA already contains an explicit assistant message holding
+            # its K action slots.  Every other mode intentionally ends at the
+            # user instruction and gets no assistant special token.
+            add_generation_prompt=False,
             tokenize=True,
             return_dict=True,
             return_tensors="pt",
@@ -216,15 +456,36 @@ class FrozenQwen35SemanticEncoder(nn.Module):
             for key, value in inputs.items()
             if isinstance(value, torch.Tensor)
         }
+        input_ids = tensor_inputs["input_ids"]
+        language_model = self.qwen.model.language_model
+        if self.action_attention_mode == "full_attention_bidir":
+            action_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+            for token_id in self.action_placeholder_ids:
+                action_mask |= input_ids.eq(token_id)
+            language_model._uav_action_token_mask = action_mask
         self._captured.clear()
-        output = self.qwen(
-            **tensor_inputs,
-            use_cache=False,
-            return_dict=True,
+        # Slot placeholders remain trainable even in a frozen-Qwen control.
+        # Do not key autograd solely on LoRA being enabled.
+        has_trainable_conditioner = any(
+            parameter.requires_grad for parameter in self.parameters()
         )
+        grad_context = (
+            nullcontext()
+            if has_trainable_conditioner and torch.is_grad_enabled()
+            else torch.no_grad()
+        )
+        try:
+            with grad_context:
+                output = self.qwen(
+                    **tensor_inputs,
+                    use_cache=False,
+                    return_dict=True,
+                )
+        finally:
+            if hasattr(language_model, "_uav_action_token_mask"):
+                delattr(language_model, "_uav_action_token_mask")
         del output
 
-        input_ids = tensor_inputs["input_ids"]
         attention_mask = tensor_inputs["attention_mask"].bool()
         image_masks = input_ids.eq(self.image_token_id)
         token_counts = image_masks.sum(dim=1)
@@ -248,6 +509,20 @@ class FrozenQwen35SemanticEncoder(nn.Module):
             joint_mask = attention_mask & positions.gt(last_image_position)
             if not bool(joint_mask.any(dim=1).all()):
                 raise RuntimeError("No valid text tokens remain after the image prefix.")
+        elif self.token_selection == "action_placeholders":
+            if not self.action_placeholder_ids:
+                raise ValueError(
+                    "action_placeholders selection requires action_placeholder_count > 0"
+                )
+            joint_mask = torch.zeros_like(attention_mask)
+            for token_id in self.action_placeholder_ids:
+                joint_mask |= input_ids.eq(token_id)
+            counts = joint_mask.sum(dim=1)
+            if not bool(counts.eq(self.action_placeholder_count).all()):
+                raise RuntimeError(
+                    "Qwen prompt action-placeholder count mismatch: "
+                    f"expected={self.action_placeholder_count}, got={counts.tolist()}"
+                )
 
         layer_tokens = []
         for index in self.layer_indices:
@@ -259,6 +534,16 @@ class FrozenQwen35SemanticEncoder(nn.Module):
                 hidden = self.qwen.model.language_model.norm(hidden)
             layer_tokens.append(hidden)
         joint_layers = torch.stack(layer_tokens, dim=1)
+        if self.token_selection == "action_placeholders":
+            # Compact to a fixed [B,layers,K,D] sequence in prompt order.
+            joint_layers = torch.stack([
+                joint_layers[index, :, joint_mask[index], :]
+                for index in range(batch_size)
+            ], dim=0)
+            joint_mask = torch.ones(
+                batch_size, self.action_placeholder_count,
+                device=joint_layers.device, dtype=torch.bool,
+            )
         return {
             "joint_layers": joint_layers,
             "joint_mask": joint_mask,

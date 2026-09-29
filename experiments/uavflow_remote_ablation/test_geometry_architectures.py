@@ -10,10 +10,23 @@ import torch
 from torch import nn
 from experiments.uavflow_predictor_idm.model import UAVFlowPredictorIDM
 from experiments.uavflow_predictor_idm.geometry_architectures import (
-    architecture_state, load_architecture_state, select_dual_view,
+    DualActionFusion, architecture_state, load_architecture_state, select_dual_view,
+)
+from experiments.uavflow_direct_visual_probe.qwen35_semantic import (
+    _replace_action_placeholder_embeddings,
 )
 from experiments.uavflow_predictor_idm.objectives import architecture_feature_loss, forward_batch
 from robot.modeling.dual_geometry_attention import dual_allow_mask, run_dual_masked_block
+from experiments.uavflow_predictor_idm.semantic_geometry_action import (
+    OFTDimensionActionTokenizer,
+    ParallelContinuousActionHead,
+    QwenInternalActionProjector,
+    QwenParallelActionTokenizer,
+    SemanticActionInitializer,
+)
+from experiments.uavflow_direct_visual_probe.qwen35_semantic import (
+    _qwen35_text_forward_with_action_block,
+)
 
 
 MODES = ["current_prediction", "direct_current", "dual_observed", "dual_predicted", "dual_action_bridge"]
@@ -45,6 +58,27 @@ class TinyDA3(nn.Module):
 
     def propagate_shallow_visual_slots_grad(self, *args, **kwargs):
         raise AssertionError("Architecture should reuse its joint/current decode, not run a second current pass")
+
+
+class TinyParallelDA3(TinyDA3):
+    def propagate_shallow_visual_slots_grad(self, visual, **kwargs):
+        deep = torch.cat([visual, visual], dim=-1) * self.scale
+        return {
+            "shallow": visual, "deep_levels": [deep, deep, deep, deep],
+            "layer_patches": {index: deep[..., 3:, :] for index in range(4)},
+        }
+
+    def propagate_shallow_with_actions_grad(self, visual, actions, **kwargs):
+        self.calls += 1
+        if actions.ndim != 5:
+            raise AssertionError(f"Expected parallel actions, got {tuple(actions.shape)}")
+        b, h, v, k, _ = actions.shape
+        mixed = actions + visual.mean(-2).unsqueeze(-2)
+        depth = (visual.mean((-1, -2)) * self.scale).reshape(
+            b, h * v, 1, 1
+        ).expand(b, h * v, 2, 2)
+        return {"action_tokens": (mixed * self.scale).reshape(b * h * v, k, -1),
+                "depth": depth}
 
 
 def build(mode, stop=False, stop_mode="legacy_action_token"):
@@ -92,9 +126,64 @@ class IdentityNormalizer:
 
 
 class Tests(unittest.TestCase):
+    def test_action_placeholder_embeddings_are_ordered_and_trainable(self):
+        base = torch.zeros(1, 5, 3)
+        token_ids = torch.tensor([[4, 101, 9, 102, 4]])
+        action_embeddings = torch.nn.Parameter(torch.tensor([
+            [1.0, 2.0, 3.0],
+            [4.0, 5.0, 6.0],
+        ]))
+        output = _replace_action_placeholder_embeddings(
+            base, token_ids, (101, 102), action_embeddings
+        )
+        self.assertTrue(torch.equal(output[0, 1], action_embeddings[0]))
+        self.assertTrue(torch.equal(output[0, 3], action_embeddings[1]))
+        self.assertTrue(torch.equal(output[0, 0], torch.zeros(3)))
+        output.sum().backward()
+        self.assertTrue(torch.equal(
+            action_embeddings.grad, torch.ones_like(action_embeddings)
+        ))
+
+    def test_dual_action_fusion_starts_as_mean_and_learns(self):
+        fusion = DualActionFusion(16)
+        current = torch.randn(2, 3, 16, requires_grad=True)
+        future = torch.randn(2, 3, 16, requires_grad=True)
+        fused, gate = fusion(current, future)
+        torch.testing.assert_close(gate, torch.full_like(gate, 0.5))
+        torch.testing.assert_close(fused, 0.5 * (current + future))
+        fused.square().mean().backward()
+        self.assertGreater(fusion.gate[-1].weight.grad.abs().sum().item(), 0)
+
     def setUp(self):
         torch.set_num_threads(2)
         torch.manual_seed(42)
+
+    def test_future_predictor_has_five_real_action_slots(self):
+        import robot.modeling.future_predictor as predictor_module
+        predictor = predictor_module.GAMFuturePredictor(
+            d_da3=16, d_model=32, depth=2, num_heads=4,
+            num_patches_per_view=4, num_register_tokens=2,
+            use_language=False, proprio_dim=5, action_dim=4,
+            action_chunk_size=1, use_proprio_input=False,
+            num_action_slots=5,
+        )
+        visual = torch.randn(2, 1, 1, 7, 16)
+        history = torch.zeros(2, 1, 1, 4)
+        seed = torch.randn(2, 5, 32, requires_grad=True)
+        with patch("robot.modeling.future_predictor._HAS_FLEX", False):
+            output = predictor(
+                visual, past_action_history=history, action_slot_seed=seed,
+            )
+        self.assertEqual(output["predicted_action_tokens"].shape, (2, 1, 1, 5, 16))
+        output["predicted_action_tokens"].square().mean().backward()
+        self.assertGreater(seed.grad.abs().sum().item(), 0)
+        legacy = predictor_module.GAMFuturePredictor(
+            d_da3=16, d_model=32, depth=1, num_heads=4,
+            num_patches_per_view=4, num_register_tokens=2,
+            use_language=False, proprio_dim=5, action_dim=4,
+            action_chunk_size=1, use_proprio_input=False,
+        )
+        self.assertNotIn("action_slot_embed", legacy.state_dict())
 
     def test_stop_only_pose_does_not_change_actions(self):
         for mode, steps in (("legacy", 3), ("dual_observed", 1)):
@@ -182,20 +271,24 @@ class Tests(unittest.TestCase):
         self.assertTrue((net.prediction_roles.grad.abs().sum(1) > 0).all())
 
     def test_matrix_matches_executable_modes(self):
+        from experiments.uavflow_remote_ablation.matrix_v2 import (
+            EXPERIMENTS, overrides,
+        )
         root = Path(__file__).parent
-        script = (root / "run_remote.sh").read_text()
-        variants = script.split("variant_overrides() {", 1)[1].split("latest_checkpoint()", 1)[0]
-        variants = "variant_overrides() {" + variants
-        outputs = "output_id_for() {" + script.split("output_id_for() {", 1)[1].split("run_stage()", 1)[0]
         with (root / "compact_matrix.tsv").open() as stream:
             rows = list(csv.DictReader(stream, delimiter="\t"))
+        self.assertEqual([row["id"] for row in rows], list(EXPERIMENTS))
         for row in rows:
-            result = subprocess.check_output(["bash", "-c", variants + '\nvariant_overrides "$1"', "test", row["id"]], text=True)
-            flags = dict(line.split("=", 1) for line in result.splitlines())
-            self.assertEqual(flags.get("model.geometry_architecture", "legacy"), row["geometry_architecture"])
-        for run_id in ["H0", "HB", "C2_D2HB", "C3_W3HB", "C5_F10HB"]:
-            name = subprocess.check_output(["bash", "-c", outputs + '\noutput_id_for "$1"', "test", run_id], text=True).strip()
-            self.assertEqual(name, run_id + "_g2_simpleprompt_s1end0_s2end5")
+            flags = dict(value.split("=", 1) for value in overrides(row["id"]))
+            self.assertEqual(
+                flags["model.parallel_action_decode_mode"],
+                "geometry_residual" if row["id"] == "R1" else "full",
+            )
+            if row["assistant_slots"] == "5":
+                self.assertEqual(
+                    flags["stage1.qwen_token_selection"], "action_placeholders"
+                )
+                self.assertEqual(flags["stage1.qwen_action_placeholder_count"], "5")
 
     def test_real_encoder_loop_checkpoint_mask(self):
         from robot.modeling.da3_giant_encoder import DA3GiantEncoder
@@ -230,6 +323,200 @@ class Tests(unittest.TestCase):
         g1 = torch.autograd.grad(normal["action_tokens"].square().mean(), x, retain_graph=True)[0]
         g2 = torch.autograd.grad(checkpointed["action_tokens"].square().mean(), x)[0]
         torch.testing.assert_close(g1, g2)
+
+    def test_parallel_semantic_geometry_tokens_and_da3_insertion(self):
+        bridge = SemanticActionInitializer(
+            language_dim=12, output_dim=8,
+            chunk_size=5, width=16, heads=2,
+        )
+        language = torch.randn(2, 6, 12, requires_grad=True)
+        language_mask = torch.tensor([
+            [1, 1, 1, 0, 0, 0], [1, 1, 1, 1, 1, 1],
+        ], dtype=torch.bool)
+        seeds = bridge(language, language_mask)
+        self.assertEqual(seeds.shape, (2, 5, 8))
+
+        trans = nn.Module()
+        trans.blocks = nn.ModuleList([nn.Linear(8, 8) for _ in range(4)])
+        trans.num_register_tokens, trans.alt_start, trans.rope_start = 2, 0, 0
+        trans.rope, trans.cat_token = None, True
+        trans.norm = nn.LayerNorm(8)
+        trans._prepare_rope = lambda *args: (None, None)
+        trans.process_attention = lambda x, blk, **kw: x + blk(x.mean(2, keepdim=True))
+        backbone = nn.Module(); backbone.pretrained = trans
+        enc = types.SimpleNamespace(
+            backbone=backbone, embed_dim=8, PATCH_SIZE=14, temporal_embed=None,
+            out_layers=[0, 1, 2, 3], _deep_prefix_lengths=lambda **kw: None,
+            _build_camera_tokens=lambda b, v, dev, dtype: torch.zeros(
+                b, v, 8, device=dev, dtype=dtype
+            ),
+        )
+        visual = torch.randn(2, 1, 1, 7, 8, requires_grad=True)
+        run = __import__(
+            "robot.modeling.da3_giant_encoder", fromlist=["DA3GiantEncoder"]
+        ).DA3GiantEncoder._propagate_shallow_with_actions_impl
+        result = run(
+            enc, visual, seeds[:, None, None], decode_visuals=False,
+            return_multi_level=True,
+        )
+        self.assertEqual(result["action_tokens"].shape, (2, 5, 8))
+        self.assertEqual(result["level_feats"][-1][0].shape[-2], 4)
+        head = ParallelContinuousActionHead(8, 4)
+        actions = head(result["action_tokens"].reshape(2, 1, 1, 5, 8))
+        self.assertEqual(actions.shape, (2, 1, 5, 4))
+        actions.square().mean().backward()
+        self.assertGreater(language.grad[:, :3].abs().sum().item(), 0)
+        self.assertGreater(visual.grad.abs().sum().item(), 0)
+
+        qwen = QwenParallelActionTokenizer(
+            language_dim=12, output_dim=8, chunk_size=5, width=16, heads=2,
+        )
+        self.assertEqual(qwen(language.detach(), language_mask).shape, (2, 5, 8))
+        oft = OFTDimensionActionTokenizer(
+            language_dim=12, output_dim=8, chunk_size=5, action_dim=4,
+            width=16, heads=2,
+        )(language.detach(), language_mask)
+        self.assertEqual(oft["dimension_tokens"].shape, (2, 20, 16))
+        self.assertEqual(oft["plan_tokens"].shape, (2, 5, 8))
+        self.assertEqual(oft["direct_actions_norm"].shape, (2, 5, 4))
+
+    def test_five_token_post_qwen_bidirectional_mixer(self):
+        plain = QwenInternalActionProjector(
+            language_dim=12, output_dim=8, chunk_size=5, layers=0,
+        )
+        mixed = QwenInternalActionProjector(
+            language_dim=12, output_dim=8, chunk_size=5,
+            width=16, heads=2, layers=2,
+        )
+        tokens = torch.randn(2, 5, 12)
+        changed = tokens.clone()
+        changed[:, -1] += torch.linspace(-2.0, 3.0, 12)
+        # Point-wise projection cannot route the final slot into the first.
+        torch.testing.assert_close(plain(tokens)[:, 0], plain(changed)[:, 0])
+        # Full self-attention can route information in both directions.
+        self.assertFalse(torch.allclose(mixed(tokens)[:, 0], mixed(changed)[:, 0]))
+
+    def test_qwen_full_attention_action_block_mask(self):
+        class Layer(nn.Module):
+            def __init__(self):
+                super().__init__(); self.seen = None
+            def forward(self, hidden_states, attention_mask=None, **kwargs):
+                self.seen = attention_mask
+                return hidden_states
+        module = nn.Module()
+        module.embed_tokens = nn.Embedding(8, 4)
+        module.config = types.SimpleNamespace(
+            num_hidden_layers=2,
+            layer_types=["full_attention", "linear_attention"],
+        )
+        module.layers = nn.ModuleList([Layer(), Layer()])
+        module.norm = nn.Identity()
+        module.rotary_emb = lambda hidden, positions: (None, None)
+        module._update_linear_attn_mask = lambda mask, cache: mask
+        module._uav_action_token_mask = torch.tensor(
+            [[False, False, False, True, True]]
+        )
+        padding = torch.ones(1, 5, dtype=torch.long)
+        _qwen35_text_forward_with_action_block(
+            module, input_ids=torch.arange(5).view(1, 5),
+            attention_mask=padding, use_cache=False,
+        )
+        full = module.layers[0].seen[0, 0]
+        self.assertTrue(full[3, 4] and full[4, 3])
+        self.assertFalse(full[0, 3] or full[0, 4])
+        self.assertEqual(module.layers[1].seen.shape, (1, 5))
+
+    def test_complete_dual_vla_gfm_routing(self):
+        for mode in ("external_query", "qwen_tokens", "oft_gfm", "oft_direct"):
+            with self.subTest(mode=mode):
+                net = UAVFlowPredictorIDM(
+                    da3=TinyParallelDA3(), idm=None, action_dim=4, action_chunk_size=5,
+                    d_model=256, depth=1, num_heads=4, language_dim=16, language_len=8,
+                    direct_action_enabled=True, deep_action_enabled=True,
+                    compute_idm_branch=False, gradient_checkpointing=False,
+                    geometry_architecture="dual_vla_gfm",
+                    parallel_vla_gfm_enabled=True, parallel_vla_gfm_mode=mode,
+                    parallel_vla_gfm_width=32, parallel_vla_gfm_heads=4,
+                    depth_decode_enabled=True, use_fixed_first_frame=True,
+                    use_reference_type_embedding=True,
+                )
+                def rollout(self, observed, **kwargs):
+                    seed = kwargs["action_slot_seed"]
+                    self._test_seed = seed
+                    projected = self.predictor.action_proj(
+                        self.predictor.out_action_norm(seed)
+                    )
+                    return observed + 0.1, projected[:, None, None]
+                net.rollout_shallow = types.MethodType(rollout, net)
+                visual = torch.randn(2, 1, 1, 7, 16, requires_grad=True)
+                language_length = (
+                    5 if mode == "qwen_tokens"
+                    else 20 if mode in {"oft_gfm", "oft_direct"}
+                    else 6
+                )
+                language = torch.randn(2, language_length, 16, requires_grad=True)
+                language_mask = torch.ones(2, language_length, dtype=torch.bool)
+                if mode == "external_query":
+                    language_mask[0, 3:] = False
+                output = net(
+                    visual, reference_shallow=visual,
+                    lang_feats=language,
+                    lang_padding_mask=language_mask,
+                )
+                self.assertIsNone(net.causal_action_decoder)
+                self.assertEqual(net._test_seed.shape, (2, 5, 256))
+                self.assertEqual(output["actions_norm"].shape, (2, 1, 5, 4))
+                self.assertEqual(output["refine_actions_norm"].shape, (2, 1, 5, 4))
+                self.assertEqual(output["deep_joint_features"]["action_tokens"].shape, (2, 5, 16))
+                self.assertIsNotNone(output["current_geometry_features"])
+                if mode == "oft_direct":
+                    torch.testing.assert_close(
+                        output["actions_norm"], output["direct_actions_norm"]
+                    )
+                output["actions_norm"].square().mean().backward()
+                self.assertGreater(language.grad.abs().sum().item(), 0)
+                if mode != "oft_direct":
+                    self.assertGreater(visual.grad.abs().sum().item(), 0)
+
+    def test_geometry_residual_starts_from_vla_base(self):
+        net = UAVFlowPredictorIDM(
+            da3=TinyParallelDA3(), idm=None, action_dim=4, action_chunk_size=5,
+            d_model=256, depth=1, num_heads=4, language_dim=16, language_len=8,
+            direct_action_enabled=True, deep_action_enabled=True,
+            compute_idm_branch=False, gradient_checkpointing=False,
+            geometry_architecture="dual_vla_gfm",
+            parallel_vla_gfm_enabled=True,
+            parallel_vla_gfm_mode="external_query",
+            parallel_action_decode_mode="geometry_residual",
+            parallel_vla_gfm_width=32, parallel_vla_gfm_heads=4,
+            depth_decode_enabled=True, use_fixed_first_frame=True,
+            use_reference_type_embedding=True,
+        )
+
+        def rollout(self, observed, **kwargs):
+            projected = self.predictor.action_proj(
+                self.predictor.out_action_norm(kwargs["action_slot_seed"])
+            )
+            return observed + 0.1, projected[:, None, None]
+
+        net.rollout_shallow = types.MethodType(rollout, net)
+        visual = torch.randn(2, 1, 1, 7, 16)
+        language = torch.randn(2, 6, 16)
+        output = net(
+            visual, reference_shallow=visual,
+            lang_feats=language,
+            lang_padding_mask=torch.ones(2, 6, dtype=torch.bool),
+        )
+        torch.testing.assert_close(
+            output["refine_actions_norm"], output["direct_actions_norm"]
+        )
+        torch.testing.assert_close(
+            output["geometry_action_residual_norm"],
+            torch.zeros_like(output["geometry_action_residual_norm"]),
+        )
+        output["refine_actions_norm"].square().mean().backward()
+        final = net.parallel_action_correction_head.model[-1]
+        self.assertGreater(final.weight.grad.abs().sum().item(), 0)
 
     def test_mask_truth_table(self):
         n = 5
@@ -269,6 +556,12 @@ class Tests(unittest.TestCase):
         memories = DA3GiantEncoder.propagate_shallow_visual_slots_grad(
             enc, current, gradient_checkpointing=True, return_layer_patches=True)
         self.assertEqual(set(memories["layer_patches"]), {0, 1, 2, 3})
+        sparse_current = DA3GiantEncoder.propagate_shallow_visual_slots_grad(
+            enc, current, gradient_checkpointing=True, return_layer_patches=True,
+            layer_patch_indices=[1, 3], layer_patch_mode="current",
+        )
+        self.assertEqual(set(sparse_current["layer_patches"]), {1, 3})
+        self.assertEqual(sparse_current["layer_patches"][1].shape[-1], 8)
         read = CurrentGeometryRead(8, width=16, heads=2)
         args = dict(decode_visuals=False, return_multi_level=True,
                     current_geometry_by_layer=memories["layer_patches"], current_geometry_read=read)
@@ -284,6 +577,13 @@ class Tests(unittest.TestCase):
         self.assertGreater(late_grad.abs().sum().item(), 0)
         plain_grad = torch.autograd.grad(plain["level_feats"][-1][0].square().mean(), current)[0]
         torch.testing.assert_close(late_grad, plain_grad)
+        sparse_read = CurrentGeometryRead(8, width=16, heads=2, memory_dim=8)
+        sparse = run(
+            enc, visual, action, decode_visuals=False,
+            current_geometry_by_layer=sparse_current["layer_patches"],
+            current_geometry_read=sparse_read,
+        )
+        self.assertEqual(sparse["action_tokens"].shape, (2, 8))
 
     def test_current_never_receives_future_or_actions_across_layers(self):
         block = Block()

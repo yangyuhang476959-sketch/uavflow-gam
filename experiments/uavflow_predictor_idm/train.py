@@ -28,6 +28,7 @@ from experiments.uavflow_predictor_idm.data import (
 from experiments.uavflow_predictor_idm.idm import build_frozen_idm
 from experiments.uavflow_predictor_idm.model import UAVFlowPredictorIDM
 from experiments.uavflow_predictor_idm.objectives import evaluate, forward_batch
+from experiments.uavflow_predictor_idm.logging_metrics import compact_train_line, enabled_metric
 from experiments.uavflow_predictor_idm.runtime import (
     apply_overrides,
     distributed_info,
@@ -309,7 +310,50 @@ def main() -> None:
         deep_action_enabled=bool(cfg.model.get("deep_action_enabled", False)),
         current_geometry_action_enabled=bool(cfg.model.get("current_geometry_action_enabled", False)),
         current_geometry_read_mode=str(cfg.model.get("current_geometry_read_mode", "terminal")),
+        current_geometry_bank_mode=str(
+            cfg.model.get("current_geometry_bank_mode", "output_current")
+        ),
         geometry_architecture=str(cfg.model.get("geometry_architecture", "legacy")),
+        vlm_action_seed_enabled=bool(
+            cfg.model.get("vlm_action_seed_enabled", False)
+        ),
+        causal_action_decoder_enabled=bool(
+            cfg.model.get("causal_action_decoder_enabled", False)
+        ),
+        causal_action_bins=int(cfg.model.get("causal_action_bins", 256)),
+        causal_action_model_dim=int(
+            cfg.model.get("causal_action_model_dim", 512)
+        ),
+        causal_action_num_heads=int(
+            cfg.model.get("causal_action_num_heads", 8)
+        ),
+        causal_action_num_layers=int(
+            cfg.model.get("causal_action_num_layers", 2)
+        ),
+        parallel_vla_gfm_enabled=bool(
+            cfg.model.get("parallel_vla_gfm_enabled", False)
+        ),
+        parallel_vla_gfm_width=int(
+            cfg.model.get("parallel_vla_gfm_width", 512)
+        ),
+        parallel_vla_gfm_heads=int(
+            cfg.model.get("parallel_vla_gfm_heads", 8)
+        ),
+        parallel_vla_gfm_mode=str(
+            cfg.model.get("parallel_vla_gfm_mode", "external_query")
+        ),
+        parallel_action_post_bidir_layers=int(
+            cfg.model.get("parallel_action_post_bidir_layers", 0)
+        ),
+        parallel_current_depth_enabled=bool(
+            cfg.model.get("parallel_current_depth_enabled", True)
+        ),
+        parallel_current_geometry_read_enabled=bool(
+            cfg.model.get("parallel_current_geometry_read_enabled", True)
+        ),
+        parallel_action_decode_mode=str(
+            cfg.model.get("parallel_action_decode_mode", "full")
+        ),
         train_deep_backbone=train_deep_parameters,
         deep_train_start_block=int(
             deep_lora_cfg.get("start_block", cfg.model.get("deep_train_start_block", da3.out_layers[0]))
@@ -334,13 +378,54 @@ def main() -> None:
         gradient_checkpointing=bool(cfg.model.gradient_checkpointing),
     ).to(device)
     raw_model = model
+    trainable_conditioner_names = {
+        name for name, parameter in text.named_parameters() if parameter.requires_grad
+    }
+    if trainable_conditioner_names:
+        # Register the conditioner under the policy before DDP wrapping so its
+        # LoRA gradients participate in the same reducer and optimizer. The
+        # encoding call still happens before policy.forward, but its graph is
+        # connected through lang_feats to the returned policy losses.
+        raw_model.add_module("trainable_conditioner", text)
     if args.init_checkpoint:
         init_ckpt = torch.load(args.init_checkpoint, map_location="cpu", weights_only=False)
-        load_current_geometry_read(raw_model, init_ckpt, required=raw_model.current_geometry_action_enabled)
+        if trainable_conditioner_names:
+            state = init_ckpt.get("conditioner_trainable")
+            if state is not None:
+                text.load_state_dict(state, strict=False)
+        load_current_geometry_read(
+            raw_model, init_ckpt,
+            required=(raw_model.current_geometry_action_enabled or raw_model.parallel_vla_gfm_enabled),
+        )
         load_architecture_state(raw_model, init_ckpt)
         raw_model.predictor.load_state_dict(init_ckpt["predictor"], strict=True)
         if "direct_action_head" in init_ckpt:
             raw_model.direct_action_head.load_state_dict(init_ckpt["direct_action_head"], strict=True)
+        if raw_model.vlm_action_seed_enabled and init_ckpt.get("vlm_action_seed") is not None:
+            raw_model.vlm_action_seed.load_state_dict(init_ckpt["vlm_action_seed"], strict=True)
+        if raw_model.causal_action_decoder_enabled and init_ckpt.get("causal_action_decoder") is not None:
+            raw_model.causal_action_decoder.load_state_dict(
+                init_ckpt["causal_action_decoder"], strict=True
+            )
+        if raw_model.parallel_vla_gfm_enabled:
+            bridge_state = init_ckpt.get("semantic_geometry_action")
+            oft_state = init_ckpt.get("oft_action_tokenizer")
+            head_state = init_ckpt.get("parallel_action_head")
+            correction_state = init_ckpt.get("parallel_action_correction_head")
+            if bridge_state is not None and raw_model.semantic_geometry_action is not None:
+                raw_model.semantic_geometry_action.load_state_dict(bridge_state, strict=True)
+            if oft_state is not None and raw_model.oft_action_tokenizer is not None:
+                raw_model.oft_action_tokenizer.load_state_dict(oft_state, strict=True)
+            if head_state is not None:
+                raw_model.parallel_action_head.load_state_dict(head_state, strict=True)
+            if raw_model.parallel_action_correction_head is not None:
+                if correction_state is None:
+                    raise KeyError(
+                        "Geometry-residual init checkpoint has no correction-head state."
+                    )
+                raw_model.parallel_action_correction_head.load_state_dict(
+                    correction_state, strict=True
+                )
         if raw_model.relative_pose_head_enabled and init_ckpt.get("relative_pose_head") is not None:
             raw_model.relative_pose_head.load_state_dict(
                 init_ckpt["relative_pose_head"], strict=True
@@ -386,6 +471,22 @@ def main() -> None:
         id(parameter) for parameter in raw_model.direct_action_head.parameters()
         if parameter.requires_grad
     }
+    if raw_model.causal_action_decoder is not None:
+        direct_head_ids.update(
+            id(parameter) for parameter in raw_model.causal_action_decoder.parameters()
+            if parameter.requires_grad
+        )
+    if raw_model.parallel_action_head is not None:
+        direct_head_ids.update(
+            id(parameter) for parameter in raw_model.parallel_action_head.parameters()
+            if parameter.requires_grad
+        )
+    if raw_model.parallel_action_correction_head is not None:
+        direct_head_ids.update(
+            id(parameter)
+            for parameter in raw_model.parallel_action_correction_head.parameters()
+            if parameter.requires_grad
+        )
     separate_stop_lr = cfg.training.get("stop_head_lr") is not None
     stop_head_ids = {
         id(parameter) for parameter in raw_model.stop_head.parameters()
@@ -480,6 +581,13 @@ def main() -> None:
             "stage1.qwen_use_reference_image",
             "stage1.qwen_prompt_mode",
             "stage1.qwen_token_selection",
+            "stage1.qwen_lora_enabled",
+            "stage1.qwen_action_attention_mode",
+            "stage1.qwen_lora_rank",
+            "stage1.qwen_lora_alpha",
+            "stage1.qwen_lora_dropout",
+            "stage1.qwen_action_placeholder_count",
+            "dataset.openvla_prompt_pose_mode",
             "dataset.split_file",
             "dataset.real_root",
             "dataset.sim_root",
@@ -517,7 +625,21 @@ def main() -> None:
             "model.deep_action_enabled",
             "model.current_geometry_action_enabled",
             "model.current_geometry_read_mode",
+            "model.current_geometry_bank_mode",
             "model.geometry_architecture",
+            "model.vlm_action_seed_enabled",
+            "model.causal_action_decoder_enabled",
+            "model.causal_action_bins",
+            "model.causal_action_model_dim",
+            "model.causal_action_num_heads",
+            "model.causal_action_num_layers",
+            "model.parallel_vla_gfm_enabled",
+            "model.parallel_vla_gfm_width",
+            "model.parallel_vla_gfm_heads",
+            "model.parallel_vla_gfm_mode",
+            "model.parallel_action_post_bidir_layers",
+            "model.parallel_current_depth_enabled",
+            "model.parallel_current_geometry_read_enabled",
             "model.relative_pose_head_enabled",
             "loss.depth_scale_mode",
             "model.train_deep_backbone",
@@ -565,6 +687,9 @@ def main() -> None:
                 saved_value, current_value = saved_value or "legacy", current_value or "legacy"
             if path == "model.current_geometry_read_mode":
                 saved_value, current_value = saved_value or "terminal", current_value or "terminal"
+            if path == "model.current_geometry_bank_mode":
+                saved_value = saved_value or "every_layer_concat"
+                current_value = current_value or "every_layer_concat"
             if saved_value != current_value:
                 mismatches.append(f"{path}: checkpoint={saved_value!r}, current={current_value!r}")
         saved_world = ckpt.get("world_size")
@@ -583,6 +708,49 @@ def main() -> None:
                 + "\n  ".join(mismatches)
             )
         raw_model.predictor.load_state_dict(ckpt["predictor"])
+        if trainable_conditioner_names:
+            state = ckpt.get("conditioner_trainable")
+            if state is None:
+                raise KeyError("Qwen-LoRA resume checkpoint has no conditioner_trainable state")
+            text.load_state_dict(state, strict=False)
+        if raw_model.vlm_action_seed_enabled:
+            if ckpt.get("vlm_action_seed") is None:
+                raise KeyError("VLM-action-seed resume checkpoint has no projector state.")
+            raw_model.vlm_action_seed.load_state_dict(ckpt["vlm_action_seed"], strict=True)
+        if raw_model.causal_action_decoder_enabled:
+            if ckpt.get("causal_action_decoder") is None:
+                raise KeyError("Causal-action resume checkpoint has no decoder state.")
+            raw_model.causal_action_decoder.load_state_dict(
+                ckpt["causal_action_decoder"], strict=True
+            )
+        if raw_model.parallel_vla_gfm_enabled:
+            active_initializer = (
+                raw_model.oft_action_tokenizer
+                if raw_model.oft_action_tokenizer is not None
+                else raw_model.semantic_geometry_action
+            )
+            state_key = (
+                "oft_action_tokenizer"
+                if raw_model.oft_action_tokenizer is not None
+                else "semantic_geometry_action"
+            )
+            if ckpt.get(state_key) is None:
+                raise KeyError(f"dual_vla_gfm checkpoint has no {state_key} state.")
+            if ckpt.get("parallel_action_head") is None:
+                raise KeyError("dual_vla_gfm checkpoint has no parallel action-head state.")
+            active_initializer.load_state_dict(ckpt[state_key], strict=True)
+            raw_model.parallel_action_head.load_state_dict(
+                ckpt["parallel_action_head"], strict=True
+            )
+            if raw_model.parallel_action_correction_head is not None:
+                state = ckpt.get("parallel_action_correction_head")
+                if state is None:
+                    raise KeyError(
+                        "Geometry-residual resume checkpoint has no correction-head state."
+                    )
+                raw_model.parallel_action_correction_head.load_state_dict(
+                    state, strict=True
+                )
         load_current_geometry_read(raw_model, ckpt, required=True)
         load_architecture_state(raw_model, ckpt)
         raw_model.residual_gate_logit.data.copy_(ckpt["residual_gate_logit"])
@@ -709,6 +877,9 @@ def main() -> None:
             f" variable_language_tokens={raw_model.predictor.variable_language_tokens}"
             f" dense_context={raw_model.dense_context_supervision}"
             f" direct_action={raw_model.direct_action_enabled}"
+            f" vlm_action_seed={raw_model.vlm_action_seed_enabled}"
+            f" causal_action_decoder={raw_model.causal_action_decoder_enabled}"
+            f" geometry_architecture={raw_model.geometry_architecture}"
             f" idm_branch={raw_model.compute_idm_branch}"
             f" action_chunk={raw_model.action_chunk_size}"
             f" feature_target_offset={raw_model.feature_target_offset}"
@@ -747,6 +918,9 @@ def main() -> None:
                 stop_pos_weight=float(cfg.loss.get("stop_pos_weight", 1.0)),
                 action_direct_weight=float(cfg.loss.get("action_direct_weight", 1.0)),
                 action_refine_weight=float(cfg.loss.get("action_refine_weight", 1.0)),
+                dual_branch_action_aux_weight=float(
+                    cfg.loss.get("dual_branch_action_aux_weight", 0.5)
+                ),
                 max_batches=int(cfg.training.eval_max_batches),
                 amp=bool(cfg.training.amp),
                 depth_target_source=str(cfg.loss.get("depth_target_source", "ue_gt")),
@@ -836,6 +1010,7 @@ def main() -> None:
             "predictor": raw_model.predictor.state_dict(),
             "geometry_architecture_state": architecture_state(raw_model),
             "current_geometry_read_mode": raw_model.current_geometry_read_mode,
+            "current_geometry_bank_mode": raw_model.current_geometry_bank_mode,
             "current_geometry_read": (
                 raw_model.current_geometry_read.state_dict()
                 if raw_model.current_geometry_read is not None else None
@@ -845,6 +1020,38 @@ def main() -> None:
             "missing_pose_embed": raw_model.missing_pose_embed.detach().cpu(),
             "reference_step_embed": raw_model.reference_step_embed.detach().cpu(),
             "direct_action_head": raw_model.direct_action_head.state_dict(),
+            "vlm_action_seed": (
+                raw_model.vlm_action_seed.state_dict()
+                if raw_model.vlm_action_seed is not None else None
+            ),
+            "causal_action_decoder": (
+                raw_model.causal_action_decoder.state_dict()
+                if raw_model.causal_action_decoder is not None else None
+            ),
+            "semantic_geometry_action": (
+                raw_model.semantic_geometry_action.state_dict()
+                if raw_model.semantic_geometry_action is not None else None
+            ),
+            "oft_action_tokenizer": (
+                raw_model.oft_action_tokenizer.state_dict()
+                if raw_model.oft_action_tokenizer is not None else None
+            ),
+            "parallel_action_head": (
+                raw_model.parallel_action_head.state_dict()
+                if raw_model.parallel_action_head is not None else None
+            ),
+            "parallel_action_correction_head": (
+                raw_model.parallel_action_correction_head.state_dict()
+                if raw_model.parallel_action_correction_head is not None else None
+            ),
+            "conditioner_trainable": (
+                {
+                    name: value.detach().cpu()
+                    for name, value in text.state_dict().items()
+                    if name in trainable_conditioner_names
+                }
+                if trainable_conditioner_names else None
+            ),
             "relative_pose_head": (
                 raw_model.relative_pose_head.state_dict()
                 if raw_model.relative_pose_head_enabled else None
@@ -959,6 +1166,9 @@ def main() -> None:
                 stop_pos_weight=float(cfg.loss.get("stop_pos_weight", 1.0)),
                 action_direct_weight=float(cfg.loss.get("action_direct_weight", 1.0)),
                 action_refine_weight=float(cfg.loss.get("action_refine_weight", 1.0)),
+                dual_branch_action_aux_weight=float(
+                    cfg.loss.get("dual_branch_action_aux_weight", 0.5)
+                ),
                 amp=bool(cfg.training.amp),
                 depth_target_source=str(cfg.loss.get("depth_target_source", "ue_gt")),
                 depth_scale_mode=str(cfg.loss.get("depth_scale_mode", "per_frame_median")),
@@ -1043,6 +1253,9 @@ def main() -> None:
                     f"action={values['action'].item():.4f} "
                     f"direct={values['direct_action'].item():.4f} "
                     f"refine={values['refine_action'].item():.4f} "
+                    f"dual_cur={values['action_dual_current'].item():.4f} "
+                    f"dual_fut={values['action_dual_future'].item():.4f} "
+                    f"dual_fgate={values['action_dual_future_gate'].item():.3f} "
                     f"raw={values['raw_l1'].item():.5f} "
                     f"zero_slots={values['target_zero_slot_fraction'].item():.3f} "
                     f"stop={values['stop'].item():.4f} "
@@ -1093,6 +1306,7 @@ def main() -> None:
                     f"{lr:.2e}/{lr * head_lr_mult:.2e} "
                     f"peak_mem={memory_gb:.2f}GB"
                 )
+                line = compact_train_line(line, values, cfg)
                 print("\n" + line, flush=True)
                 with (output / "train.log").open("a") as handle: handle.write(line + "\n")
             if int(cfg.training.eval_every) > 0 and step % int(cfg.training.eval_every) == 0:
@@ -1112,6 +1326,9 @@ def main() -> None:
                     stop_pos_weight=float(cfg.loss.get("stop_pos_weight", 1.0)),
                     action_direct_weight=float(cfg.loss.get("action_direct_weight", 1.0)),
                     action_refine_weight=float(cfg.loss.get("action_refine_weight", 1.0)),
+                    dual_branch_action_aux_weight=float(
+                        cfg.loss.get("dual_branch_action_aux_weight", 0.5)
+                    ),
                     max_batches=int(cfg.training.eval_max_batches), amp=bool(cfg.training.amp),
                     depth_target_source=str(cfg.loss.get("depth_target_source", "ue_gt")),
                 depth_scale_mode=str(cfg.loss.get("depth_scale_mode", "per_frame_median")),
@@ -1162,6 +1379,9 @@ def main() -> None:
                         stop_pos_weight=float(cfg.loss.get("stop_pos_weight", 1.0)),
                         action_direct_weight=float(cfg.loss.get("action_direct_weight", 1.0)),
                         action_refine_weight=float(cfg.loss.get("action_refine_weight", 1.0)),
+                        dual_branch_action_aux_weight=float(
+                            cfg.loss.get("dual_branch_action_aux_weight", 0.5)
+                        ),
                         max_batches=int(cfg.training.eval_max_batches),
                         amp=bool(cfg.training.amp),
                         depth_target_source=str(cfg.loss.get("depth_target_source", "ue_gt")),
@@ -1196,7 +1416,9 @@ def main() -> None:
                         ),
                     )
                 if rank == 0:
-                    line = f"[step={step:07d}] eval " + " ".join(f"{k}={v:.5f}" for k, v in ev.items())
+                    line = f"[step={step:07d}] eval " + " ".join(
+                        f"{k}={v:.6f}" for k, v in ev.items() if enabled_metric(k, cfg)
+                    )
                     print("\n" + line, flush=True)
                     with (output / "train.log").open("a") as handle: handle.write(line + "\n")
                     for domain_name, domain_values in domain_evals.items():

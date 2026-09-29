@@ -12,11 +12,19 @@ import torch
 from torch import nn
 
 from robot.modeling.action_head_v2 import ActionHeadV2
+from robot.modeling.action_head_causal_token import CausalTokenActionHead
 from robot.modeling.future_predictor import GAMFuturePredictor
 from .idm import build_frozen_idm  # Backward-compatible re-export.
 from .current_geometry import CurrentGeometryRead
+from .semantic_geometry_action import (
+    OFTInternalActionProjector,
+    ParallelContinuousActionHead,
+    QwenInternalActionProjector,
+    SemanticActionInitializer,
+)
 from .geometry_architectures import (
-    GEOMETRY_ARCHITECTURES, DUAL_ARCHITECTURES, DirectCurrentActionSeed, select_dual_view,
+    GEOMETRY_ARCHITECTURES, DUAL_ARCHITECTURES, DirectCurrentActionSeed,
+    DualActionFusion, select_dual_view,
 )
 
 
@@ -537,7 +545,22 @@ class UAVFlowPredictorIDM(nn.Module):
         gradient_checkpointing: bool = True,
         current_geometry_action_enabled: bool = False,
         current_geometry_read_mode: str = "terminal",
+        current_geometry_bank_mode: str = "output_current",
         geometry_architecture: str = "legacy",
+        vlm_action_seed_enabled: bool = False,
+        causal_action_decoder_enabled: bool = False,
+        causal_action_bins: int = 256,
+        causal_action_model_dim: int = 512,
+        causal_action_num_heads: int = 8,
+        causal_action_num_layers: int = 2,
+        parallel_vla_gfm_enabled: bool = False,
+        parallel_vla_gfm_width: int = 512,
+        parallel_vla_gfm_heads: int = 8,
+        parallel_vla_gfm_mode: str = "external_query",
+        parallel_action_post_bidir_layers: int = 0,
+        parallel_current_depth_enabled: bool = True,
+        parallel_current_geometry_read_enabled: bool = True,
+        parallel_action_decode_mode: str = "full",
     ) -> None:
         super().__init__()
         self.da3 = da3
@@ -576,7 +599,56 @@ class UAVFlowPredictorIDM(nn.Module):
         self.current_geometry_read_mode = str(current_geometry_read_mode)
         if self.current_geometry_read_mode not in {"terminal", "per_layer"}:
             raise ValueError("current_geometry_read_mode must be terminal or per_layer")
+        self.current_geometry_bank_mode = str(current_geometry_bank_mode).lower()
+        valid_bank_modes = {
+            "every_layer_concat", "output_current", "output_concat", "global_current",
+        }
+        if self.current_geometry_bank_mode not in valid_bank_modes:
+            raise ValueError(
+                f"current_geometry_bank_mode={self.current_geometry_bank_mode!r} not in "
+                f"{sorted(valid_bank_modes)}"
+            )
         self.geometry_architecture = str(geometry_architecture)
+        self.vlm_action_seed_enabled = bool(vlm_action_seed_enabled)
+        self.causal_action_decoder_enabled = bool(causal_action_decoder_enabled)
+        self.parallel_vla_gfm_enabled = bool(parallel_vla_gfm_enabled)
+        self.parallel_vla_gfm_mode = str(parallel_vla_gfm_mode).lower()
+        self.parallel_action_post_bidir_layers = int(parallel_action_post_bidir_layers)
+        self.parallel_current_depth_enabled = bool(parallel_current_depth_enabled)
+        self.parallel_current_geometry_read_enabled = bool(
+            parallel_current_geometry_read_enabled
+        )
+        self.parallel_action_decode_mode = str(parallel_action_decode_mode).lower()
+        if self.parallel_action_decode_mode not in {"full", "geometry_residual"}:
+            raise ValueError(
+                "parallel_action_decode_mode must be full or geometry_residual"
+            )
+        if self.parallel_action_post_bidir_layers < 0:
+            raise ValueError("parallel_action_post_bidir_layers must be non-negative")
+        valid_parallel_modes = {"external_query", "qwen_tokens", "oft_gfm", "oft_direct"}
+        if self.parallel_vla_gfm_enabled:
+            if self.geometry_architecture != "dual_vla_gfm":
+                raise ValueError(
+                    "parallel_vla_gfm_enabled=true requires geometry_architecture=dual_vla_gfm"
+                )
+            if self.vlm_action_seed_enabled or self.causal_action_decoder_enabled:
+                raise ValueError(
+                    "dual_vla_gfm replaces the pooled VLM seed and causal action decoder"
+                )
+            if self.rollout_steps != 1 or self.action_chunk_size <= 1:
+                raise ValueError("dual_vla_gfm requires rollout_steps=1 and chunk_size>1")
+            if self.parallel_vla_gfm_mode not in valid_parallel_modes:
+                raise ValueError(
+                    f"parallel_vla_gfm_mode={self.parallel_vla_gfm_mode!r} not in "
+                    f"{sorted(valid_parallel_modes)}"
+                )
+            # Geometry Bank is always consumed inside every DA3 refine layer,
+            # never as the legacy one-shot terminal read.
+            self.current_geometry_read_mode = "per_layer"
+        elif self.parallel_current_depth_enabled or self.parallel_current_geometry_read_enabled:
+            # These switches only describe the parallel VLA-GFM family.
+            self.parallel_current_depth_enabled = False
+            self.parallel_current_geometry_read_enabled = False
         if self.geometry_architecture not in GEOMETRY_ARCHITECTURES:
             raise ValueError(f"Unknown geometry_architecture={self.geometry_architecture}")
         if self.geometry_architecture != "legacy":
@@ -623,7 +695,12 @@ class UAVFlowPredictorIDM(nn.Module):
             dropout=float(dropout),
             num_patches_per_view=n_visual - 1 - int(getattr(da3, "num_register_tokens", 0)),
             num_register_tokens=int(getattr(da3, "num_register_tokens", 0)),
-            use_language=True,
+            # Parallel VLA-GFM carries semantics exclusively in its K action
+            # slots. Keeping the old per-block language CA would duplicate
+            # conditioning and invalidate the intended ablation.
+            use_language=not (
+                self.vlm_action_seed_enabled or self.parallel_vla_gfm_enabled
+            ),
             language_dim=int(language_dim),
             language_len=int(language_len),
             variable_language_tokens=bool(variable_language_tokens),
@@ -636,7 +713,19 @@ class UAVFlowPredictorIDM(nn.Module):
             condition_mode=str(condition_mode),
             input_proj_norm="ln",
             gradient_checkpointing=bool(gradient_checkpointing),
+            num_action_slots=(self.action_chunk_size if self.parallel_vla_gfm_enabled else 1),
         )
+        if self.vlm_action_seed_enabled:
+            # Select one already multimodally contextualized Qwen token, then
+            # initialize only GAM's current action slot. Language is therefore
+            # consumed once at the entrance and is absent from all Predictor
+            # block cross-attention paths.
+            self.vlm_action_seed = nn.Sequential(
+                nn.LayerNorm(int(language_dim)),
+                nn.Linear(int(language_dim), int(d_model)),
+            )
+        else:
+            self.vlm_action_seed = None
         # Dedicated content embedding for a missing/not-yet-executed action.
         # GAM's existing type_embed[4] is still added inside the predictor, so
         # this parameter represents content only and cannot be confused with a
@@ -671,7 +760,78 @@ class UAVFlowPredictorIDM(nn.Module):
             chunk_position_encoding=("learned" if self.action_chunk_size > 1 else "none"),
         )
         for parameter in self.direct_action_head.parameters():
-            parameter.requires_grad = self.direct_action_enabled
+            parameter.requires_grad = (
+                self.direct_action_enabled
+                and not self.causal_action_decoder_enabled
+                and not self.parallel_vla_gfm_enabled
+            )
+        self.dual_action_fusion = (
+            DualActionFusion(int(da3.embed_dim))
+            if self.geometry_architecture in DUAL_ARCHITECTURES else None
+        )
+        self.causal_action_decoder = (
+            CausalTokenActionHead(
+                input_dim=int(da3.embed_dim),
+                action_dim=int(action_dim),
+                chunk_size=self.action_chunk_size,
+                n_bins=int(causal_action_bins),
+                model_dim=int(causal_action_model_dim),
+                num_heads=int(causal_action_num_heads),
+                num_layers=int(causal_action_num_layers),
+                dropout=float(dropout),
+            )
+            if self.causal_action_decoder_enabled else None
+        )
+        self.semantic_geometry_action = None
+        if self.parallel_vla_gfm_enabled:
+            initializer_cls = (
+                QwenInternalActionProjector
+                if self.parallel_vla_gfm_mode == "qwen_tokens"
+                else SemanticActionInitializer
+            )
+            initializer_kwargs = dict(
+                language_dim=int(language_dim),
+                output_dim=int(d_model),
+                chunk_size=self.action_chunk_size,
+                width=int(parallel_vla_gfm_width),
+                heads=int(parallel_vla_gfm_heads),
+            )
+            if self.parallel_vla_gfm_mode == "qwen_tokens":
+                initializer_kwargs["layers"] = self.parallel_action_post_bidir_layers
+            self.semantic_geometry_action = initializer_cls(**initializer_kwargs)
+        self.oft_action_tokenizer = (
+            OFTInternalActionProjector(
+                language_dim=int(language_dim), output_dim=int(d_model),
+                chunk_size=self.action_chunk_size, action_dim=self.action_dim,
+                width=int(parallel_vla_gfm_width), heads=int(parallel_vla_gfm_heads),
+            )
+            if self.parallel_vla_gfm_enabled
+            and self.parallel_vla_gfm_mode in {"oft_gfm", "oft_direct"}
+            else None
+        )
+        if self.oft_action_tokenizer is not None:
+            # Only one semantic initializer is active in a run.
+            self.semantic_geometry_action = None
+        self.parallel_action_head = (
+            ParallelContinuousActionHead(
+                input_dim=int(da3.embed_dim), action_dim=int(action_dim)
+            )
+            if self.parallel_vla_gfm_enabled else None
+        )
+        self.parallel_action_correction_head = (
+            ParallelContinuousActionHead(
+                input_dim=int(da3.embed_dim), action_dim=int(action_dim)
+            )
+            if self.parallel_vla_gfm_enabled
+            and self.parallel_action_decode_mode == "geometry_residual"
+            else None
+        )
+        if self.parallel_action_correction_head is not None:
+            # R1 starts as the exact VLA base policy. Geometry must learn only
+            # a correction, rather than replacing the semantic plan at step 0.
+            final = self.parallel_action_correction_head.model[-1]
+            nn.init.zeros_(final.weight)
+            nn.init.zeros_(final.bias)
         # Auxiliary endpoint supervision. Given the observed episode-relative
         # pose token, predict the GT pose reached after the complete action
         # chunk, still relative to episode F0, as [x,y,z,sin(yaw),cos(yaw)].
@@ -769,9 +929,44 @@ class UAVFlowPredictorIDM(nn.Module):
             requires_grad=self.residual_prediction,
         )
         # Construct last: disabled ablations retain their previous RNG sequence.
+        parallel_geometry_layers = None
+        self.current_geometry_patch_mode = "concat"
+        if self.parallel_vla_gfm_enabled and self.parallel_current_geometry_read_enabled:
+            transformer = getattr(getattr(da3, "backbone", None), "pretrained", None)
+            if transformer is not None and hasattr(transformer, "blocks"):
+                start = int(getattr(transformer, "alt_start", 12))
+                if self.current_geometry_bank_mode == "every_layer_concat":
+                    parallel_geometry_layers = list(range(start, len(transformer.blocks)))
+                elif self.current_geometry_bank_mode in {"output_current", "output_concat"}:
+                    parallel_geometry_layers = [int(index) for index in da3.out_layers]
+                elif self.current_geometry_bank_mode == "global_current":
+                    parallel_geometry_layers = [
+                        index for index in range(start, len(transformer.blocks)) if index % 2 == 1
+                    ]
+            self.current_geometry_patch_mode = (
+                "concat" if self.current_geometry_bank_mode.endswith("concat") else "current"
+            )
+        self.current_geometry_layer_indices = (
+            None if parallel_geometry_layers is None else tuple(parallel_geometry_layers)
+        )
         self.current_geometry_read = (
-            CurrentGeometryRead(int(da3.embed_dim))
-            if self.current_geometry_action_enabled else None
+            CurrentGeometryRead(
+                int(da3.embed_dim),
+                layer_indices=parallel_geometry_layers,
+                gate_init=(0.05 if self.parallel_vla_gfm_enabled else 1e-3),
+                memory_dim=(
+                    int(2 * da3.embed_dim)
+                    if self.current_geometry_patch_mode == "concat"
+                    else int(da3.embed_dim)
+                ),
+            )
+            if (
+                self.current_geometry_action_enabled
+                or (
+                    self.parallel_vla_gfm_enabled
+                    and self.parallel_current_geometry_read_enabled
+                )
+            ) else None
         )
         self.direct_current_seed = (
             DirectCurrentActionSeed(int(da3.embed_dim), int(language_dim))
@@ -823,6 +1018,7 @@ class UAVFlowPredictorIDM(nn.Module):
         reference_pose: torch.Tensor | None,
         lang_feats: torch.Tensor,
         lang_padding_mask: torch.Tensor | None,
+        action_slot_seed: torch.Tensor | None = None,
         conditioning_generator: torch.Generator | None = None,
         force_action_history_missing: bool = False,
         force_pose_history_missing: bool = False,
@@ -991,9 +1187,16 @@ class UAVFlowPredictorIDM(nn.Module):
                 past_action_history=predictor_actions,
                 past_action_history_valid_mask=predictor_action_valid,
                 missing_action_embed=(self.missing_action_embed if self.use_action_history else None),
+                action_slot_seed=action_slot_seed,
                 step_role_embeddings=predictor_step_roles,
-                lang_feats=lang_feats,
-                lang_padding_mask=lang_padding_mask,
+                lang_feats=(
+                    None if (self.vlm_action_seed_enabled or self.parallel_vla_gfm_enabled)
+                    else lang_feats
+                ),
+                lang_padding_mask=(
+                    None if (self.vlm_action_seed_enabled or self.parallel_vla_gfm_enabled)
+                    else lang_padding_mask
+                ),
             )
             if self.dense_context_supervision:
                 # The synthetic fixed-F0 reference is conditioning only.  Drop
@@ -1090,6 +1293,7 @@ class UAVFlowPredictorIDM(nn.Module):
         stop_pose: torch.Tensor | None = None,
         lang_feats: torch.Tensor,
         lang_padding_mask: torch.Tensor | None,
+        action_targets_norm: torch.Tensor | None = None,
         conditioning_generator: torch.Generator | None = None,
         force_action_history_missing: bool = False,
         force_pose_history_missing: bool = False,
@@ -1098,6 +1302,34 @@ class UAVFlowPredictorIDM(nn.Module):
             raise ValueError("Current geometry action ablation supports H=1 only (avoid temporal leakage)")
         if self.geometry_architecture != "legacy" and observed_shallow.shape[1:3] != (1, 1):
             raise ValueError("Geometry architecture ablations require H=1 and one physical camera")
+        action_slot_seed = None
+        oft_direct_prediction = None
+        if self.parallel_vla_gfm_enabled:
+            if self.oft_action_tokenizer is not None:
+                oft_output = self.oft_action_tokenizer(lang_feats, lang_padding_mask)
+                action_slot_seed = oft_output["plan_tokens"]
+                oft_direct_prediction = oft_output["direct_actions_norm"][:, None]
+            else:
+                if self.semantic_geometry_action is None:
+                    raise RuntimeError("parallel semantic action initializer is missing")
+                action_slot_seed = self.semantic_geometry_action(
+                    lang_feats, lang_padding_mask
+                )
+        if self.vlm_action_seed_enabled:
+            if self.vlm_action_seed is None:
+                raise RuntimeError("VLM action seed is enabled but its projector is missing.")
+            if lang_padding_mask is None:
+                last_index = torch.full(
+                    (lang_feats.shape[0],), lang_feats.shape[1] - 1,
+                    device=lang_feats.device, dtype=torch.long,
+                )
+            else:
+                keep = lang_padding_mask.to(device=lang_feats.device, dtype=torch.bool)
+                last_index = keep.long().sum(dim=1).sub(1).clamp_min(0)
+            pooled = lang_feats[
+                torch.arange(lang_feats.shape[0], device=lang_feats.device), last_index
+            ]
+            action_slot_seed = self.vlm_action_seed(pooled)
         rollout_kwargs = dict(
             reference_shallow=reference_shallow,
             observed_action_history=observed_action_history,
@@ -1106,6 +1338,7 @@ class UAVFlowPredictorIDM(nn.Module):
             reference_pose=reference_pose,
             lang_feats=lang_feats,
             lang_padding_mask=lang_padding_mask,
+            action_slot_seed=action_slot_seed,
             conditioning_generator=conditioning_generator,
             force_action_history_missing=force_action_history_missing,
             force_pose_history_missing=force_pose_history_missing,
@@ -1131,6 +1364,8 @@ class UAVFlowPredictorIDM(nn.Module):
         current_depth_output = None
         current_geometry_features = None
         refined_action_tokens = None
+        dual_refined_action_tokens = None
+        dual_action_future_weight = None
         if self.deep_action_enabled or self.stop_head_enabled:
             if direct_action_tokens is None:
                 raise RuntimeError("Joint DA3-deep propagation requires predictor action tokens.")
@@ -1142,7 +1377,33 @@ class UAVFlowPredictorIDM(nn.Module):
             deep_visuals = future
             deep_actions = direct_action_tokens
             deep_kwargs = {}
-            if self.current_geometry_read is not None and self.current_geometry_read_mode == "per_layer":
+            if self.parallel_vla_gfm_enabled and (
+                self.parallel_current_depth_enabled
+                or self.parallel_current_geometry_read_enabled
+            ):
+                # Bank 2: current observation takes a pure action-free DA3
+                # deep pass.  Each corresponding deep layer becomes geometry
+                # memory for the K action tokens that already passed through
+                # the Future Predictor with the predicted future features.
+                current_geometry_features = self.da3.propagate_shallow_visual_slots_grad(
+                    observed_shallow,
+                    gradient_checkpointing=self.deep_gradient_checkpointing,
+                    return_layer_patches=self.parallel_current_geometry_read_enabled,
+                    layer_patch_indices=(
+                        self.current_geometry_layer_indices
+                        if self.parallel_current_geometry_read_enabled else None
+                    ),
+                    layer_patch_mode=self.current_geometry_patch_mode,
+                )
+                if self.parallel_current_geometry_read_enabled:
+                    if self.current_geometry_read is None:
+                        raise RuntimeError("Parallel Current Geometry read has no CA module")
+                    deep_kwargs.update(
+                        current_geometry_by_layer=current_geometry_features["layer_patches"],
+                        current_geometry_read=self.current_geometry_read,
+                    )
+            if (not self.parallel_vla_gfm_enabled and self.current_geometry_read is not None
+                    and self.current_geometry_read_mode == "per_layer"):
                 current_geometry_features = self.da3.propagate_shallow_visual_slots_grad(
                     observed_shallow, gradient_checkpointing=self.deep_gradient_checkpointing,
                     return_layer_patches=True,
@@ -1170,17 +1431,37 @@ class UAVFlowPredictorIDM(nn.Module):
             deep_tokens = deep_joint_features.get("action_tokens")
             if not isinstance(deep_tokens, torch.Tensor):
                 raise RuntimeError("DA3 joint propagation did not return action_tokens.")
-            b, steps, views = direct_action_tokens.shape[:3]
+            b, steps, views = deep_visuals.shape[:3]
             if is_dual:
-                refined_action_tokens = deep_tokens.reshape(b, steps, 2, -1).mean(dim=2, keepdim=True)
-                direct_action_tokens = deep_actions.mean(dim=2, keepdim=True)
+                # Preserve and supervise both branches, then learn a scalar
+                # Current/Future gate per temporal action step.  This replaces
+                # the old destructive fixed 0.5/0.5 hidden-state average.
+                dual_refined_action_tokens = deep_tokens.reshape(b, steps, 2, -1)
+                if self.dual_action_fusion is None:
+                    raise RuntimeError("Dual geometry mode is missing dual_action_fusion")
+                fused, dual_action_future_weight = self.dual_action_fusion(
+                    dual_refined_action_tokens[:, :, 0],
+                    dual_refined_action_tokens[:, :, 1],
+                )
+                refined_action_tokens = fused.unsqueeze(2)
+                direct_action_tokens = (
+                    (1.0 - dual_action_future_weight) * deep_actions[:, :, 0]
+                    + dual_action_future_weight * deep_actions[:, :, 1]
+                ).unsqueeze(2)
                 current_depth_output = select_dual_view(deep_joint_features, b, 0)
                 deep_joint_features = select_dual_view(deep_joint_features, b, 1)
             else:
-                refined_action_tokens = deep_tokens.reshape(b, steps, views, -1)
+                if self.parallel_vla_gfm_enabled:
+                    refined_action_tokens = deep_tokens.reshape(
+                        b, steps, views, self.action_chunk_size, -1
+                    )
+                    direct_action_tokens = deep_actions
+                else:
+                    refined_action_tokens = deep_tokens.reshape(b, steps, views, -1)
                 if self.geometry_architecture in {"current_prediction", "direct_current"}:
                     current_depth_output = deep_joint_features
-            if self.current_geometry_read is not None and self.current_geometry_read_mode == "terminal":
+            if (not self.parallel_vla_gfm_enabled and self.current_geometry_read is not None
+                    and self.current_geometry_read_mode == "terminal"):
                 current_geometry_features = self.da3.propagate_shallow_visual_slots_grad(
                     observed_shallow,
                     gradient_checkpointing=self.deep_gradient_checkpointing,
@@ -1189,15 +1470,76 @@ class UAVFlowPredictorIDM(nn.Module):
                 patches = current_geometry_features["deep_levels"][-1][..., prefix:, :]
                 refined_action_tokens = self.current_geometry_read(refined_action_tokens, patches)
         direct_actions_norm = None
-        if self.direct_action_enabled:
+        action_token_output = None
+        geometry_action_residual = None
+        if self.parallel_vla_gfm_enabled:
+            if self.parallel_action_head is None:
+                raise RuntimeError("dual_vla_gfm parallel action head is missing")
+            direct_actions_norm = (
+                oft_direct_prediction
+                if self.parallel_vla_gfm_mode == "oft_direct"
+                else self.parallel_action_head(direct_action_tokens)
+            )
+        elif self.direct_action_enabled and not self.causal_action_decoder_enabled:
             if direct_action_tokens is None:
                 raise RuntimeError("Direct action branch requires predicted_action_tokens.")
             # Released GAM applies the same action head before and after the
             # DA3 deep stack and supervises both predictions.
             direct_actions_norm = self.direct_action_head(direct_action_tokens)
         refine_actions_norm = None
-        if refined_action_tokens is not None:
+        if self.parallel_vla_gfm_enabled:
+            if self.parallel_action_decode_mode == "geometry_residual":
+                if self.parallel_action_correction_head is None:
+                    raise RuntimeError("Geometry-residual decode has no correction head")
+                geometry_action_residual = self.parallel_action_correction_head(
+                    refined_action_tokens
+                )
+                refine_actions_norm = direct_actions_norm + geometry_action_residual
+            else:
+                geometry_action_residual = None
+                refine_actions_norm = self.parallel_action_head(refined_action_tokens)
+        elif self.causal_action_decoder_enabled:
+            decoder_tokens = (
+                refined_action_tokens
+                if refined_action_tokens is not None else direct_action_tokens
+            )
+            if decoder_tokens is None or self.causal_action_decoder is None:
+                raise RuntimeError("Causal action decoding requires a predicted action token.")
+            action_token_output = self.causal_action_decoder(
+                decoder_tokens, target_actions_norm=action_targets_norm
+            )
+            # Teacher forcing supplies the stable token CE used for training,
+            # but its per-position argmax is not a faithful policy rollout:
+            # every position has seen the preceding GT action tokens.  During
+            # validation, keep the teacher-forced logits/targets for CE while
+            # reporting actions from a genuinely autoregressive 20-token
+            # decode.  Closed-loop inference already enters the decoder with
+            # ``action_targets_norm=None`` and therefore takes this path once.
+            if not self.training and action_targets_norm is not None:
+                autoregressive = self.causal_action_decoder(
+                    decoder_tokens, target_actions_norm=None
+                )
+                action_token_output["actions_norm"] = autoregressive["actions_norm"]
+                action_token_output["token_ids"] = autoregressive["token_ids"]
+            refine_actions_norm = action_token_output["actions_norm"]
+        elif refined_action_tokens is not None:
             refine_actions_norm = self.direct_action_head(refined_action_tokens)
+        dual_refine_actions_norm = None
+        if dual_refined_action_tokens is not None:
+            dual_refine_actions_norm = torch.stack([
+                self.direct_action_head(dual_refined_action_tokens[:, :, index:index + 1])
+                for index in range(2)
+            ], dim=2)
+
+        def auxiliary_action_hidden(tokens: torch.Tensor) -> torch.Tensor:
+            """Pool only for scalar/endpoint auxiliary heads, never Action output."""
+            if tokens.ndim == 5:  # [B,T,V,K,D]
+                return tokens.mean(dim=(2, 3))
+            if tokens.ndim == 4:  # [B,T,V,D]
+                return tokens.mean(dim=2)
+            if tokens.ndim == 3:
+                return tokens
+            raise ValueError(f"Unexpected auxiliary action-token shape {tuple(tokens.shape)}")
 
         stop_logits = None
         if self.stop_head_enabled:
@@ -1214,7 +1556,11 @@ class UAVFlowPredictorIDM(nn.Module):
                         future if self.stop_head_mode == "hybrid_action_feature" else None
                     ),
                     deep_action_tokens=(
-                        refined_action_tokens
+                        (
+                            refined_action_tokens.mean(dim=3)
+                            if refined_action_tokens.ndim == 5
+                            else refined_action_tokens
+                        )
                         if self.stop_head_mode == "hybrid_action_feature" else None
                     ),
                 )
@@ -1222,10 +1568,12 @@ class UAVFlowPredictorIDM(nn.Module):
                 if stop_pose is None:
                     raise ValueError("Action-hidden Stop requires stop-only current pose.")
                 stop_logits = self.stop_head(
-                    refined_action_tokens.mean(dim=2), stop_pose,
+                    auxiliary_action_hidden(refined_action_tokens), stop_pose,
                 )
             else:
-                stop_logits = self.stop_head(refined_action_tokens.mean(dim=2)).squeeze(-1)
+                stop_logits = self.stop_head(
+                    auxiliary_action_hidden(refined_action_tokens)
+                ).squeeze(-1)
 
         relative_pose = None
         if self.relative_pose_head_enabled:
@@ -1236,7 +1584,7 @@ class UAVFlowPredictorIDM(nn.Module):
             )
             if pose_tokens is None:
                 raise RuntimeError("Relative-pose head requires predicted action tokens.")
-            relative_pose = self.relative_pose_head(pose_tokens.mean(dim=2))
+            relative_pose = self.relative_pose_head(auxiliary_action_hidden(pose_tokens))
 
         depth_log_scale = None
         if self.depth_scale_head_enabled:
@@ -1247,7 +1595,9 @@ class UAVFlowPredictorIDM(nn.Module):
             )
             if scale_tokens is None:
                 raise RuntimeError("Depth scale head requires predictor action tokens.")
-            depth_log_scale = self.depth_scale_head(scale_tokens.mean(dim=2)).squeeze(-1)
+            depth_log_scale = self.depth_scale_head(
+                auxiliary_action_hidden(scale_tokens)
+            ).squeeze(-1)
 
         idm_features = None
         all_window_actions_norm = None
@@ -1274,7 +1624,9 @@ class UAVFlowPredictorIDM(nn.Module):
                 else all_window_actions_norm
             )
         actions_norm = (
-            refine_actions_norm
+            direct_actions_norm
+            if self.parallel_vla_gfm_enabled and self.parallel_vla_gfm_mode == "oft_direct"
+            else refine_actions_norm
             if refine_actions_norm is not None
             else direct_actions_norm if direct_actions_norm is not None else idm_actions_norm
         )
@@ -1288,6 +1640,18 @@ class UAVFlowPredictorIDM(nn.Module):
             "actions_norm": actions_norm,
             "direct_actions_norm": direct_actions_norm,
             "refine_actions_norm": refine_actions_norm,
+            "geometry_action_residual_norm": geometry_action_residual,
+            "dual_refine_actions_norm": dual_refine_actions_norm,
+            "dual_action_future_weight": dual_action_future_weight,
+            "action_token_logits": (
+                None if action_token_output is None else action_token_output["logits"]
+            ),
+            "action_token_target_ids": (
+                None if action_token_output is None else action_token_output.get("target_ids")
+            ),
+            "action_token_ids": (
+                None if action_token_output is None else action_token_output["token_ids"]
+            ),
             "idm_actions_norm": idm_actions_norm,
             "all_window_actions_norm": all_window_actions_norm,
             "deep_joint_features": deep_joint_features,
