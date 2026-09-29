@@ -1102,6 +1102,21 @@ def main() -> None:
         point_last_at(destination)
         return destination
 
+    best_action_path = output / "best_action.pt"
+    best_action_meta_path = output / "best_action.json"
+    best_action_value = float("inf")
+    if best_action_meta_path.is_file():
+        try:
+            best_action_value = float(
+                json.loads(best_action_meta_path.read_text())["value"]
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            if rank == 0:
+                print(
+                    f"Ignoring invalid best-action metadata: {best_action_meta_path}",
+                    flush=True,
+                )
+
     step = start_step; epoch = start_epoch
     last_saved_step = start_step if args.resume else -1
     pbar = tqdm(total=max_steps, initial=step, disable=rank != 0, desc="uav-predictor-idm")
@@ -1421,6 +1436,29 @@ def main() -> None:
                     )
                     print("\n" + line, flush=True)
                     with (output / "train.log").open("a") as handle: handle.write(line + "\n")
+                    selection_context = min(
+                        int(value) for value in cfg.model.context_lengths
+                    )
+                    selection_metric = f"H{selection_context}_action"
+                    selection_value = float(ev[selection_metric])
+                    if selection_value < best_action_value:
+                        best_action_value = selection_value
+                        atomic_save_checkpoint(
+                            checkpoint_payload(step, epoch, logical_batch_idx + 1),
+                            best_action_path,
+                        )
+                        best_action_meta_path.write_text(json.dumps({
+                            "metric": selection_metric,
+                            "value": selection_value,
+                            "step": int(step),
+                            "epoch": int(epoch),
+                            "checkpoint": str(best_action_path),
+                        }, indent=2) + "\n")
+                        print(
+                            f"[best_action] {selection_metric}={selection_value:.6f} "
+                            f"checkpoint={best_action_path}",
+                            flush=True,
+                        )
                     for domain_name, domain_values in domain_evals.items():
                         short_name = (
                             "sim" if "sim" in domain_name.lower()

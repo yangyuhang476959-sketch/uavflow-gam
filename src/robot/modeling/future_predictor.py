@@ -1494,6 +1494,7 @@ class GAMFuturePredictor(nn.Module):
         past_action_history_valid_mask: Optional[torch.Tensor] = None,
         missing_action_embed: Optional[torch.Tensor] = None,
         action_slot_seed: Optional[torch.Tensor] = None,
+        action_slot_valid_mask: Optional[torch.Tensor] = None,  # (B,H,K) bool
         step_role_embeddings: Optional[torch.Tensor] = None,  # (B,H,d_model)
         lang_feats: Optional[torch.Tensor] = None,
         lang_padding_mask: Optional[torch.Tensor] = None,
@@ -1519,6 +1520,28 @@ class GAMFuturePredictor(nn.Module):
             if not bool(view_keep.any(dim=2).all().item()):
                 raise ValueError("Each timestep must keep at least one valid view.")
             step_token_keep_mask = self._build_step_keep_mask(view_keep, H, V, device)
+
+        # A fixed episode reference is visual context, not a control state.
+        # Callers can therefore remove its otherwise-structural action slots
+        # from attention without changing the rectangular timestep layout.
+        # Masked slots are excluded as K/V and zeroed after every block, which
+        # is functionally equivalent to omitting them from the sequence.
+        if action_slot_valid_mask is not None:
+            action_keep = action_slot_valid_mask.to(device=device, dtype=torch.bool)
+            if action_keep.shape != (b, H, self.num_action_slots):
+                raise ValueError(
+                    "action_slot_valid_mask shape "
+                    f"{tuple(action_keep.shape)} != {(b, H, self.num_action_slots)}"
+                )
+            tokens_per_step = V * self.visual_tokens_per_view + self.extra_tokens_per_step
+            if step_token_keep_mask is None:
+                step_token_keep_mask = torch.ones(
+                    b, H * tokens_per_step, device=device, dtype=torch.bool
+                )
+            keep_blocks = step_token_keep_mask.reshape(b, H, tokens_per_step)
+            action_start = V * self.visual_tokens_per_view + int(self.use_proprio_input)
+            keep_blocks[:, :, action_start:action_start + self.num_action_slots] &= action_keep
+            step_token_keep_mask = keep_blocks.reshape(b, -1)
 
         # 1. Project visual context into predictor space.
         flat_context = past_visual_tokens.reshape(b, H * V * P, d)
@@ -1696,6 +1719,12 @@ class GAMFuturePredictor(nn.Module):
             # Batch-specific padded-view masks require SDPA with an explicit key
             # mask because the cached flex BlockMask is shape-only.
             flex_block_mask = None
+            if dense_mask is None:
+                dense_mask = (
+                    self._build_concat_dense_mask(H, V, prepended_lang_len, device)
+                    if prepended_lang_len > 0
+                    else self._build_dense_block_causal_mask(H, V, device)
+                )
             dense_mask = self._merge_key_keep_mask(dense_mask, sequence_keep_mask)
 
         # 7. Transformer stack.

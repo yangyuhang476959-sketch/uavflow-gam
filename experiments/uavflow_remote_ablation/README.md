@@ -9,10 +9,13 @@ horizon, GAM `3:1:3` action/feature/depth loss, full-rank DA3 blocks 13+, no
 first-frame duplication, and the natural five terminal absorbing windows. No
 artificial 20% terminal rebalance is applied.
 
-Stage 1 trains action/feature/depth for 10 epochs at constant LR. Stage 2 starts
-from Stage 1 and jointly fine-tunes the same policy plus the Stop head for 10
-epochs with cosine decay. Only Stop receives its separate normalized pose
-branch; this does not alter the main pose ablation.
+Stage 1 trains action/feature/depth for 10 epochs at constant LR. During
+validation it atomically maintains `best_action.pt` using the lowest H=1
+validation Action loss. Stage 2 starts from that checkpoint (not blindly from
+the final epoch) and jointly fine-tunes the same policy plus the Stop head for
+10 epochs with cosine decay. Only Stop receives its separate normalized pose
+branch; this does not alter the main pose ablation. For five-slot policies,
+Stop preserves order by concatenating the five refined states before its MLP.
 
 | ID | comparison |
 |---|---|
@@ -31,15 +34,23 @@ Prompt contracts:
 
 - G0/G1: T5 receives the raw instruction.
 - C0/C1: frozen Qwen receives current image + raw instruction, with no
-  assistant message.
+  assistant message. Only image-conditioned text states after the image prefix
+  are passed to GAM as per-layer language memory.
 - Q0: Qwen receives current image + corrected `Current State` + action
-  question, with no assistant message.
+  question, with no assistant message. Its five external queries read only the
+  image-conditioned text states.
 - S0/S1/S2/R1: the same user message as Q0, followed by one assistant message
   containing five action placeholders. Only those five hidden states are used.
 
 `Current State` comes from `preprocessed_logs[:, [0,1,2,4]]`: episode-first
 full-rotation coordinates, xyz in centimetres and yaw in degrees. Literal
 `In:`/`Out:` markers are not used.
+
+The prepended F0 reference contains visual tokens only from the attention
+graph: its rectangular placeholder action slots are fully key-masked and
+zeroed. Only the real current Ft block owns control slots. Five-slot VLA--GAM
+also adds a learned DA3-width chunk-step embedding before deep refinement, so
+action order remains explicit in both the Future Predictor and geometry path.
 
 ## One Python command per 8-GPU cluster job
 

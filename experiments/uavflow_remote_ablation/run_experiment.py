@@ -186,7 +186,11 @@ def main() -> None:
             f"split_sha256={hashlib.sha256(split.read_bytes()).hexdigest()}\n"
         )
         tee_run(command, env=env, log=stage_dir / "console.log")
-        final = latest_checkpoint(stage_dir)
+        final = (
+            stage_dir / "best_action.pt"
+            if stage == "stage1" and (stage_dir / "best_action.pt").is_file()
+            else latest_checkpoint(stage_dir)
+        )
         if final is None:
             raise RuntimeError(f"No checkpoint produced in {stage_dir}")
         success.write_text(str(final) + "\n")

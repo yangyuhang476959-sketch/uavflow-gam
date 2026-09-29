@@ -49,7 +49,7 @@ def _legacy(language: str, pose: bool) -> tuple[str, ...]:
         values += [
             "stage1.text_encoder_type=qwen3_5",
             "stage1.qwen_prompt_mode=current_image_instruction",
-            "stage1.qwen_token_selection=all",
+            "stage1.qwen_token_selection=text_after_image",
             "stage1.qwen_lora_enabled=false",
         ]
     return tuple(values)
@@ -63,7 +63,7 @@ def _vla(mode: str, *, current_depth: bool, current_read: bool,
         "stage1.qwen_layers=[23]",
         "stage1.qwen_use_reference_image=false",
         "stage1.qwen_prompt_mode=current_image_action_question",
-        f"stage1.qwen_token_selection={'action_placeholders' if placeholders else 'all'}",
+        f"stage1.qwen_token_selection={'action_placeholders' if placeholders else 'text_after_image'}",
         f"stage1.qwen_action_placeholder_count={5 if placeholders else 0}",
         "stage1.qwen_lora_enabled=true",
         "stage1.qwen_lora_rank=32",
@@ -107,7 +107,7 @@ EXPERIMENTS: dict[str, tuple[str, ...]] = {
         "stage1.qwen_layers=[23]",
         "stage1.qwen_use_reference_image=false",
         "stage1.qwen_prompt_mode=current_image_action_question",
-        "stage1.qwen_token_selection=all",
+        "stage1.qwen_token_selection=text_after_image",
         "stage1.qwen_action_placeholder_count=0",
         "stage1.qwen_lora_enabled=true",
         "stage1.qwen_lora_rank=32",

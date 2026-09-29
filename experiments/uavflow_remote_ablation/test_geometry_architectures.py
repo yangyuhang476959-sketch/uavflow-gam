@@ -185,6 +185,48 @@ class Tests(unittest.TestCase):
         )
         self.assertNotIn("action_slot_embed", legacy.state_dict())
 
+    def test_reference_action_slots_are_fully_masked(self):
+        import robot.modeling.future_predictor as predictor_module
+        predictor = predictor_module.GAMFuturePredictor(
+            d_da3=16, d_model=32, depth=2, num_heads=4,
+            num_patches_per_view=4, num_register_tokens=2,
+            use_language=False, proprio_dim=5, action_dim=4,
+            action_chunk_size=1, use_proprio_input=False,
+            num_action_slots=5,
+        ).eval()
+        visual = torch.randn(2, 2, 1, 7, 16)
+        history = torch.zeros(2, 2, 1, 4)
+        current_seed = torch.randn(2, 5, 32)
+        seed_a = torch.zeros(2, 2, 5, 32)
+        seed_b = seed_a.clone()
+        seed_a[:, 0] = torch.randn(2, 5, 32) * 100
+        seed_b[:, 0] = torch.randn(2, 5, 32) * 100
+        seed_a[:, 1] = current_seed
+        seed_b[:, 1] = current_seed
+        valid = torch.ones(2, 2, 5, dtype=torch.bool)
+        valid[:, 0].zero_()
+        with patch("robot.modeling.future_predictor._HAS_FLEX", False):
+            first = predictor(
+                visual, past_action_history=history,
+                action_slot_seed=seed_a, action_slot_valid_mask=valid,
+            )
+            second = predictor(
+                visual, past_action_history=history,
+                action_slot_seed=seed_b, action_slot_valid_mask=valid,
+            )
+        torch.testing.assert_close(
+            first["predicted_next_visual_tokens"],
+            second["predicted_next_visual_tokens"],
+        )
+        torch.testing.assert_close(
+            first["predicted_action_tokens"],
+            second["predicted_action_tokens"],
+        )
+        self.assertTrue(torch.equal(
+            first["predicted_action_tokens"][:, 0],
+            torch.zeros_like(first["predicted_action_tokens"][:, 0]),
+        ))
+
     def test_stop_only_pose_does_not_change_actions(self):
         for mode, steps in (("legacy", 3), ("dual_observed", 1)):
             with self.subTest(mode=mode):

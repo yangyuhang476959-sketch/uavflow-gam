@@ -105,6 +105,10 @@ def architecture_state(model):
             None if getattr(model, "dual_action_fusion", None) is None
             else model.dual_action_fusion.state_dict()
         ),
+        "deep_action_step_embed": (
+            None if getattr(model, "deep_action_step_embed", None) is None
+            else model.deep_action_step_embed.detach().cpu()
+        ),
         "parallel_action_decode_mode": getattr(
             model, "parallel_action_decode_mode", "full"
         ),
@@ -138,3 +142,9 @@ def load_architecture_state(model, checkpoint):
         # evaluation/init transfer remains backward compatible.
         if fusion_state is not None:
             model.dual_action_fusion.load_state_dict(fusion_state, strict=True)
+    if getattr(model, "deep_action_step_embed", None) is not None:
+        step_embed = state.get("deep_action_step_embed")
+        if step_embed is None:
+            raise KeyError("Parallel VLA-GFM checkpoint is missing deep_action_step_embed")
+        with torch.no_grad():
+            model.deep_action_step_embed.copy_(step_embed)

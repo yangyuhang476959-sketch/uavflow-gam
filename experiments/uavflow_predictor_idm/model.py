@@ -451,10 +451,16 @@ class HybridPatchActionStopHead(nn.Module):
 class ActionHiddenPoseStopHead(nn.Module):
     """CLIP-style Stop readout from refined action state and stop-only pose."""
 
-    def __init__(self, action_dim: int, model_dim: int, pose_dim: int = 5) -> None:
+    def __init__(self, action_dim: int, model_dim: int, pose_dim: int = 5,
+                 action_slots: int = 1) -> None:
         super().__init__()
+        self.action_dim = int(action_dim)
+        self.action_slots = int(action_slots)
+        if self.action_slots <= 0:
+            raise ValueError("action_slots must be positive")
         self.action_proj = nn.Sequential(
-            nn.LayerNorm(action_dim), nn.Linear(action_dim, model_dim), nn.GELU(),
+            nn.LayerNorm(self.action_dim * self.action_slots),
+            nn.Linear(self.action_dim * self.action_slots, model_dim), nn.GELU(),
         )
         self.pose_proj = nn.Sequential(
             nn.Linear(pose_dim, model_dim), nn.GELU(),
@@ -468,6 +474,16 @@ class ActionHiddenPoseStopHead(nn.Module):
         nn.init.zeros_(self.output[-1].bias)
 
     def forward(self, action_hidden: torch.Tensor, stop_pose: torch.Tensor) -> torch.Tensor:
+        if action_hidden.ndim >= 4 and action_hidden.shape[-2:] == (
+            self.action_slots, self.action_dim
+        ):
+            action_hidden = action_hidden.flatten(-2)
+        if action_hidden.shape[-1] != self.action_dim * self.action_slots:
+            raise ValueError(
+                "Stop action hidden must preserve the ordered action plan: "
+                f"expected trailing width {self.action_dim * self.action_slots}, "
+                f"got {tuple(action_hidden.shape)}"
+            )
         expected = (*action_hidden.shape[:-1], 5)
         if stop_pose.shape != expected:
             raise ValueError(
@@ -799,6 +815,12 @@ class UAVFlowPredictorIDM(nn.Module):
             if self.parallel_vla_gfm_mode == "qwen_tokens":
                 initializer_kwargs["layers"] = self.parallel_action_post_bidir_layers
             self.semantic_geometry_action = initializer_cls(**initializer_kwargs)
+        self.deep_action_step_embed = (
+            nn.Parameter(torch.empty(1, 1, 1, self.action_chunk_size, int(da3.embed_dim)))
+            if self.parallel_vla_gfm_enabled else None
+        )
+        if self.deep_action_step_embed is not None:
+            nn.init.normal_(self.deep_action_step_embed, std=0.02)
         self.oft_action_tokenizer = (
             OFTInternalActionProjector(
                 language_dim=int(language_dim), output_dim=int(d_model),
@@ -870,6 +892,7 @@ class UAVFlowPredictorIDM(nn.Module):
         elif self.stop_head_mode == "action_hidden_pose":
             self.stop_head = ActionHiddenPoseStopHead(
                 action_dim=int(da3.embed_dim), model_dim=int(stop_model_dim),
+                action_slots=(self.action_chunk_size if self.parallel_vla_gfm_enabled else 1),
             )
         elif self.stop_head_mode == "patch_motion":
             if not self.use_fixed_first_frame or not self.use_pose_history:
@@ -1127,12 +1150,18 @@ class UAVFlowPredictorIDM(nn.Module):
                     torch.cat([reference_pose, pose_history], dim=1)
                     if pose_history is not None else None
                 )
+                predictor_action_slot_valid = torch.ones(
+                    b, predictor_sequence.shape[1], self.predictor.num_action_slots,
+                    device=predictor_sequence.device, dtype=torch.bool,
+                )
+                predictor_action_slot_valid[:, 0].zero_()
             else:
                 predictor_sequence = sequence
                 predictor_step_roles = None
                 predictor_actions = action_history
                 predictor_action_valid = action_history_valid
                 predictor_pose = pose_history
+                predictor_action_slot_valid = None
             predictor_pose_valid = None
             if predictor_pose is not None:
                 predictor_pose_valid = torch.ones(
@@ -1188,6 +1217,7 @@ class UAVFlowPredictorIDM(nn.Module):
                 past_action_history_valid_mask=predictor_action_valid,
                 missing_action_embed=(self.missing_action_embed if self.use_action_history else None),
                 action_slot_seed=action_slot_seed,
+                action_slot_valid_mask=predictor_action_slot_valid,
                 step_role_embeddings=predictor_step_roles,
                 lang_feats=(
                     None if (self.vlm_action_seed_enabled or self.parallel_vla_gfm_enabled)
@@ -1360,6 +1390,15 @@ class UAVFlowPredictorIDM(nn.Module):
                 predicted_current, current_action_tokens = self.rollout_shallow(
                     observed_shallow, **rollout_kwargs, prediction_role=self.prediction_roles[0]
                 )
+        if self.deep_action_step_embed is not None:
+            if direct_action_tokens.ndim != 5 or direct_action_tokens.shape[-2] != self.action_chunk_size:
+                raise ValueError(
+                    "Parallel VLA-GFM expected [B,T,V,K,D] action tokens before deep refinement, "
+                    f"got {tuple(direct_action_tokens.shape)}"
+                )
+            direct_action_tokens = direct_action_tokens + self.deep_action_step_embed.to(
+                device=direct_action_tokens.device, dtype=direct_action_tokens.dtype
+            )
         deep_joint_features = None
         current_depth_output = None
         current_geometry_features = None
@@ -1541,6 +1580,16 @@ class UAVFlowPredictorIDM(nn.Module):
                 return tokens
             raise ValueError(f"Unexpected auxiliary action-token shape {tuple(tokens.shape)}")
 
+        def stop_action_hidden(tokens: torch.Tensor) -> torch.Tensor:
+            """Preserve ordered K-step plans for the concat-MLP Stop head."""
+            if tokens.ndim == 5:  # [B,T,V,K,D]
+                return tokens.mean(dim=2)
+            if tokens.ndim == 4:  # legacy [B,T,V,D]
+                return tokens.mean(dim=2)
+            if tokens.ndim == 3:
+                return tokens
+            raise ValueError(f"Unexpected Stop action-token shape {tuple(tokens.shape)}")
+
         stop_logits = None
         if self.stop_head_enabled:
             if self.stop_head_mode in {"patch_motion", "hybrid_action_feature"}:
@@ -1568,7 +1617,7 @@ class UAVFlowPredictorIDM(nn.Module):
                 if stop_pose is None:
                     raise ValueError("Action-hidden Stop requires stop-only current pose.")
                 stop_logits = self.stop_head(
-                    auxiliary_action_hidden(refined_action_tokens), stop_pose,
+                    stop_action_hidden(refined_action_tokens), stop_pose,
                 )
             else:
                 stop_logits = self.stop_head(
