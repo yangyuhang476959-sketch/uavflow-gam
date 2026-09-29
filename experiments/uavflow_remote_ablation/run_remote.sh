@@ -80,6 +80,20 @@ echo "stage1_schedule=${STAGE1_LR_SCHEDULE} warmup=${STAGE1_WARMUP_STEPS} min_ra
 echo "stage2_stop_schedule=${STAGE2_LR_SCHEDULE} warmup=${STAGE2_WARMUP_STEPS} min_ratio=${STAGE2_MIN_LR_RATIO}"
 echo "stage2_lrs: deep=${STAGE2_BASE_LR} predictor=$(awk -v x="${STAGE2_BASE_LR}" 'BEGIN {printf "%.8g", x*0.2}') action_head=$(awk -v x="${STAGE2_BASE_LR}" 'BEGIN {printf "%.8g", x*10}') stop_head=${STAGE2_STOP_HEAD_LR}"
 
+# Fail before allocating model/GPU memory when a rental image has dependency
+# drift or the published hybrid/replay package is wired incorrectly.  Local
+# legacy consolidated roots still receive the runtime import/ABI smoke test.
+if [[ -d "${UAVFLOW_DEPTH_ROOT}/hybrid" && -d "${UAVFLOW_DEPTH_ROOT}/replay" ]]; then
+  "${PYTHON_BIN}" "${ROOT}/scripts/verify_uavflow_remote.py" \
+    --sim-root "${UAVFLOW_SIM_ROOT}" \
+    --depth-root "${UAVFLOW_DEPTH_ROOT}" \
+    --da3-checkpoint "${DA3_CHECKPOINT}" \
+    --qwen-model "${QWEN_MODEL}" \
+    --t5-model "${T5_MODEL}"
+else
+  "${PYTHON_BIN}" "${ROOT}/scripts/verify_uavflow_remote.py" --imports-only
+fi
+
 COMMON_OVERRIDES=(
   --set "stage1.da3_checkpoint=${DA3_CHECKPOINT}"
   --set "stage1.idm_checkpoint=${IDM_CHECKPOINT}"

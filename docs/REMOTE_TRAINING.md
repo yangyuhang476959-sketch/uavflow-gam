@@ -15,10 +15,11 @@ conda activate uav-gam
 bash scripts/setup_uavflow_remote.sh
 ```
 
-The validated environment uses Python 3.12, PyTorch 2.5.1+cu124 and
-torchvision 0.20.1+cu124. Override `TORCH_INDEX_URL` when the server requires a
-different CUDA wheel. The setup installs the pinned DA3 source checkout but
-does not install its optional 3D rendering stack.
+The validated environment uses Python 3.12, PyTorch 2.5.1+cu124,
+torchvision 0.20.1+cu124, NumPy 1.26.4 and SciPy 1.15.3. Override
+`TORCH_INDEX_URL` when the server requires a different CUDA wheel. The setup
+also pins DA3's eager-import dependencies in the same transaction; it does not
+install the unrelated heavy Open3D/gsplat application stack.
 
 ## 2. Download public data and model weights
 
@@ -71,9 +72,11 @@ python scripts/verify_uavflow_remote.py \
   --t5-model "$MODEL_ROOT/t5-base"
 ```
 
-The audit requires exactly 21 parquet shards, 10,109 unique depth episodes,
-the canonical `hybrid/` and `replay/` trees, all model configs and seven
-instruction overrides.
+The audit requires exactly 21 parquet shards, 10,109 unique depth episodes
+(6,990 replay plus 3,119 hybrid), the canonical `hybrid/` and `replay/` trees,
+all model configs and seven instruction overrides. It also imports DA3,
+checks NumPy/SciPy/PyTorch interoperability and samples both depth formats
+through `UAVFlowParquetDataset._depth()`.
 
 ## 4. Export the portable path contract
 

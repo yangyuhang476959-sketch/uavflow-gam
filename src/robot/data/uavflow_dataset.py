@@ -17,6 +17,22 @@ _UAVFLOW_TASK_CLASSES = (
 )
 
 
+def _expand_uavflow_depth_roots(configured_roots):
+    """Expand a published depth package root into hybrid/replay sources."""
+    expanded_roots = []
+    seen = set()
+    for root in configured_roots:
+        root = Path(root).expanduser()
+        canonical_children = [root / "hybrid", root / "replay"]
+        candidates = [path for path in canonical_children if path.is_dir()] or [root]
+        for path in candidates:
+            key = str(path)
+            if key not in seen:
+                expanded_roots.append(path)
+                seen.add(key)
+    return expanded_roots
+
+
 def _instruction_task_class(instruction):
     """Map released UAV-Flow unified instructions to official task classes."""
     text = " ".join(str(instruction).lower().strip().rstrip(".").split())
@@ -295,9 +311,17 @@ class UAVFlowParquetDataset(Dataset):
         fallback_roots = gt_depth_fallback_roots or []
         if isinstance(fallback_roots, (str, Path)):
             fallback_roots = [fallback_roots]
-        self.gt_depth_roots = ([self.gt_depth_root] if self.gt_depth_root else []) + [
+        configured_depth_roots = ([self.gt_depth_root] if self.gt_depth_root else []) + [
             Path(root).expanduser() for root in fallback_roots if root
         ]
+        # The published ModelScope archive is deliberately split into:
+        #   <root>/hybrid/{person,robotic_dog,vehicle}/<episode>.npz
+        #   <root>/replay/<episode>/depth.npy
+        # Accept that package root directly, in addition to the historical
+        # API where callers supplied hybrid as the primary root and replay as
+        # a fallback.  This keeps direct Dataset use and matrix launchers on
+        # the same lookup contract.
+        self.gt_depth_roots = _expand_uavflow_depth_roots(configured_depth_roots)
         self._hybrid_depth_paths = {}
         for root in self.gt_depth_roots:
             if not root.exists():
@@ -308,8 +332,13 @@ class UAVFlowParquetDataset(Dataset):
                 # hybrid sidecar override the ordinary replay depth.
                 self._hybrid_depth_paths.setdefault(episode_id, path)
         if instruction_overrides_path is None and self.gt_depth_root is not None:
-            candidate = self.gt_depth_root / "instruction_overrides.json"
-            instruction_overrides_path = candidate if candidate.exists() else None
+            candidates = (
+                self.gt_depth_root / "instruction_overrides.json",
+                self.gt_depth_root / "metadata" / "instruction_overrides.json",
+            )
+            instruction_overrides_path = next(
+                (candidate for candidate in candidates if candidate.exists()), None
+            )
         self.instruction_overrides = {}
         if instruction_overrides_path:
             override_path = Path(instruction_overrides_path).expanduser()

@@ -15,8 +15,9 @@ conda activate uav-gam
 bash scripts/setup_uavflow_remote.sh
 ```
 
-The setup installs the pinned PyTorch stack and the pinned DA3 source checkout.
-It intentionally omits DA3's optional rendering dependencies.
+The setup installs the pinned PyTorch stack, DA3's eager-import dependencies,
+and the pinned DA3 source checkout in one resolver transaction. NumPy remains
+locked to 1.26.4; heavy Open3D/gsplat applications are not required.
 
 ## 2. Download data and frozen models
 
@@ -55,7 +56,9 @@ python scripts/verify_uavflow_remote.py \
   --t5-model "$T5_MODEL"
 ```
 
-Do not start production training unless the audit prints `remote audit: OK`.
+Do not start production training unless the audit prints `runtime smoke: OK`,
+loads sampled replay and hybrid depth through the real DataLoader, and finally
+prints `remote audit: OK`.
 
 ## 4. Smoke test
 
