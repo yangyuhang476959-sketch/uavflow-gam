@@ -208,6 +208,11 @@ def main() -> None:
             ]
         else:
             stage_values += [
+                # Stage 2 alone receives five additional fully terminal
+                # FN->FN windows per episode.  Keep Stage 1's action/depth
+                # distribution unchanged while raising the raw Stop-positive
+                # share for Stop-head training.
+                "dataset.endpoint_self_pair_end_count=5",
                 "model.stop_head_enabled=true",
                 "model.stop_head_mode=action_hidden_pose",
                 "loss.stop_weight=1.0", "loss.stop_pos_weight=5.0",
