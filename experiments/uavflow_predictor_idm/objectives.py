@@ -15,6 +15,7 @@ from robot.modeling.da3_giant_encoder import DA3GiantEncoder
 from robot.modeling.lora import LoRALinear
 
 from .data import EpisodePoseNormalizer, move_batch
+from .runtime import autocast_context, randn_on_device
 from .vlm_conditioning import encode_stage2_condition
 
 
@@ -795,13 +796,13 @@ def prepare_observed_pose_history(
         if xyz_noise_meters > 0.0 or yaw_noise_degrees > 0.0:
             xyz = pose[..., :3]
             if xyz_noise_meters > 0.0:
-                xyz = xyz + torch.randn(
+                xyz = xyz + randn_on_device(
                     xyz.shape, device=xyz.device, dtype=xyz.dtype,
                     generator=conditioning_generator,
                 ) * xyz_noise_meters
             yaw = torch.atan2(pose[..., 3], pose[..., 4])
             if yaw_noise_degrees > 0.0:
-                yaw = yaw + torch.randn(
+                yaw = yaw + randn_on_device(
                     yaw.shape, device=yaw.device, dtype=yaw.dtype,
                     generator=conditioning_generator,
                 ) * (yaw_noise_degrees * torch.pi / 180.0)
@@ -830,6 +831,7 @@ def forward_batch(
     deep_feature_cls_weight: float,
     stop_pos_weight: float,
     amp: bool,
+    amp_dtype: str = "auto",
     action_direct_weight: float = 1.0,
     action_refine_weight: float = 1.0,
     dual_branch_action_aux_weight: float = 0.5,
@@ -872,14 +874,14 @@ def forward_batch(
     )
     encoded_steps = needed + int(use_reference)
     flat = encoded_images.reshape(batch_size, encoded_steps * views, *images.shape[3:])
-    with torch.no_grad(), torch.amp.autocast(
-        "cuda", dtype=torch.bfloat16, enabled=bool(amp and images.is_cuda)
+    with torch.no_grad(), autocast_context(
+        images.device, enabled=bool(amp), dtype_name=amp_dtype
     ):
         encoded_shallow = da3.encode_shallow_visual_slots(flat, T=encoded_steps, V=views)["visual_tokens"]
     # Qwen is usually frozen, but the optional OpenVLA-UAV-scale LoRA must
     # retain its graph. The conditioner itself selects no_grad in frozen mode.
-    with torch.amp.autocast(
-        "cuda", dtype=torch.bfloat16, enabled=bool(amp and images.is_cuda)
+    with autocast_context(
+        images.device, enabled=bool(amp), dtype_name=amp_dtype
     ):
         language = encode_stage2_condition(
             text,
@@ -961,8 +963,8 @@ def forward_batch(
     target_norm_full = normalizer.normalize(
         target_raw_full, stats_keys=list(batch["action_stats_key"])
     )
-    with torch.amp.autocast(
-        "cuda", dtype=torch.bfloat16, enabled=bool(amp and images.is_cuda)
+    with autocast_context(
+        images.device, enabled=bool(amp), dtype_name=amp_dtype
     ):
         output = model(
             observed,
@@ -1502,6 +1504,7 @@ def evaluate(
     stop_pos_weight: float,
     max_batches: int,
     amp: bool,
+    amp_dtype: str = "auto",
     action_direct_weight: float = 1.0,
     action_refine_weight: float = 1.0,
     dual_branch_action_aux_weight: float = 0.5,
@@ -1578,6 +1581,7 @@ def evaluate(
                 deep_feature_cls_weight=deep_feature_cls_weight,
                 stop_pos_weight=stop_pos_weight,
                 amp=amp,
+                amp_dtype=amp_dtype,
                 action_direct_weight=action_direct_weight,
                 action_refine_weight=action_refine_weight,
                 dual_branch_action_aux_weight=dual_branch_action_aux_weight,

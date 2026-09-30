@@ -30,7 +30,7 @@ def require(path: Path, description: str) -> None:
         raise FileNotFoundError(f"Missing {description}: {path}")
 
 
-def verify_runtime() -> None:
+def verify_runtime(accelerator: str = "auto") -> None:
     versions = {}
     for distribution, expected in PINNED_RUNTIME.items():
         actual = importlib.metadata.version(distribution)
@@ -43,6 +43,39 @@ def verify_runtime() -> None:
     np = importlib.import_module("numpy")
     scipy = importlib.import_module("scipy")
     torch = importlib.import_module("torch")
+    requested = str(accelerator).strip().lower()
+    if requested == "ascend":
+        requested = "npu"
+    if requested == "auto":
+        requested = "cuda" if torch.cuda.is_available() else "npu"
+    if requested == "npu":
+        try:
+            torch_npu = importlib.import_module("torch_npu")
+        except ImportError as exc:
+            raise RuntimeError(
+                "Ascend audit requires the vendor-matched torch_npu package."
+            ) from exc
+        if not torch_npu.npu.is_available():
+            raise RuntimeError("torch_npu imported but no Ascend NPU is available")
+        device = torch.device("npu:0")
+        probe = torch.arange(4, dtype=torch.float32, device=device)
+        if float(probe.sum().cpu()) != 6.0:
+            raise RuntimeError("Ascend tensor smoke test failed")
+        try:
+            torch_npu_version = importlib.metadata.version("torch-npu")
+        except importlib.metadata.PackageNotFoundError:
+            torch_npu_version = getattr(torch_npu, "__version__", "unknown")
+        print(
+            "  accelerator=npu "
+            f"torch_npu={torch_npu_version} "
+            f"devices={torch_npu.npu.device_count()}"
+        )
+    elif requested == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA audit requested but torch.cuda.is_available() is false")
+        print(f"  accelerator=cuda devices={torch.cuda.device_count()}")
+    else:
+        raise ValueError(f"Unsupported accelerator {accelerator!r}")
     # Exercise the exact ABI boundaries that failed after NumPy drifted to 2.x.
     array = np.arange(12, dtype=np.float32).reshape(3, 4)
     tensor = torch.from_numpy(array)
@@ -155,6 +188,9 @@ def verify_depth_data(depth_root: Path, sample_count: int) -> tuple[int, int]:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--imports-only", action="store_true")
+    parser.add_argument(
+        "--accelerator", choices=("auto", "cuda", "npu", "ascend"), default="auto"
+    )
     parser.add_argument("--sim-root", type=Path)
     parser.add_argument("--depth-root", type=Path)
     parser.add_argument("--da3-checkpoint", type=Path)
@@ -163,7 +199,7 @@ def main() -> None:
     parser.add_argument("--depth-samples", type=int, default=3)
     args = parser.parse_args()
 
-    verify_runtime()
+    verify_runtime(args.accelerator)
     if args.imports_only:
         return
 

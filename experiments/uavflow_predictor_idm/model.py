@@ -26,6 +26,7 @@ from .geometry_architectures import (
     GEOMETRY_ARCHITECTURES, DUAL_ARCHITECTURES, DirectCurrentActionSeed,
     DualActionFusion, select_dual_view,
 )
+from .runtime import rand_on_device
 
 
 class PatchMotionStopHead(nn.Module):
@@ -1173,8 +1174,8 @@ class UAVFlowPredictorIDM(nn.Module):
                     # Drop the whole trajectory condition per sample instead
                     # of creating impossible per-timestep holes.
                     pose_keep = (
-                        torch.rand(
-                            b, 1, device=predictor_pose.device,
+                        rand_on_device(
+                            (b, 1), device=predictor_pose.device,
                             generator=conditioning_generator,
                         )
                         < self.pose_history_keep_prob
@@ -1193,8 +1194,8 @@ class UAVFlowPredictorIDM(nn.Module):
                 and self.action_history_keep_prob < 1.0
             ):
                 action_keep = (
-                    torch.rand(
-                        b, 1, device=predictor_action_valid.device,
+                    rand_on_device(
+                        (b, 1), device=predictor_action_valid.device,
                         generator=conditioning_generator,
                     )
                     < self.action_history_keep_prob

@@ -49,6 +49,7 @@ Contract with the unified training path (`src/robot/losses/unified_loss.py`,
 from __future__ import annotations
 
 import math
+import os
 from typing import Callable, Optional, Tuple
 
 import torch
@@ -76,6 +77,8 @@ def _patch_triton_compiled_kernel_hooks() -> None:
 
 
 try:
+    if os.environ.get("UAVFLOW_DISABLE_FLEX_ATTENTION", "0") == "1":
+        raise ImportError("FlexAttention disabled for the selected accelerator")
     from torch.nn.attention.flex_attention import (
         flex_attention as _flex_attention_raw,
         create_block_mask as _create_block_mask,

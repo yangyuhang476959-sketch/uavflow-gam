@@ -6,6 +6,8 @@ from typing import Any
 
 import torch
 
+from .runtime import rand_on_device
+
 
 class EpisodePoseNormalizer:
     """GAM-style q01/q99 normalization for episode-relative UAV pose.
@@ -51,16 +53,18 @@ def temporal_color_augment(
         return images
     batch = images.shape[0]
     shape = (batch, 1, 1, 1, 1, 1)
-    apply = torch.rand(*shape, device=images.device, generator=generator) < float(
+    apply = rand_on_device(shape, device=images.device, generator=generator) < float(
         cfg.get("probability", 0.5)
     )
     brightness = float(cfg.get("brightness", 0.0))
     contrast = float(cfg.get("contrast", 0.0))
     color = float(cfg.get("color", 0.0))
-    gain = 1.0 + (torch.rand(*shape, device=images.device, generator=generator) * 2 - 1) * contrast
-    bias = (torch.rand(*shape, device=images.device, generator=generator) * 2 - 1) * brightness
+    gain = 1.0 + (rand_on_device(shape, device=images.device, generator=generator) * 2 - 1) * contrast
+    bias = (rand_on_device(shape, device=images.device, generator=generator) * 2 - 1) * brightness
     channel = 1.0 + (
-        torch.rand(batch, 1, 1, 3, 1, 1, device=images.device, generator=generator) * 2 - 1
+        rand_on_device(
+            (batch, 1, 1, 3, 1, 1), device=images.device, generator=generator
+        ) * 2 - 1
     ) * color
     augmented = (images * gain * channel + bias).clamp(0.0, 1.0)
     return torch.where(apply, augmented, images)
@@ -77,4 +81,7 @@ def choose_context_length(
     weights = torch.tensor(model_cfg["context_weights"], device=device, dtype=torch.float)
     if choices.numel() != weights.numel() or float(weights.sum()) <= 0:
         raise ValueError("context_lengths/context_weights must have equal positive length.")
-    return int(choices[torch.multinomial(weights, 1, generator=generator)].item())
+    generator_device = torch.device(generator.device) if generator is not None else device
+    sample_weights = weights.to(generator_device)
+    index = torch.multinomial(sample_weights, 1, generator=generator)
+    return int(choices[int(index.item())].item())

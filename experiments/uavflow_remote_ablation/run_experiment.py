@@ -89,8 +89,33 @@ def main() -> None:
     if global_batch % nproc:
         raise ValueError("GLOBAL_BATCH_SIZE must be divisible by NPROC")
     per_gpu_batch = global_batch // nproc
-    cuda_devices = os.environ.get(
-        "CUDA_DEVICES", ",".join(str(index) for index in range(nproc))
+    requested_accelerator = os.environ.get("UAVFLOW_ACCELERATOR", "auto").lower()
+    if requested_accelerator == "ascend":
+        requested_accelerator = "npu"
+    if requested_accelerator == "auto":
+        ascend_environment = any(
+            os.environ.get(name)
+            for name in (
+                "ASCEND_RT_VISIBLE_DEVICES",
+                "ASCEND_HOME_PATH",
+                "ASCEND_TOOLKIT_HOME",
+            )
+        )
+        # Do not import/probe torch here: CUDA/NPU visibility must be fixed
+        # before either runtime is initialized in the torchrun children.
+        # Ascend vendor images expose one of the CANN variables above; all
+        # other remote jobs retain the historical CUDA default.
+        requested_accelerator = "npu" if ascend_environment else "cuda"
+    if requested_accelerator not in {"cuda", "npu"}:
+        raise ValueError(
+            "Remote matrix jobs require UAVFLOW_ACCELERATOR=cuda or npu; "
+            f"got {requested_accelerator!r}."
+        )
+    device_ids = os.environ.get(
+        "DEVICE_IDS",
+        os.environ.get(
+            "CUDA_DEVICES", ",".join(str(index) for index in range(nproc))
+        ),
     )
     stage1_epochs = int(os.environ.get("STAGE1_EPOCHS", "20"))
     stage2_epochs = int(os.environ.get("STAGE2_EPOCHS", "20"))
@@ -98,17 +123,29 @@ def main() -> None:
 
     env = os.environ.copy()
     env.update({
-        "CUDA_VISIBLE_DEVICES": cuda_devices,
+        "UAVFLOW_ACCELERATOR": requested_accelerator,
         "PYTHONPATH": f"{ROOT / 'src'}:{ROOT}:" + env.get("PYTHONPATH", ""),
-        "PYTORCH_CUDA_ALLOC_CONF": env.get(
-            "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"
-        ),
     })
+    if requested_accelerator == "npu":
+        env.update({
+            "ASCEND_RT_VISIBLE_DEVICES": device_ids,
+            "HCCL_ASYNC_ERROR_HANDLING": env.get("HCCL_ASYNC_ERROR_HANDLING", "1"),
+            # TorchInductor/Triton FlexAttention is CUDA-specific. The matrix
+            # does not require it, so keep the dense portable path on NPU.
+            "UAVFLOW_DISABLE_FLEX_ATTENTION": "1",
+        })
+    else:
+        env.update({
+            "CUDA_VISIBLE_DEVICES": device_ids,
+            "PYTORCH_CUDA_ALLOC_CONF": env.get(
+                "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"
+            ),
+        })
     subprocess.run([
         str(python), str(ROOT / "scripts/verify_uavflow_remote.py"),
         "--sim-root", str(sim), "--depth-root", str(depth),
         "--da3-checkpoint", str(da3), "--qwen-model", str(qwen),
-        "--t5-model", str(t5),
+        "--t5-model", str(t5), "--accelerator", requested_accelerator,
     ], cwd=ROOT, env=env, check=True)
 
     common = [
@@ -123,6 +160,13 @@ def main() -> None:
         f"training.batch_size={per_gpu_batch}",
         f"training.num_workers={int(os.environ.get('NUM_WORKERS', '4'))}",
         f"training.lr={base_lr}", "training.save_latest_every=0",
+        "training.amp_dtype=" + os.environ.get(
+            "AMP_DTYPE", "fp16" if requested_accelerator == "npu" else "auto"
+        ),
+        "stage1.qwen_attention_implementation=" + os.environ.get(
+            "QWEN_ATTN_IMPLEMENTATION",
+            "eager" if requested_accelerator == "npu" else "sdpa",
+        ),
         f"dataset.split_file={split}",
     ]
     if args.max_trajectories is not None:
@@ -183,6 +227,7 @@ def main() -> None:
         state.write_text(
             f"experiment={args.experiment}\nstage={stage}\nstart={datetime.now().isoformat()}\n"
             f"nproc={nproc}\nper_gpu_batch={per_gpu_batch}\nglobal_batch={global_batch}\n"
+            f"accelerator={requested_accelerator}\ndevice_ids={device_ids}\n"
             f"split_sha256={hashlib.sha256(split.read_bytes()).hexdigest()}\n"
         )
         tee_run(command, env=env, log=stage_dir / "console.log")

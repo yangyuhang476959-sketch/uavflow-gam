@@ -43,6 +43,8 @@ class _DeepActionDinoAdapter(nn.Module):
 # breaks in our deep-stack loop drop the flex_attention call back to eager. We
 # wrap the imported function at module load.
 try:
+    if os.environ.get("UAVFLOW_DISABLE_FLEX_ATTENTION", "0") == "1":
+        raise ImportError("FlexAttention disabled for the selected accelerator")
     from torch.nn.attention.flex_attention import (
         flex_attention as _flex_attention_raw,
         create_block_mask as _create_block_mask,

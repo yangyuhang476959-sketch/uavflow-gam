@@ -19,6 +19,22 @@ from torch.utils.data import ConcatDataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
+from experiments.uavflow_predictor_idm.runtime import (
+    apply_overrides,
+    bootstrap_accelerator_plugin,
+    configure_accelerator,
+    create_grad_scaler,
+    distributed_info,
+    lr_scale,
+    manual_seed_all,
+    max_memory_allocated_gb,
+    step_generator,
+)
+
+# TorchNPU must register the NPU backend before Transformers and DA3 modules
+# are imported. This is a no-op for the default CUDA runtime.
+bootstrap_accelerator_plugin()
+
 from experiments.uavflow_predictor_idm.data import (
     EpisodePoseNormalizer,
     choose_context_length,
@@ -29,11 +45,6 @@ from experiments.uavflow_predictor_idm.idm import build_frozen_idm
 from experiments.uavflow_predictor_idm.model import UAVFlowPredictorIDM
 from experiments.uavflow_predictor_idm.objectives import evaluate, forward_batch
 from experiments.uavflow_predictor_idm.logging_metrics import compact_train_line, enabled_metric
-from experiments.uavflow_predictor_idm.runtime import (
-    apply_overrides,
-    distributed_info,
-    lr_scale,
-)
 from experiments.uavflow_predictor_idm.vlm_conditioning import build_stage2_conditioner
 from robot.data.dataset import ActionNormalizer, build_robot_dataset
 from robot.modeling.da3_giant_encoder import DA3GiantEncoder
@@ -109,7 +120,18 @@ def main() -> None:
             f"{dataset_chunk_size}, model.action_chunk_size={action_chunk_size}."
         )
     is_dist, rank, local_rank, world = distributed_info()
-    if is_dist:
+    accelerator = configure_accelerator(local_rank=local_rank, distributed=is_dist)
+    if rank == 0:
+        print(
+            "runtime "
+            f"accelerator={accelerator.kind} "
+            f"backend={accelerator.distributed_backend} "
+            f"world_size={world} "
+            f"amp={bool(cfg.training.amp)} "
+            f"amp_dtype={cfg.training.get('amp_dtype', 'auto')}",
+            flush=True,
+        )
+    if is_dist and accelerator.kind == "cuda":
         # ``flex_attention`` is a higher-order operator.  TorchDynamo's DDP
         # graph/bucket optimizer cannot partition graphs containing it and
         # otherwise fails on the first forward with
@@ -117,13 +139,13 @@ def main() -> None:
         # graph rewrite preserves compiled flex-attention and normal DDP
         # gradient synchronization.
         torch._dynamo.config.optimize_ddp = False
-        torch.cuda.set_device(local_rank)
-        dist.init_process_group("nccl")
-    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    device = accelerator.device
     seed = int(cfg.seed) + rank
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
+    manual_seed_all(accelerator, seed)
+    if accelerator.kind == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
     dataset_cfg = OmegaConf.to_container(cfg.dataset, resolve=True)
     split_file = dataset_cfg.pop("split_file", None)
@@ -275,8 +297,7 @@ def main() -> None:
     # and action-head parameters then start identically in CLIP/T5 ablations.
     model_init_seed = int(cfg.get("model_init_seed", cfg.seed))
     torch.manual_seed(model_init_seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(model_init_seed)
+    manual_seed_all(accelerator, model_init_seed)
     from experiments.uavflow_predictor_idm.current_geometry import load_current_geometry_read
     from experiments.uavflow_predictor_idm.geometry_architectures import architecture_state, load_architecture_state
     model = UAVFlowPredictorIDM(
@@ -547,7 +568,9 @@ def main() -> None:
     optimizer = torch.optim.AdamW(
         optimizer_groups, weight_decay=float(cfg.training.weight_decay)
     )
-    scaler = torch.amp.GradScaler("cuda", enabled=bool(cfg.training.amp and device.type == "cuda"))
+    scaler = create_grad_scaler(
+        device.type, enabled=bool(cfg.training.amp and device.type in {"cuda", "npu"})
+    )
     start_step = 0; start_epoch = 0; start_batch = 0
     if args.resume:
         ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
@@ -662,6 +685,7 @@ def main() -> None:
             "loss.depth_fixed_scale_meters",
             "loss.depth_scale_loss_weight",
             "training.batch_size",
+            "training.amp_dtype",
             "training.direct_action_head_lr_mult",
             "training.predictor_lr_mult",
             "training.stop_head_lr",
@@ -819,12 +843,13 @@ def main() -> None:
     train_loader = DataLoader(
         train_set, batch_size=int(cfg.training.batch_size), sampler=train_sampler,
         shuffle=train_sampler is None, num_workers=int(cfg.training.num_workers),
-        pin_memory=True, drop_last=True, persistent_workers=int(cfg.training.num_workers) > 0,
+        pin_memory=accelerator.kind == "cuda", drop_last=True,
+        persistent_workers=int(cfg.training.num_workers) > 0,
     )
     eval_loader = DataLoader(
         eval_set, batch_size=int(cfg.training.batch_size), sampler=eval_sampler,
         shuffle=False, num_workers=max(1, int(cfg.training.num_workers) // 2),
-        pin_memory=True, drop_last=False,
+        pin_memory=accelerator.kind == "cuda", drop_last=False,
     )
     # Keep domain-specific validation loaders as well as the historical mixed
     # loader.  In particular, ``sim_H*_action/raw`` uses the same normalized
@@ -845,7 +870,7 @@ def main() -> None:
             sampler=domain_sampler,
             shuffle=False,
             num_workers=max(1, int(cfg.training.num_workers) // 2),
-            pin_memory=True,
+            pin_memory=accelerator.kind == "cuda",
             drop_last=False,
         )
     output = Path(str(cfg.training.results_dir)); output.mkdir(parents=True, exist_ok=True)
@@ -923,6 +948,7 @@ def main() -> None:
                 ),
                 max_batches=int(cfg.training.eval_max_batches),
                 amp=bool(cfg.training.amp),
+                amp_dtype=str(cfg.training.get("amp_dtype", "auto")),
                 depth_target_source=str(cfg.loss.get("depth_target_source", "ue_gt")),
                 depth_scale_mode=str(cfg.loss.get("depth_scale_mode", "per_frame_median")),
                 depth_target_mode=str(cfg.loss.get("depth_target_mode", "future")),
@@ -1151,21 +1177,22 @@ def main() -> None:
             batch = move_batch(batch, device)
             # Step-keyed randomness makes context sampling and augmentation
             # bitwise resume-stable without serializing global CUDA RNG state.
-            step_generator = torch.Generator(device=device)
-            step_generator.manual_seed(int(cfg.seed) + step * world + rank)
+            batch_generator = step_generator(
+                accelerator, int(cfg.seed) + step * world + rank
+            )
             augmented_sequence = temporal_color_augment(
                 torch.cat([
                     batch["episode_first_image"][:, None],
                     batch["all_view_images"],
                 ], dim=1),
                 OmegaConf.to_container(cfg.augmentation, resolve=True),
-                generator=step_generator,
+                generator=batch_generator,
             )
             batch["episode_first_image"] = augmented_sequence[:, 0]
             batch["all_view_images"] = augmented_sequence[:, 1:]
             h = choose_context_length(
                 OmegaConf.to_container(cfg.model, resolve=True), device,
-                generator=step_generator,
+                generator=batch_generator,
             )
             values = forward_batch(
                 model=model, da3=da3, text=text, normalizer=normalizer, batch=batch,
@@ -1185,6 +1212,7 @@ def main() -> None:
                     cfg.loss.get("dual_branch_action_aux_weight", 0.5)
                 ),
                 amp=bool(cfg.training.amp),
+                amp_dtype=str(cfg.training.get("amp_dtype", "auto")),
                 depth_target_source=str(cfg.loss.get("depth_target_source", "ue_gt")),
                 depth_scale_mode=str(cfg.loss.get("depth_scale_mode", "per_frame_median")),
                 depth_target_mode=str(cfg.loss.get("depth_target_mode", "future")),
@@ -1215,7 +1243,7 @@ def main() -> None:
                 depth_gradient_tolerance_pixels=int(
                     cfg.loss.get("depth_gradient_tolerance_pixels", 2)
                 ),
-                conditioning_generator=step_generator,
+                conditioning_generator=batch_generator,
             )
             weighted_action = float(cfg.loss.action_weight) * values["action"]
             weighted_feature = float(cfg.loss.feature_weight) * values["feature"]
@@ -1259,10 +1287,7 @@ def main() -> None:
                     f"{float(value):.4f}"
                     for value in values["feature_cos_per_horizon"].detach().float().cpu()
                 )
-                memory_gb = (
-                    torch.cuda.max_memory_allocated(device) / (1024 ** 3)
-                    if device.type == "cuda" else 0.0
-                )
+                memory_gb = max_memory_allocated_gb(accelerator)
                 line = (
                     f"[step={step:07d}] total={loss.item():.4f} H={h} "
                     f"action={values['action'].item():.4f} "
@@ -1345,6 +1370,7 @@ def main() -> None:
                         cfg.loss.get("dual_branch_action_aux_weight", 0.5)
                     ),
                     max_batches=int(cfg.training.eval_max_batches), amp=bool(cfg.training.amp),
+                    amp_dtype=str(cfg.training.get("amp_dtype", "auto")),
                     depth_target_source=str(cfg.loss.get("depth_target_source", "ue_gt")),
                 depth_scale_mode=str(cfg.loss.get("depth_scale_mode", "per_frame_median")),
                 depth_target_mode=str(cfg.loss.get("depth_target_mode", "future")),
@@ -1399,6 +1425,7 @@ def main() -> None:
                         ),
                         max_batches=int(cfg.training.eval_max_batches),
                         amp=bool(cfg.training.amp),
+                        amp_dtype=str(cfg.training.get("amp_dtype", "auto")),
                         depth_target_source=str(cfg.loss.get("depth_target_source", "ue_gt")),
                 depth_scale_mode=str(cfg.loss.get("depth_scale_mode", "per_frame_median")),
                 depth_target_mode=str(cfg.loss.get("depth_target_mode", "future")),

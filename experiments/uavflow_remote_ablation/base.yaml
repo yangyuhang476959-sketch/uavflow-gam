@@ -206,6 +206,9 @@ training:
   min_lr_ratio: 0.05
   grad_clip: 1.0
   amp: true
+  # auto selects BF16 on CUDA and the more broadly supported FP16 on Ascend.
+  # Override with AMP_DTYPE=bf16 only after confirming the NPU model supports it.
+  amp_dtype: auto
   log_every: 25
   eval_every: 2000
   eval_max_batches: 100

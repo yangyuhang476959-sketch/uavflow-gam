@@ -75,3 +75,8 @@ Defaults are `NPROC=8`, `GLOBAL_BATCH_SIZE=32`, four samples per GPU. Override
 only through environment variables when the node differs. For a cheap launch
 audit, append `--max-trajectories 20 --stage stage1` and set
 `STAGE1_EPOCHS=1`.
+
+The same entrypoints run on Huawei Ascend by exporting
+`UAVFLOW_ACCELERATOR=npu` and `DEVICE_IDS=0,1,2,3,4,5,6,7`. See
+`docs/ASCEND_TRAINING.md` for the vendor-runtime requirement, HCCL/AMP
+defaults, full audit and mandatory smoke test.
