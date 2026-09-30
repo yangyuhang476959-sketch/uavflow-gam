@@ -106,9 +106,10 @@ def configure_accelerator(*, local_rank: int, distributed: bool) -> Accelerator:
 def amp_dtype(name: str, device_type: str) -> torch.dtype:
     value = str(name).strip().lower()
     if value == "auto":
-        # FP16 works across more Ascend generations. CUDA keeps the validated
-        # BF16 behavior used by the original experiments.
-        value = "fp16" if device_type == "npu" else "bf16"
+        # Keep the matrix numerically aligned across the validated NVIDIA and
+        # target Atlas 910B1 stacks. Both execute the outer model in BF16;
+        # newly inserted LoRA parameters remain FP32 on both accelerators.
+        value = "bf16"
     if value in {"fp16", "float16", "half"}:
         return torch.float16
     if value in {"bf16", "bfloat16"}:

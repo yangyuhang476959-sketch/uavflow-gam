@@ -31,7 +31,7 @@ class AcceleratorRuntimeTests(unittest.TestCase):
 
     def test_amp_auto_is_backend_specific(self):
         self.assertEqual(amp_dtype("auto", "cuda"), torch.bfloat16)
-        self.assertEqual(amp_dtype("auto", "npu"), torch.float16)
+        self.assertEqual(amp_dtype("auto", "npu"), torch.bfloat16)
         self.assertEqual(amp_dtype("bf16", "npu"), torch.bfloat16)
 
     def test_cpu_path_does_not_require_torch_npu(self):

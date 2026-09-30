@@ -55,15 +55,17 @@ export UAVFLOW_ACCELERATOR=npu
 export DEVICE_IDS=0,1,2,3,4,5,6,7
 export NPROC=8
 export GLOBAL_BATCH_SIZE=32
-export AMP_DTYPE=fp16
+export AMP_DTYPE=bf16
 export QWEN_ATTN_IMPLEMENTATION=eager
 export HCCL_ASYNC_ERROR_HANDLING=1
 ```
 
-`fp16` and Qwen eager attention are conservative defaults across Ascend
-generations. On a confirmed Atlas A2/A3 environment, `AMP_DTYPE=bf16` and/or
-`QWEN_ATTN_IMPLEMENTATION=sdpa` may be smoke-tested for performance, but must
-not be mixed within one reported comparison matrix.
+BF16 matches the existing NVIDIA matrix and is supported by the target Atlas
+910B1 stack: Qwen parameters and outer AMP are BF16, while newly inserted LoRA
+parameters remain FP32 on both platforms. Qwen eager attention remains the
+conservative backend default. `QWEN_ATTN_IMPLEMENTATION=sdpa` may be tested for
+performance after the mandatory smoke, but must not be mixed within one
+reported comparison matrix.
 
 Run the full preflight audit before queueing expensive jobs:
 
@@ -98,7 +100,7 @@ command per eight-NPU node.
 - uses `npu:<local_rank>` and HCCL for DDP;
 - uses TorchNPU AMP/GradScaler and reports NPU peak memory;
 - disables CUDA/Triton FlexAttention on NPU;
-- defaults Qwen to eager attention and NPU AMP to FP16;
+- defaults Qwen to eager attention and NPU AMP to BF16 on Atlas 910B1;
 - disables CUDA-oriented DataLoader pinned memory on NPU;
 - records accelerator, device IDs, AMP dtype and attention implementation in
   the resolved configuration/run state.
@@ -111,7 +113,7 @@ validate routing and CPU/CUDA regression behavior but cannot certify every
 operator on the destination CANN/torch_npu version. The mandatory R1 smoke is
 the final operator-compatibility gate.
 
-CUDA and Ascend runs implement the same objective and matrix cell, but BF16
-versus FP16 and backend kernels are not bitwise equivalent. Keep accelerator,
-AMP dtype and attention backend in the experiment metadata, and do not splice
-checkpoints from different accelerator stacks into one exact-resume run.
+CUDA and Ascend runs implement the same objective and both use BF16, but their
+backend kernels are not bitwise equivalent. Keep accelerator, AMP dtype and
+attention backend in the experiment metadata, and do not splice checkpoints
+from different accelerator stacks into one exact-resume run.

@@ -161,7 +161,7 @@ def main() -> None:
         f"training.num_workers={int(os.environ.get('NUM_WORKERS', '4'))}",
         f"training.lr={base_lr}", "training.save_latest_every=0",
         "training.amp_dtype=" + os.environ.get(
-            "AMP_DTYPE", "fp16" if requested_accelerator == "npu" else "auto"
+            "AMP_DTYPE", "auto"
         ),
         "stage1.qwen_attention_implementation=" + os.environ.get(
             "QWEN_ATTN_IMPLEMENTATION",
