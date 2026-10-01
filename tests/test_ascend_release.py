@@ -231,6 +231,37 @@ def test_ascend_stack_modes_and_benchmark_are_explicit():
     assert "UAVFLOW_QWEN_BENCHMARK_MODE=normal" in bench
 
 
+def test_ascend_project_install_resolves_dependencies_but_protects_runtime():
+    setup = (ROOT / "scripts/setup_ascend_cluster.sh").read_text()
+    flattened = setup.replace("\\\n", " ")
+    requirements_commands = [
+        line for line in flattened.splitlines()
+        if 'requirements-ascend.txt' in line and 'pip install' in line
+    ]
+    assert len(requirements_commands) == 2  # dry-run and actual installation
+    assert all("--no-deps" not in line for line in requirements_commands)
+    assert all("INSTALL_CONSTRAINTS" in line for line in requirements_commands)
+    assert '--upgrade-strategy only-if-needed' in flattened
+
+    assert 'INSTALL_CONSTRAINTS=(-c "${PROJECT_CONSTRAINTS}")' in setup
+    assert 'INSTALL_CONSTRAINTS+=(-c "${REFERENCE_CONSTRAINTS}")' in setup
+    assert 'VENDOR_RUNTIME_CONSTRAINTS="$(mktemp' in setup
+    assert 'accelerator_snapshot > "${VENDOR_RUNTIME_CONSTRAINTS}"' in setup
+    assert 'INSTALL_CONSTRAINTS+=(-c "${VENDOR_RUNTIME_CONSTRAINTS}")' in setup
+    assert 'diff -u "${ACCELERATOR_BEFORE}" "${ACCELERATOR_AFTER}"' in setup
+    assert "verify_reference_stack" in setup
+
+
+def test_ascend_no_deps_is_limited_to_validated_special_cases():
+    setup = (ROOT / "scripts/setup_ascend_cluster.sh").read_text()
+    flattened = setup.replace("\\\n", " ")
+    no_deps_lines = [line.strip() for line in flattened.splitlines() if "--no-deps" in line]
+    assert len(no_deps_lines) == 3
+    assert any('"${TORCHVISION_WHEEL}"' in line for line in no_deps_lines)
+    assert any('triton-ascend==3.2.1' in line for line in no_deps_lines)
+    assert any('-e "${DA3_DIR}"' in line for line in no_deps_lines)
+
+
 def test_lora_forward_and_gradients_match_explicit_reference():
     torch.manual_seed(3)
     wrapped = LoRALinear(nn.Linear(7, 5), rank=3, alpha=6.0)

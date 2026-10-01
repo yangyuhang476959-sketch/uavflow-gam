@@ -1,6 +1,6 @@
 # Exact runtime validated on Ascend 910B2, Python 3.11.15 and CANN 9.0.0.
-# The installed torch wheel may report the local suffix 2.7.1+cpu.
--c constraints-ascend.txt
+# The installed torch wheel may report the local suffix 2.7.1+cpu. Use this
+# together with constraints-ascend.txt; keep runtime and project policy split.
 torch==2.7.1
 torchvision==0.22.1
 torch-npu==2.7.1.post4

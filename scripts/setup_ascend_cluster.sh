@@ -75,12 +75,14 @@ PY="${ASCEND_VENV}/bin/python"
 "${PY}" -m pip install --upgrade 'pip<26' setuptools wheel
 
 echo "== Phase 3: accelerator stack mode=${ASCEND_STACK_MODE} =="
-if [[ -n "${TORCH_WHEEL:-}" || -n "${TORCH_NPU_WHEEL:-}" ]]; then
-  [[ -f "${TORCH_WHEEL:-}" && -f "${TORCH_NPU_WHEEL:-}" ]] || {
-    echo 'Set both TORCH_WHEEL and TORCH_NPU_WHEEL to local compatible wheels.' >&2; exit 3; }
-  "${PY}" -m pip install --no-deps "${TORCH_WHEEL}" "${TORCH_NPU_WHEEL}"
-fi
 if [[ "${ASCEND_STACK_MODE}" == reference ]]; then
+  if [[ -n "${TORCH_WHEEL:-}" || -n "${TORCH_NPU_WHEEL:-}" ]]; then
+    [[ -f "${TORCH_WHEEL:-}" && -f "${TORCH_NPU_WHEEL:-}" ]] || {
+      echo 'Set both TORCH_WHEEL and TORCH_NPU_WHEEL to local compatible wheels.' >&2; exit 3; }
+    "${PY}" -m pip install \
+      -c "${PROJECT_CONSTRAINTS}" -c "${REFERENCE_CONSTRAINTS}" \
+      "${TORCH_WHEEL}" "${TORCH_NPU_WHEEL}"
+  fi
   if ! "${PY}" - <<'PY'
 import torch, torch_npu
 assert torch.__version__.split('+')[0] == '2.7.1', torch.__version__
@@ -120,7 +122,9 @@ PY
 
 core_snapshot() {
   "${PY}" - <<'PY'
+import platform
 import torch, torch_npu, torchvision, numpy, scipy, transformers, huggingface_hub
+print('python', platform.python_version())
 for name, value in (
     ('torch', torch.__version__), ('torch_npu', torch_npu.__version__),
     ('torchvision', torchvision.__version__), ('numpy', numpy.__version__),
@@ -130,20 +134,89 @@ for name, value in (
 PY
 }
 
+accelerator_snapshot() {
+  "${PY}" - <<'PY'
+from importlib.metadata import version
+for distribution in ('torch', 'torch-npu', 'torchvision'):
+    print(distribution, version(distribution))
+PY
+}
+
+verify_reference_stack() {
+  "${PY}" - <<'PY'
+import platform, torch, torch_npu, torchvision, numpy, scipy, transformers, huggingface_hub
+expected = {
+    'python': '3.11.15',
+    'torch': '2.7.1',
+    'torch_npu': '2.7.1.post4',
+    'torchvision': '0.22.1',
+    'numpy': '1.26.4',
+    'scipy': '1.15.3',
+    'transformers': '5.5.4',
+    'huggingface_hub': '1.10.1',
+}
+actual = {
+    'python': platform.python_version(),
+    'torch': torch.__version__.split('+')[0],
+    'torch_npu': torch_npu.__version__,
+    'torchvision': torchvision.__version__.split('+')[0],
+    'numpy': numpy.__version__,
+    'scipy': scipy.__version__,
+    'transformers': transformers.__version__,
+    'huggingface_hub': huggingface_hub.__version__,
+}
+assert actual == expected, f'reference stack drifted: expected={expected} actual={actual}'
+print('reference stack verified', actual)
+PY
+}
+
 echo '== Phase 5/6: pinned scientific/HF stack and project requirements =='
-# Establish the protected versions first. Constraints then prevent timm or
-# torchvision dependencies from taking ownership of the torch decision.
-"${PY}" -m pip install -c "${PROJECT_CONSTRAINTS}" \
+# Allow normal dependency resolution while constraints prevent it from taking
+# ownership of the selected accelerator runtime.
+INSTALL_CONSTRAINTS=(-c "${PROJECT_CONSTRAINTS}")
+VENDOR_RUNTIME_CONSTRAINTS=""
+if [[ "${ASCEND_STACK_MODE}" == reference ]]; then
+  INSTALL_CONSTRAINTS+=(-c "${REFERENCE_CONSTRAINTS}")
+else
+  VENDOR_RUNTIME_CONSTRAINTS="$(mktemp /tmp/uavflow-vendor-runtime-XXXXXX.txt)"
+  accelerator_snapshot > "${VENDOR_RUNTIME_CONSTRAINTS}"
+  sed -i 's/ /==/' "${VENDOR_RUNTIME_CONSTRAINTS}"
+  INSTALL_CONSTRAINTS+=(-c "${VENDOR_RUNTIME_CONSTRAINTS}")
+  echo "Pinned vendor runtime constraints:"
+  cat "${VENDOR_RUNTIME_CONSTRAINTS}"
+fi
+
+ACCELERATOR_BEFORE="$(mktemp /tmp/uavflow-accelerator-before-XXXXXX.txt)"
+ACCELERATOR_AFTER="$(mktemp /tmp/uavflow-accelerator-after-XXXXXX.txt)"
+accelerator_snapshot > "${ACCELERATOR_BEFORE}"
+
+"${PY}" -m pip install "${INSTALL_CONSTRAINTS[@]}" \
   numpy==1.26.4 scipy==1.15.3 transformers==5.5.4 huggingface-hub==1.10.1
-core_snapshot > /tmp/uavflow_core_before.txt
-# requirements-ascend.txt is a complete project lock. --no-deps is deliberate:
-# pip is forbidden from resolving or replacing the accelerator triplet.
-"${PY}" -m pip install --dry-run --no-deps -c "${PROJECT_CONSTRAINTS}" \
+CORE_BEFORE="$(mktemp /tmp/uavflow-core-before-XXXXXX.txt)"
+CORE_AFTER="$(mktemp /tmp/uavflow-core-after-XXXXXX.txt)"
+core_snapshot > "${CORE_BEFORE}"
+
+"${PY}" -m pip install --dry-run "${INSTALL_CONSTRAINTS[@]}" \
+  --upgrade-strategy only-if-needed -r "${ROOT}/requirements-ascend.txt"
+"${PY}" -m pip install "${INSTALL_CONSTRAINTS[@]}" \
+  --upgrade-strategy only-if-needed \
   -r "${ROOT}/requirements-ascend.txt"
-"${PY}" -m pip install --no-deps -c "${PROJECT_CONSTRAINTS}" \
-  -r "${ROOT}/requirements-ascend.txt"
-core_snapshot > /tmp/uavflow_core_after.txt
-diff -u /tmp/uavflow_core_before.txt /tmp/uavflow_core_after.txt
+core_snapshot > "${CORE_AFTER}"
+accelerator_snapshot > "${ACCELERATOR_AFTER}"
+diff -u "${ACCELERATOR_BEFORE}" "${ACCELERATOR_AFTER}"
+if [[ "${ASCEND_STACK_MODE}" == reference ]]; then
+  verify_reference_stack
+else
+  # The complete snapshot is printed for audit; the accelerator diff above is
+  # the hard invariant for a vendor-provided runtime.
+  echo 'Vendor protected runtime remained unchanged.'
+fi
+echo '== Protected stack before project installation =='
+cat "${CORE_BEFORE}"
+echo '== Protected stack after project installation =='
+cat "${CORE_AFTER}"
+rm -f "${CORE_BEFORE}" "${CORE_AFTER}" "${ACCELERATOR_BEFORE}" "${ACCELERATOR_AFTER}"
+[[ -z "${VENDOR_RUNTIME_CONSTRAINTS}" ]] || rm -f "${VENDOR_RUNTIME_CONSTRAINTS}"
 
 echo '== Phase 7: optional pycolmap remains isolated =='
 echo 'Skipping requirements-optional-geometry.txt on the core training node.'

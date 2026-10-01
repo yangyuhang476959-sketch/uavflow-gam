@@ -52,7 +52,8 @@ bash scripts/setup_ascend_cluster.sh
 
 Only when cluster driver/firmware policy makes the exact stack impossible,
 select the administrator runtime explicitly. This mode inherits and snapshots
-the core triplet; project installation uses `--no-deps` and cannot replace it:
+the core triplet, generates exact temporary constraints for it, and then lets
+pip resolve ordinary project dependencies without replacing that triplet:
 
 ```bash
 export ASCEND_STACK_MODE=vendor
