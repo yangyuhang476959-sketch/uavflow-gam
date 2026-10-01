@@ -11,6 +11,7 @@ import argparse
 import fcntl
 import hashlib
 import os
+import shutil
 import subprocess
 import sys
 from datetime import datetime
@@ -22,6 +23,14 @@ from experiments.uavflow_predictor_idm.runtime import env_truthy
 
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG = ROOT / "experiments/uavflow_remote_ablation/base.yaml"
+
+
+def python_interpreter(value: str | None = None) -> Path:
+    """Return an interpreter path without dereferencing a venv symlink."""
+    raw = value if value is not None else os.environ.get("PYTHON_BIN", sys.executable)
+    if os.sep not in raw:
+        raw = shutil.which(raw) or raw
+    return Path(raw).expanduser()
 
 
 def required_path(env: str, default: Path | None = None) -> Path:
@@ -90,7 +99,7 @@ def main() -> None:
             "--stage stage1; Stage 2 must have a real Stage-1 checkpoint."
         )
 
-    python = Path(os.environ.get("PYTHON_BIN", sys.executable)).resolve()
+    python = python_interpreter()
     sim = required_path("UAVFLOW_SIM_ROOT", ROOT / "data_remote/UAV-Flow-Sim")
     depth = required_path(
         "UAVFLOW_DEPTH_ROOT", ROOT / "data_remote/UAV-Flow-Sim-Depth"

@@ -16,6 +16,7 @@ from experiments.uavflow_predictor_idm.runtime import (
 )
 from experiments.uavflow_remote_ablation.run_experiment import (
     benchmark_missing_checkpoint_allowed,
+    python_interpreter,
 )
 from robot.modeling.lora import LoRALinear
 
@@ -41,12 +42,38 @@ def test_env_truthy_rejects_typo(monkeypatch):
         env_truthy("UAVFLOW_TEST_FLAG")
 
 
-def test_grad_scaler_policy():
-    assert not grad_scaler_enabled("npu", amp_enabled=True, dtype_name="bf16")
-    assert grad_scaler_enabled("npu", amp_enabled=True, dtype_name="fp16")
-    assert not grad_scaler_enabled("cuda", amp_enabled=True, dtype_name="bf16")
-    assert grad_scaler_enabled("cuda", amp_enabled=True, dtype_name="fp16")
-    assert not grad_scaler_enabled("cuda", amp_enabled=False, dtype_name="fp16")
+@pytest.mark.parametrize(
+    "policy,dtype,expected",
+    [("auto", "bf16", False), ("auto", "fp16", True),
+     ("on", "bf16", True), ("off", "fp16", False)],
+)
+def test_grad_scaler_policy(policy, dtype, expected):
+    assert grad_scaler_enabled(
+        "npu", amp_enabled=True, dtype_name=dtype, policy=policy
+    ) is expected
+
+
+def test_grad_scaler_disabled_amp_and_invalid_policy():
+    assert not grad_scaler_enabled(
+        "cuda", amp_enabled=False, dtype_name="fp16", policy="auto"
+    )
+    with pytest.raises(ValueError, match="requires AMP"):
+        grad_scaler_enabled(
+            "cuda", amp_enabled=False, dtype_name="bf16", policy="on"
+        )
+    with pytest.raises(ValueError, match="auto, on, or off"):
+        grad_scaler_enabled(
+            "cuda", amp_enabled=True, dtype_name="fp16", policy="typo"
+        )
+
+
+def test_python_interpreter_preserves_venv_symlink(tmp_path):
+    venv_python = tmp_path / ".venv" / "bin" / "python"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.symlink_to(Path(sys.executable))
+    selected = python_interpreter(str(venv_python))
+    assert selected == venv_python
+    assert selected.is_symlink()
 
 
 def test_checkpoint_skip_is_benchmark_stage1_only():
@@ -62,6 +89,14 @@ def test_checkpoint_skip_is_benchmark_stage1_only():
     assert not benchmark_missing_checkpoint_allowed(
         stage="stage1", requested_stage="stage1", skip_final_checkpoint=False
     )
+
+
+def test_train_imports_profile_phase_used_by_backward_scopes():
+    source = (ROOT / "experiments/uavflow_predictor_idm/train.py").read_text()
+    import_block = source.split(")\n", 1)[0]
+    assert "profile_phase" in import_block
+    assert 'with profile_phase("R1/backward")' in source
+    assert 'with profile_phase("R1/optimizer")' in source
 
 
 def test_qwen_module_import_does_not_require_ascend(monkeypatch):
@@ -113,6 +148,11 @@ def test_qwen_fla_patch_is_lazy_and_preserves_layout(monkeypatch):
         for _ in range(18)
     ]
     qwen = types.SimpleNamespace(
+        config=types.SimpleNamespace(
+            text_config=types.SimpleNamespace(
+                layer_types=["linear_attention"] * 18
+            )
+        ),
         model=types.SimpleNamespace(
             language_model=types.SimpleNamespace(layers=layers)
         )
@@ -130,6 +170,65 @@ def test_qwen_fla_patch_is_lazy_and_preserves_layout(monkeypatch):
         use_qk_l2norm_in_kernel=True,
     )
     assert calls["qk_norm"] is True
+
+
+def test_qwen_fla_patch_rejects_partial_coverage(monkeypatch):
+    module = importlib.import_module(
+        "experiments.uavflow_direct_visual_probe.qwen35_semantic"
+    )
+    monkeypatch.setenv("UAVFLOW_ACCELERATOR", "npu")
+    monkeypatch.setenv("UAVFLOW_QWEN_FLA_NPU", "1")
+    fake_conv = types.ModuleType("fla.modules.convolution")
+    fake_conv.causal_conv1d = lambda x, weight, **kwargs: x
+    fake_gdr = types.ModuleType("fla.ops.gated_delta_rule")
+    fake_gdr.chunk_gated_delta_rule = lambda q, k, v, **kwargs: (q, None)
+    for name, value in {
+        "fla": types.ModuleType("fla"),
+        "fla.modules": types.ModuleType("fla.modules"),
+        "fla.modules.convolution": fake_conv,
+        "fla.ops": types.ModuleType("fla.ops"),
+        "fla.ops.gated_delta_rule": fake_gdr,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, value)
+    layers = [types.SimpleNamespace(linear_attn=types.SimpleNamespace()) for _ in range(17)]
+    qwen = types.SimpleNamespace(
+        config=types.SimpleNamespace(text_config=types.SimpleNamespace(
+            layer_types=["linear_attention"] * 18)),
+        model=types.SimpleNamespace(language_model=types.SimpleNamespace(layers=layers)),
+    )
+    with pytest.raises(RuntimeError, match="patched 17 of 18"):
+        module._patch_qwen_fla_npu(qwen)
+
+
+def test_cann_discovery_rejects_multiple_installations(tmp_path):
+    import subprocess
+    for name in ("cann-a", "cann-b"):
+        path = tmp_path / name / "bin" / "set_env.sh"
+        path.parent.mkdir(parents=True)
+        path.write_text("#!/usr/bin/env bash\n")
+    command = (
+        f"source {ROOT / 'scripts/ascend_cann.sh'}; "
+        "uavflow_select_cann_env"
+    )
+    result = subprocess.run(
+        ["bash", "-c", command], text=True, capture_output=True,
+        env={**os.environ, "ASCEND_SEARCH_ROOT": str(tmp_path), "CANN_ROOT": ""},
+    )
+    assert result.returncode != 0
+    assert "Multiple CANN installations" in result.stderr
+
+
+def test_ascend_stack_modes_and_benchmark_are_explicit():
+    setup = (ROOT / "scripts/setup_ascend_cluster.sh").read_text()
+    project = (ROOT / "constraints-ascend.txt").read_text()
+    reference = (ROOT / "constraints-ascend-reference.txt").read_text()
+    bench = (ROOT / "scripts/bench_r1_ascend.sh").read_text()
+    assert "ASCEND_STACK_MODE" in setup and "reference" in setup and "vendor" in setup
+    assert "torch==" not in project and "torch-npu==" not in project
+    assert "torch==2.7.1" in reference and "torch-npu==2.7.1.post4" in reference
+    assert '--max-trajectories "${MAX_TRAJECTORIES:-20}"' in bench
+    assert "unset UAVFLOW_PROFILE_NPU" in bench
+    assert "UAVFLOW_QWEN_BENCHMARK_MODE=normal" in bench
 
 
 def test_lora_forward_and_gradients_match_explicit_reference():

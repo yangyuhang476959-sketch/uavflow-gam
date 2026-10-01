@@ -15,17 +15,10 @@ fi
 # shellcheck disable=SC1090
 source "${ASCEND_VENV}/bin/activate"
 
-if [[ -n "${CANN_ROOT:-}" && -f "${CANN_ROOT}/set_env.sh" ]]; then
-  _UAVFLOW_CANN_ENV="${CANN_ROOT}/set_env.sh"
-elif [[ -n "${CANN_ROOT:-}" && -f "${CANN_ROOT}/bin/set_env.sh" ]]; then
-  _UAVFLOW_CANN_ENV="${CANN_ROOT}/bin/set_env.sh"
-else
-  _UAVFLOW_CANN_ENV="$(find /usr/local/Ascend -maxdepth 3 -type f -name set_env.sh 2>/dev/null | sort | head -n1)"
-fi
-if [[ -z "${_UAVFLOW_CANN_ENV:-}" || ! -f "${_UAVFLOW_CANN_ENV}" ]]; then
-  echo "CANN set_env.sh not found; export CANN_ROOT first" >&2
-  return 1 2>/dev/null || exit 1
-fi
+# shellcheck disable=SC1091
+source "${_UAVFLOW_SCRIPT_DIR}/ascend_cann.sh"
+_UAVFLOW_CANN_ENV="$(uavflow_select_cann_env)" || {
+  return 1 2>/dev/null || exit 1; }
 # shellcheck disable=SC1090
 source "${_UAVFLOW_CANN_ENV}"
 echo "Using CANN environment: ${_UAVFLOW_CANN_ENV}"

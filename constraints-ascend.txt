@@ -1,8 +1,6 @@
-# Validated Ascend 910B2 / CANN 9.0.0 core stack.  Local version suffixes such
-# as torch 2.7.1+cpu satisfy the corresponding public 2.7.1 constraint.
-torch==2.7.1
-torchvision==0.22.1
-torch-npu==2.7.1.post4
+# Project-level packages shared by reference and vendor runtime modes.
+# Deliberately excludes torch/torch_npu/torchvision: project installation must
+# never replace an administrator-provided accelerator runtime.
 numpy==1.26.4
 scipy==1.15.3
 transformers==5.5.4

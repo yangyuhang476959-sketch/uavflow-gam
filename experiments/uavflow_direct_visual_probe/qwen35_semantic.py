@@ -81,6 +81,19 @@ def _patch_qwen_fla_npu(qwen: nn.Module) -> int:
             **kwargs,
         )
 
+    text_config = getattr(getattr(qwen, "config", None), "text_config", None)
+    if text_config is None:
+        text_config = getattr(qwen.model.language_model, "config", None)
+    layer_types = getattr(text_config, "layer_types", None)
+    if not layer_types:
+        raise RuntimeError(
+            "Qwen config does not expose layer_types; cannot verify a complete "
+            "Ascend FLA patch"
+        )
+    expected = sum(str(kind).lower() == "linear_attention" for kind in layer_types)
+    if expected <= 0:
+        raise RuntimeError("Qwen config declares no linear-attention layers")
+
     count = 0
     for layer in qwen.model.language_model.layers:
         linear_attn = getattr(layer, "linear_attn", None)
@@ -89,8 +102,11 @@ def _patch_qwen_fla_npu(qwen: nn.Module) -> int:
         linear_attn.causal_conv1d_fn = causal_conv_wrapper
         linear_attn.chunk_gated_delta_rule = chunk_gdr_wrapper
         count += 1
-    if count == 0:
-        raise RuntimeError("No Qwen3.5 GatedDeltaNet layers found for Ascend FLA")
+    if count != expected:
+        raise RuntimeError(
+            "Incomplete Qwen3.5 Ascend FLA patch: "
+            f"patched {count} of {expected} declared linear-attention layers"
+        )
     print(
         f"[QWEN-FLA-NPU] patched {count} linear-attention layers with FLA "
         "Triton-Ascend causal-conv + GDR",

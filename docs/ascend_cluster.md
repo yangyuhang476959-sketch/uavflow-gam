@@ -33,26 +33,35 @@ npu-smi info
 find /usr/local/Ascend -maxdepth 3 -type f -name set_env.sh -print
 ```
 
-Then clone this repository and run the setup. In a vendor image where the
-validated torch/torch_npu pair is already in system site-packages:
+Then clone this repository. The default `reference` mode is strict: it requires
+the exact Python/CANN/core triplet above and never asks pip to choose a torch
+stack. Supply the three architecture-matched wheels when they are not already
+present in the isolated environment:
 
 ```bash
 git clone https://github.com/yangyuhang476959-sketch/uavflow-gam.git
 cd uavflow-gam
 export CANN_ROOT=/usr/local/Ascend/ascend-toolkit/latest
+export CANN_VERSION=9.0.0  # only after verifying this selected installation
 export ASCEND_VENV=$PWD/.venv-ascend
-bash scripts/setup_ascend_cluster.sh
-```
-
-For a clean node, provide local, architecture-matched vendor wheels explicitly:
-
-```bash
-export ASCEND_INHERIT_VENDOR_PACKAGES=0
 export TORCH_WHEEL=/shared/wheels/torch-2.7.1+cpu-cp311-linux_aarch64.whl
 export TORCH_NPU_WHEEL=/shared/wheels/torch_npu-2.7.1.post4-cp311-linux_aarch64.whl
 export TORCHVISION_WHEEL=/shared/wheels/torchvision-0.22.1-cp311-manylinux_2_28_aarch64.whl
 bash scripts/setup_ascend_cluster.sh
 ```
+
+Only when cluster driver/firmware policy makes the exact stack impossible,
+select the administrator runtime explicitly. This mode inherits and snapshots
+the core triplet; project installation uses `--no-deps` and cannot replace it:
+
+```bash
+export ASCEND_STACK_MODE=vendor
+export CANN_ROOT=/administrator/selected/cann
+bash scripts/setup_ascend_cluster.sh
+```
+
+If more than one CANN installation is discovered, setup/runtime both stop and
+list every candidate rather than selecting the lexicographically first one.
 
 `pycolmap` is intentionally isolated in
 `requirements-optional-geometry.txt`; it is not needed for the training path
@@ -102,7 +111,7 @@ Expected key output on the validated 910B2 node:
 torch 2.7.1+cpu
 torch_npu 2.7.1.post4
 [QWEN-FLA-NPU] patched 18 linear-attention layers with FLA Triton-Ascend causal-conv + GDR
-AMP grad scaler: enabled=False dtype=bf16
+AMP grad scaler: policy=auto enabled=False dtype=bf16
 [BENCH] steps=11-50 count=40 ... mean=1.37...s/step throughput=...
 ```
 

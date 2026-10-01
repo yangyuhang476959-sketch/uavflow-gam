@@ -142,19 +142,41 @@ def autocast_context(
 
 
 def grad_scaler_enabled(
-    device_type: str, *, amp_enabled: bool, dtype_name: str = "auto"
+    device_type: str, *, amp_enabled: bool, dtype_name: str = "auto",
+    policy: str | None = None,
 ) -> bool:
-    """Use loss scaling only for FP16; BF16 has enough exponent range."""
-    if not amp_enabled or device_type == "cpu":
+    """Resolve the production default or an explicit numerical A/B policy."""
+    value = (policy if policy is not None else os.environ.get(
+        "UAVFLOW_GRAD_SCALER", "auto"
+    )).strip().lower()
+    if value not in {"auto", "on", "off"}:
+        raise ValueError(
+            "UAVFLOW_GRAD_SCALER must be auto, on, or off; "
+            f"got {value!r}."
+        )
+    if not amp_enabled:
+        if value == "on":
+            raise ValueError("UAVFLOW_GRAD_SCALER=on requires AMP to be enabled")
+        return False
+    if value == "off":
+        return False
+    if value == "on":
+        if device_type not in {"cuda", "npu"}:
+            raise ValueError(
+                "UAVFLOW_GRAD_SCALER=on is supported only on CUDA or NPU"
+            )
+        return True
+    if device_type == "cpu":
         return False
     return amp_dtype(dtype_name, device_type) == torch.float16
 
 
 def create_grad_scaler(
-    device_type: str, *, enabled: bool, dtype_name: str = "auto"
+    device_type: str, *, enabled: bool, dtype_name: str = "auto",
+    policy: str | None = None,
 ):
     scaler_enabled = grad_scaler_enabled(
-        device_type, amp_enabled=enabled, dtype_name=dtype_name
+        device_type, amp_enabled=enabled, dtype_name=dtype_name, policy=policy
     )
     if device_type == "npu" and scaler_enabled:
         bootstrap_accelerator_plugin()

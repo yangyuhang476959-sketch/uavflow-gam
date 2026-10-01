@@ -11,38 +11,61 @@ FLA_COMMIT="${FLA_COMMIT:-9f38d24980c46d46bd38614e743cdacd21906578}"
 DA3_DIR="${DA3_DIR:-${ROOT}/Depth-Anything-3}"
 DA3_REPO="${DA3_REPO:-https://github.com/ByteDance-Seed/Depth-Anything-3.git}"
 DA3_COMMIT="${DA3_COMMIT:-2c21ea849ceec7b469a3e62ea0c0e270afc3281a}"
-CONSTRAINTS="${ROOT}/constraints-ascend.txt"
+PROJECT_CONSTRAINTS="${ROOT}/constraints-ascend.txt"
+REFERENCE_CONSTRAINTS="${ROOT}/constraints-ascend-reference.txt"
+ASCEND_STACK_MODE="${ASCEND_STACK_MODE:-reference}"
+if [[ "${ASCEND_STACK_MODE}" != reference && "${ASCEND_STACK_MODE}" != vendor ]]; then
+  echo "ASCEND_STACK_MODE must be reference or vendor" >&2; exit 2
+fi
 
 echo '== Phase 1: platform inventory =='
 uname -a
 ARCH="$(uname -m)"
 echo "architecture=${ARCH}"
 "${PYTHON311}" --version
+command -v python3 >/dev/null && python3 --version || true
+command -v python3.11 >/dev/null && python3.11 --version || true
 "${PYTHON311}" -c 'import platform; print(platform.machine()); print(platform.platform())'
 ldd --version | head -n1
 command -v npu-smi >/dev/null && npu-smi info || true
 find /usr/local/Ascend -maxdepth 3 -type f -name set_env.sh -print 2>/dev/null || true
+"${PYTHON311}" - <<'PY' || true
+for name in ('torch', 'torch_npu', 'torchvision'):
+    try:
+        module = __import__(name)
+        print('existing', name, getattr(module, '__version__', 'unknown'))
+    except Exception as exc:
+        print('existing', name, 'UNAVAILABLE', repr(exc))
+PY
 if [[ "${ARCH}" != "aarch64" && "${ARCH}" != "x86_64" ]]; then
   echo "Unsupported/untested architecture: ${ARCH}" >&2; exit 2
 fi
-if [[ -n "${CANN_ROOT:-}" && -f "${CANN_ROOT}/set_env.sh" ]]; then
-  CANN_ENV="${CANN_ROOT}/set_env.sh"
-elif [[ -n "${CANN_ROOT:-}" && -f "${CANN_ROOT}/bin/set_env.sh" ]]; then
-  CANN_ENV="${CANN_ROOT}/bin/set_env.sh"
-else
-  CANN_ENV="$(find /usr/local/Ascend -maxdepth 3 -type f -name set_env.sh 2>/dev/null | sort | head -n1)"
-fi
-[[ -n "${CANN_ENV:-}" && -f "${CANN_ENV}" ]] || {
-  echo 'CANN set_env.sh not found; set CANN_ROOT.' >&2; exit 2; }
+# shellcheck disable=SC1091
+source "${ROOT}/scripts/ascend_cann.sh"
+CANN_ENV="$(uavflow_select_cann_env)"
 # shellcheck disable=SC1090
 source "${CANN_ENV}"
 echo "Using CANN environment: ${CANN_ENV}"
+if [[ "${ASCEND_STACK_MODE}" == reference ]]; then
+  [[ "${ARCH}" == aarch64 ]] || {
+    echo 'Reference mode requires the validated Linux aarch64 platform; use ASCEND_STACK_MODE=vendor only when required by the cluster.' >&2; exit 2; }
+  [[ "$("${PYTHON311}" -c 'import platform; print(platform.python_version())')" == 3.11.15 ]] || {
+    echo 'Reference mode requires Python 3.11.15; exact reproduction is not possible. Use an exact interpreter or explicitly select vendor mode.' >&2; exit 2; }
+  CANN_DETECTED_VERSION="${CANN_VERSION:-}"
+  if [[ -z "${CANN_DETECTED_VERSION}" ]]; then
+    CANN_DETECTED_VERSION="$(grep -RhoE '9\.0\.0' "$(dirname "${CANN_ENV}")" "$(dirname "$(dirname "${CANN_ENV}")")" 2>/dev/null | head -n1 || true)"
+  fi
+  [[ "${CANN_DETECTED_VERSION}" == 9.0.0 ]] || {
+    echo 'Reference mode requires confirmed CANN 9.0.0. Set CANN_VERSION=9.0.0 only after checking the selected installation, or explicitly use ASCEND_STACK_MODE=vendor.' >&2; exit 2; }
+else
+  echo 'Vendor fallback selected explicitly; preserving administrator torch stack.'
+fi
 
 echo '== Phase 2: clean Python 3.11 venv =='
 if [[ ! -x "${ASCEND_VENV}/bin/python" ]]; then
-  # Vendor images commonly expose torch_npu only in system site-packages.
-  # Set ASCEND_INHERIT_VENDOR_PACKAGES=0 when local vendor wheels are supplied.
-  if [[ "${ASCEND_INHERIT_VENDOR_PACKAGES:-1}" == 1 ]]; then
+  # Vendor mode deliberately inherits the administrator runtime. Reference
+  # mode is isolated unless explicitly supplied compatible local wheels.
+  if [[ "${ASCEND_STACK_MODE}" == vendor ]]; then
     "${PYTHON311}" -m venv --system-site-packages "${ASCEND_VENV}"
   else
     "${PYTHON311}" -m venv "${ASCEND_VENV}"
@@ -51,18 +74,32 @@ fi
 PY="${ASCEND_VENV}/bin/python"
 "${PY}" -m pip install --upgrade 'pip<26' setuptools wheel
 
-echo '== Phase 3: vendor torch + torch_npu pair =='
+echo "== Phase 3: accelerator stack mode=${ASCEND_STACK_MODE} =="
 if [[ -n "${TORCH_WHEEL:-}" || -n "${TORCH_NPU_WHEEL:-}" ]]; then
   [[ -f "${TORCH_WHEEL:-}" && -f "${TORCH_NPU_WHEEL:-}" ]] || {
     echo 'Set both TORCH_WHEEL and TORCH_NPU_WHEEL to local compatible wheels.' >&2; exit 3; }
   "${PY}" -m pip install --no-deps "${TORCH_WHEEL}" "${TORCH_NPU_WHEEL}"
 fi
-"${PY}" - <<'PY'
+if [[ "${ASCEND_STACK_MODE}" == reference ]]; then
+  if ! "${PY}" - <<'PY'
 import torch, torch_npu
 assert torch.__version__.split('+')[0] == '2.7.1', torch.__version__
 assert torch_npu.__version__ == '2.7.1.post4', torch_npu.__version__
-print('torch', torch.__version__, 'torch_npu', torch_npu.__version__)
+print('reference torch', torch.__version__, 'torch_npu', torch_npu.__version__)
 PY
+  then
+    echo 'Exact torch 2.7.1+cpu / torch_npu 2.7.1.post4 is unavailable. Supply compatible local wheels; do not let pip guess. If host policy forbids it, explicitly rerun with ASCEND_STACK_MODE=vendor.' >&2
+    exit 3
+  fi
+else
+  if [[ -n "${TORCH_WHEEL:-}${TORCH_NPU_WHEEL:-}${TORCHVISION_WHEEL:-}" ]]; then
+    echo 'Do not supply core wheels in ASCEND_STACK_MODE=vendor' >&2; exit 3
+  fi
+  "${PY}" - <<'PY'
+import torch, torch_npu
+print('vendor torch', torch.__version__, 'torch_npu', torch_npu.__version__)
+PY
+fi
 
 echo '== Phase 4: architecture-matched torchvision =='
 if [[ -n "${TORCHVISION_WHEEL:-}" ]]; then
@@ -73,10 +110,11 @@ if [[ -n "${TORCHVISION_WHEEL:-}" ]]; then
   esac
   "${PY}" -m pip install --no-deps "${TORCHVISION_WHEEL}"
 fi
-"${PY}" - <<'PY'
+"${PY}" - <<PY
 import torch, torchvision
-assert torch.__version__.split('+')[0] == '2.7.1'
-assert torchvision.__version__.split('+')[0] == '0.22.1', torchvision.__version__
+if "${ASCEND_STACK_MODE}" == "reference":
+    assert torch.__version__.split('+')[0] == '2.7.1'
+    assert torchvision.__version__.split('+')[0] == '0.22.1', torchvision.__version__
 print('torchvision', torchvision.__version__)
 PY
 
@@ -95,12 +133,14 @@ PY
 echo '== Phase 5/6: pinned scientific/HF stack and project requirements =='
 # Establish the protected versions first. Constraints then prevent timm or
 # torchvision dependencies from taking ownership of the torch decision.
-"${PY}" -m pip install -c "${CONSTRAINTS}" \
+"${PY}" -m pip install -c "${PROJECT_CONSTRAINTS}" \
   numpy==1.26.4 scipy==1.15.3 transformers==5.5.4 huggingface-hub==1.10.1
 core_snapshot > /tmp/uavflow_core_before.txt
-"${PY}" -m pip install --dry-run -c "${CONSTRAINTS}" \
-  --upgrade-strategy only-if-needed -r "${ROOT}/requirements-ascend.txt"
-"${PY}" -m pip install -c "${CONSTRAINTS}" --upgrade-strategy only-if-needed \
+# requirements-ascend.txt is a complete project lock. --no-deps is deliberate:
+# pip is forbidden from resolving or replacing the accelerator triplet.
+"${PY}" -m pip install --dry-run --no-deps -c "${PROJECT_CONSTRAINTS}" \
+  -r "${ROOT}/requirements-ascend.txt"
+"${PY}" -m pip install --no-deps -c "${PROJECT_CONSTRAINTS}" \
   -r "${ROOT}/requirements-ascend.txt"
 core_snapshot > /tmp/uavflow_core_after.txt
 diff -u /tmp/uavflow_core_before.txt /tmp/uavflow_core_after.txt

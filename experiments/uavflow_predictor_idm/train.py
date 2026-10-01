@@ -32,6 +32,7 @@ from experiments.uavflow_predictor_idm.runtime import (
     lr_scale,
     manual_seed_all,
     max_memory_allocated_gb,
+    profile_phase,
     StepBenchmark,
     step_generator,
 )
@@ -573,10 +574,12 @@ def main() -> None:
     optimizer = torch.optim.AdamW(
         optimizer_groups, weight_decay=float(cfg.training.weight_decay)
     )
+    scaler_policy = os.environ.get("UAVFLOW_GRAD_SCALER", "auto").strip().lower()
     scaler = create_grad_scaler(
         device.type,
         enabled=bool(cfg.training.amp and device.type in {"cuda", "npu"}),
         dtype_name=str(cfg.training.get("amp_dtype", "auto")),
+        policy=scaler_policy,
     )
     if rank == 0:
         resolved_amp_dtype = (
@@ -594,7 +597,8 @@ def main() -> None:
         )
         print(
             "AMP grad scaler: "
-            f"enabled={grad_scaler_enabled(device.type, amp_enabled=bool(cfg.training.amp), dtype_name=str(cfg.training.get('amp_dtype', 'auto')))} "
+            f"policy={scaler_policy} "
+            f"enabled={grad_scaler_enabled(device.type, amp_enabled=bool(cfg.training.amp), dtype_name=str(cfg.training.get('amp_dtype', 'auto')), policy=scaler_policy)} "
             f"dtype={resolved_amp_dtype}",
             flush=True,
         )
