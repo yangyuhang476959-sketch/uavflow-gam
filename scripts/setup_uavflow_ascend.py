@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Install UAV-Flow Python dependencies into a vendor Ascend PyTorch image.
+"""Legacy lightweight installer for a pre-provisioned Ascend image.
 
-This script deliberately does not install or upgrade torch/torchvision/
-torch_npu. Those three packages must match the node's CANN driver and are
-supplied by the Ascend image. Replacing any one of them with a generic pip
-wheel is a common source of binary/runtime failures.
+For a new service node use ``scripts/setup_ascend_cluster.sh``. This helper
+remains for vendor images whose torch/torch_npu/torchvision triplet is already
+correct; it uses the same constraints and cannot replace that core stack.
 """
 from __future__ import annotations
 
@@ -58,7 +57,12 @@ def main() -> None:
     if not args.skip_python_deps:
         # Never pass an index/requirement containing torch here: the vendor
         # image owns the torch/torchvision/torch_npu compatibility triplet.
-        run(py, "-m", "pip", "install", "-r", str(ROOT / "requirements-uavflow.txt"))
+        run(
+            py, "-m", "pip", "install",
+            "-c", str(ROOT / "constraints-ascend.txt"),
+            "--upgrade-strategy", "only-if-needed",
+            "-r", str(ROOT / "requirements-ascend.txt"),
+        )
 
     da3 = ROOT / "Depth-Anything-3"
     if not (da3 / ".git").is_dir():

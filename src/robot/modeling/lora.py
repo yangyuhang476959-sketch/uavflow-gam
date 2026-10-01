@@ -37,7 +37,16 @@ class LoRALinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         base_out = self.base(x)
-        lora_x = self.dropout(x).to(dtype=self.lora_A.dtype)
+        lora_x = self.dropout(x)
+        try:
+            autocast_enabled = torch.is_autocast_enabled(x.device.type)
+        except TypeError:  # Compatibility with older PyTorch APIs.
+            autocast_enabled = torch.is_autocast_enabled()
+        # Under CUDA/NPU AMP, Linear already selects the compute dtype.  A
+        # per-forward explicit cast creates redundant Cast/ToCopy kernels on
+        # Ascend.  Retain the cast only for non-autocast callers so this small
+        # utility remains dtype-safe in CPU tests and standalone inference.
+        if not autocast_enabled and lora_x.dtype != self.lora_A.dtype:
+            lora_x = lora_x.to(dtype=self.lora_A.dtype)
         lora_out = F.linear(F.linear(lora_x, self.lora_A), self.lora_B)
         return base_out + lora_out.to(dtype=base_out.dtype) * self.scaling
-

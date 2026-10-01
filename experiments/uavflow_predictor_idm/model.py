@@ -26,7 +26,7 @@ from .geometry_architectures import (
     GEOMETRY_ARCHITECTURES, DUAL_ARCHITECTURES, DirectCurrentActionSeed,
     DualActionFusion, select_dual_view,
 )
-from .runtime import rand_on_device
+from .runtime import profile_phase, rand_on_device
 
 
 class PatchMotionStopHead(nn.Module):
@@ -1336,16 +1336,17 @@ class UAVFlowPredictorIDM(nn.Module):
         action_slot_seed = None
         oft_direct_prediction = None
         if self.parallel_vla_gfm_enabled:
-            if self.oft_action_tokenizer is not None:
-                oft_output = self.oft_action_tokenizer(lang_feats, lang_padding_mask)
-                action_slot_seed = oft_output["plan_tokens"]
-                oft_direct_prediction = oft_output["direct_actions_norm"][:, None]
-            else:
-                if self.semantic_geometry_action is None:
-                    raise RuntimeError("parallel semantic action initializer is missing")
-                action_slot_seed = self.semantic_geometry_action(
-                    lang_feats, lang_padding_mask
-                )
+            with profile_phase("R1/core/semantic_action_init"):
+                if self.oft_action_tokenizer is not None:
+                    oft_output = self.oft_action_tokenizer(lang_feats, lang_padding_mask)
+                    action_slot_seed = oft_output["plan_tokens"]
+                    oft_direct_prediction = oft_output["direct_actions_norm"][:, None]
+                else:
+                    if self.semantic_geometry_action is None:
+                        raise RuntimeError("parallel semantic action initializer is missing")
+                    action_slot_seed = self.semantic_geometry_action(
+                        lang_feats, lang_padding_mask
+                    )
         if self.vlm_action_seed_enabled:
             if self.vlm_action_seed is None:
                 raise RuntimeError("VLM action seed is enabled but its projector is missing.")
@@ -1385,7 +1386,10 @@ class UAVFlowPredictorIDM(nn.Module):
             )
         else:
             role = {} if self.prediction_roles is None else {"prediction_role": self.prediction_roles[1]}
-            future, direct_action_tokens = self.rollout_shallow(observed_shallow, **rollout_kwargs, **role)
+            with profile_phase("R1/core/future_predictor"):
+                future, direct_action_tokens = self.rollout_shallow(
+                    observed_shallow, **rollout_kwargs, **role
+                )
             if self.prediction_roles is not None:
                 # Shared Predictor weights, two target-role-conditioned passes.
                 predicted_current, current_action_tokens = self.rollout_shallow(
@@ -1425,16 +1429,17 @@ class UAVFlowPredictorIDM(nn.Module):
                 # deep pass.  Each corresponding deep layer becomes geometry
                 # memory for the K action tokens that already passed through
                 # the Future Predictor with the predicted future features.
-                current_geometry_features = self.da3.propagate_shallow_visual_slots_grad(
-                    observed_shallow,
-                    gradient_checkpointing=self.deep_gradient_checkpointing,
-                    return_layer_patches=self.parallel_current_geometry_read_enabled,
-                    layer_patch_indices=(
-                        self.current_geometry_layer_indices
-                        if self.parallel_current_geometry_read_enabled else None
-                    ),
-                    layer_patch_mode=self.current_geometry_patch_mode,
-                )
+                with profile_phase("R1/core/current_geometry_bank"):
+                    current_geometry_features = self.da3.propagate_shallow_visual_slots_grad(
+                        observed_shallow,
+                        gradient_checkpointing=self.deep_gradient_checkpointing,
+                        return_layer_patches=self.parallel_current_geometry_read_enabled,
+                        layer_patch_indices=(
+                            self.current_geometry_layer_indices
+                            if self.parallel_current_geometry_read_enabled else None
+                        ),
+                        layer_patch_mode=self.current_geometry_patch_mode,
+                    )
                 if self.parallel_current_geometry_read_enabled:
                     if self.current_geometry_read is None:
                         raise RuntimeError("Parallel Current Geometry read has no CA module")
@@ -1460,14 +1465,15 @@ class UAVFlowPredictorIDM(nn.Module):
                 deep_kwargs["dual_state_attention"] = (
                     "action_bridge" if self.geometry_architecture == "dual_action_bridge" else "full"
                 )
-            deep_joint_features = self.da3.propagate_shallow_with_actions_grad(
-                deep_visuals,
-                deep_actions,
-                decode_visuals=self.depth_decode_enabled,
-                gradient_checkpointing=self.deep_gradient_checkpointing,
-                deep_temporal_causal_mask=True,
-                **deep_kwargs,
-            )
+            with profile_phase("R1/core/da3_joint_deep"):
+                deep_joint_features = self.da3.propagate_shallow_with_actions_grad(
+                    deep_visuals,
+                    deep_actions,
+                    decode_visuals=self.depth_decode_enabled,
+                    gradient_checkpointing=self.deep_gradient_checkpointing,
+                    deep_temporal_causal_mask=True,
+                    **deep_kwargs,
+                )
             deep_tokens = deep_joint_features.get("action_tokens")
             if not isinstance(deep_tokens, torch.Tensor):
                 raise RuntimeError("DA3 joint propagation did not return action_tokens.")
@@ -1515,11 +1521,12 @@ class UAVFlowPredictorIDM(nn.Module):
         if self.parallel_vla_gfm_enabled:
             if self.parallel_action_head is None:
                 raise RuntimeError("dual_vla_gfm parallel action head is missing")
-            direct_actions_norm = (
-                oft_direct_prediction
-                if self.parallel_vla_gfm_mode == "oft_direct"
-                else self.parallel_action_head(direct_action_tokens)
-            )
+            with profile_phase("R1/core/direct_action_decode"):
+                direct_actions_norm = (
+                    oft_direct_prediction
+                    if self.parallel_vla_gfm_mode == "oft_direct"
+                    else self.parallel_action_head(direct_action_tokens)
+                )
         elif self.direct_action_enabled and not self.causal_action_decoder_enabled:
             if direct_action_tokens is None:
                 raise RuntimeError("Direct action branch requires predicted_action_tokens.")
@@ -1528,16 +1535,17 @@ class UAVFlowPredictorIDM(nn.Module):
             direct_actions_norm = self.direct_action_head(direct_action_tokens)
         refine_actions_norm = None
         if self.parallel_vla_gfm_enabled:
-            if self.parallel_action_decode_mode == "geometry_residual":
-                if self.parallel_action_correction_head is None:
-                    raise RuntimeError("Geometry-residual decode has no correction head")
-                geometry_action_residual = self.parallel_action_correction_head(
-                    refined_action_tokens
-                )
-                refine_actions_norm = direct_actions_norm + geometry_action_residual
-            else:
-                geometry_action_residual = None
-                refine_actions_norm = self.parallel_action_head(refined_action_tokens)
+            with profile_phase("R1/core/geometry_action_decode"):
+                if self.parallel_action_decode_mode == "geometry_residual":
+                    if self.parallel_action_correction_head is None:
+                        raise RuntimeError("Geometry-residual decode has no correction head")
+                    geometry_action_residual = self.parallel_action_correction_head(
+                        refined_action_tokens
+                    )
+                    refine_actions_norm = direct_actions_norm + geometry_action_residual
+                else:
+                    geometry_action_residual = None
+                    refine_actions_norm = self.parallel_action_head(refined_action_tokens)
         elif self.causal_action_decoder_enabled:
             decoder_tokens = (
                 refined_action_tokens

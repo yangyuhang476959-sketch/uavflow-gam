@@ -76,7 +76,7 @@ only through environment variables when the node differs. For a cheap launch
 audit, append `--max-trajectories 20 --stage stage1` and set
 `STAGE1_EPOCHS=1`.
 
-The same entrypoints run on Huawei Ascend by exporting
-`UAVFLOW_ACCELERATOR=npu` and `DEVICE_IDS=0,1,2,3,4,5,6,7`. See
-`docs/ASCEND_TRAINING.md` for the vendor-runtime requirement, HCCL/AMP
-defaults, full audit and mandatory smoke test.
+The same entrypoints run on Huawei Ascend after sourcing
+`scripts/ascend_env.sh` and exporting `DEVICE_IDS=0,1,2,3,4,5,6,7`. See
+`docs/ascend_cluster.md` for the exact 910B2/CANN environment, FLA setup,
+full audit, mandatory smoke test, and the 50-step R1 benchmark.

@@ -17,6 +17,7 @@ from datetime import datetime
 from pathlib import Path
 
 from experiments.uavflow_remote_ablation.matrix_v2 import EXPERIMENTS, overrides
+from experiments.uavflow_predictor_idm.runtime import env_truthy
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -63,12 +64,31 @@ def set_args(values: list[str] | tuple[str, ...]) -> list[str]:
     return result
 
 
+def benchmark_missing_checkpoint_allowed(
+    *, stage: str, requested_stage: str, skip_final_checkpoint: bool
+) -> bool:
+    """Only an explicit Stage-1-only benchmark may finish without weights."""
+    return bool(
+        skip_final_checkpoint and stage == "stage1" and requested_stage == "stage1"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("experiment", choices=tuple(EXPERIMENTS))
     parser.add_argument("--stage", choices=("both", "stage1", "stage2"), default="both")
     parser.add_argument("--max-trajectories", type=int)
+    parser.add_argument(
+        "--set", action="append", default=[], metavar="KEY=VALUE",
+        help="Additional OmegaConf override for diagnostics/benchmarks.",
+    )
     args = parser.parse_args()
+    skip_final_checkpoint = env_truthy("UAVFLOW_SKIP_FINAL_CHECKPOINT")
+    if skip_final_checkpoint and args.stage != "stage1":
+        raise ValueError(
+            "UAVFLOW_SKIP_FINAL_CHECKPOINT=1 is benchmark-only and requires "
+            "--stage stage1; Stage 2 must have a real Stage-1 checkpoint."
+        )
 
     python = Path(os.environ.get("PYTHON_BIN", sys.executable)).resolve()
     sim = required_path("UAVFLOW_SIM_ROOT", ROOT / "data_remote/UAV-Flow-Sim")
@@ -133,6 +153,7 @@ def main() -> None:
             # TorchInductor/Triton FlexAttention is CUDA-specific. The matrix
             # does not require it, so keep the dense portable path on NPU.
             "UAVFLOW_DISABLE_FLEX_ATTENTION": "1",
+            "UAVFLOW_QWEN_FLA_NPU": env.get("UAVFLOW_QWEN_FLA_NPU", "1"),
         })
     else:
         env.update({
@@ -169,6 +190,15 @@ def main() -> None:
         ),
         f"dataset.split_file={split}",
     ]
+    if requested_accelerator == "npu":
+        # Validated 910B2 64GB production profile: BF16 without activation
+        # checkpointing fits at batch=4 and is materially faster. R1 method
+        # semantics (both depths, trainable Current Bank/read, correction)
+        # remain unchanged.
+        common += [
+            "model.gradient_checkpointing=false",
+            "training.amp_dtype=bf16",
+        ]
     if args.max_trajectories is not None:
         common.append(f"dataset.max_trajectories={args.max_trajectories}")
 
@@ -185,9 +215,10 @@ def main() -> None:
             ], cwd=ROOT, env=env, check=True)
 
     experiment_root = output_root / args.experiment
-    variant = list(overrides(args.experiment))
+    variant = list(overrides(args.experiment)) + list(args.set)
+    benchmark_end_step = int(os.environ.get("UAVFLOW_BENCH_END_STEP", "0") or 0)
 
-    def run_stage(stage: str, init: Path | None = None) -> Path:
+    def run_stage(stage: str, init: Path | None = None) -> Path | None:
         stage_dir = experiment_root / stage
         success = stage_dir / "_SUCCESS"
         if success.is_file() and success.read_text().strip():
@@ -204,8 +235,17 @@ def main() -> None:
             stage_values += [
                 "model.stop_head_enabled=false", "loss.stop_weight=0.0",
                 "training.lr_schedule=constant", "training.warmup_steps=0",
-                f"training.max_epochs={stage1_epochs}",
             ]
+            if benchmark_end_step > 0:
+                stage_values += [
+                    "training.max_epochs=0",
+                    f"training.max_steps={benchmark_end_step}",
+                    f"training.scheduler_total_steps={benchmark_end_step}",
+                    "training.eval_every=0", "training.save_every=0",
+                    "training.save_latest_every=0", "training.save_every_epochs=0",
+                ]
+            else:
+                stage_values.append(f"training.max_epochs={stage1_epochs}")
         else:
             stage_values += [
                 # Stage 2 alone receives five additional fully terminal
@@ -242,6 +282,18 @@ def main() -> None:
             else latest_checkpoint(stage_dir)
         )
         if final is None:
+            if benchmark_missing_checkpoint_allowed(
+                stage=stage,
+                requested_stage=args.stage,
+                skip_final_checkpoint=skip_final_checkpoint,
+            ):
+                benchmark_marker = stage_dir / "_BENCHMARK_COMPLETE"
+                benchmark_marker.write_text("status=benchmark_complete\n")
+                with state.open("a") as stream:
+                    stream.write(
+                        f"status=benchmark_complete\nend={datetime.now().isoformat()}\n"
+                    )
+                return None
             raise RuntimeError(f"No checkpoint produced in {stage_dir}")
         success.write_text(str(final) + "\n")
         with state.open("a") as stream:

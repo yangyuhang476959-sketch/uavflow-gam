@@ -206,7 +206,7 @@ training:
   min_lr_ratio: 0.05
   grad_clip: 1.0
   amp: true
-  # auto selects BF16 on both NVIDIA and the target Atlas 910B1 stack so the
+  # auto selects BF16 on both NVIDIA and the target Ascend 910B2 stack so the
   # matrix does not introduce accelerator-specific numeric precision.
   amp_dtype: auto
   log_every: 25

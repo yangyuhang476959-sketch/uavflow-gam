@@ -12,6 +12,8 @@ wandb/
 .env
 server.env
 .venv/
+.venv-ascend/
+.ascend/
 modelscope_upload.log
 
 # Raw UAV-Flow and derived depth data are published separately on HF.

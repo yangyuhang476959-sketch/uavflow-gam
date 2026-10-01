@@ -33,6 +33,9 @@ and its application order.
 
 ## Remote experiment quick start
 
+For Huawei Ascend 910B2, use the pinned environment, smoke test, and complete
+R1 benchmark in [docs/ascend_cluster.md](docs/ascend_cluster.md).
+
 The publication-ready setup, download, audit, exact matrix and ten independent
 multi-GPU commands are in [`docs/REMOTE_TRAINING.md`](docs/REMOTE_TRAINING.md).
 Architecture details are in

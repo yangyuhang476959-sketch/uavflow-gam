@@ -21,13 +21,18 @@ from tqdm import tqdm
 
 from experiments.uavflow_predictor_idm.runtime import (
     apply_overrides,
+    amp_dtype,
     bootstrap_accelerator_plugin,
     configure_accelerator,
+    create_npu_profiler,
     create_grad_scaler,
     distributed_info,
+    env_truthy,
+    grad_scaler_enabled,
     lr_scale,
     manual_seed_all,
     max_memory_allocated_gb,
+    StepBenchmark,
     step_generator,
 )
 
@@ -569,8 +574,30 @@ def main() -> None:
         optimizer_groups, weight_decay=float(cfg.training.weight_decay)
     )
     scaler = create_grad_scaler(
-        device.type, enabled=bool(cfg.training.amp and device.type in {"cuda", "npu"})
+        device.type,
+        enabled=bool(cfg.training.amp and device.type in {"cuda", "npu"}),
+        dtype_name=str(cfg.training.get("amp_dtype", "auto")),
     )
+    if rank == 0:
+        resolved_amp_dtype = (
+            str(cfg.training.get("amp_dtype", "auto"))
+            if not bool(cfg.training.amp)
+            else str(
+                {
+                    torch.float16: "fp16",
+                    torch.bfloat16: "bf16",
+                }.get(
+                    amp_dtype(str(cfg.training.get("amp_dtype", "auto")), device.type),
+                    "unknown",
+                )
+            )
+        )
+        print(
+            "AMP grad scaler: "
+            f"enabled={grad_scaler_enabled(device.type, amp_enabled=bool(cfg.training.amp), dtype_name=str(cfg.training.get('amp_dtype', 'auto')))} "
+            f"dtype={resolved_amp_dtype}",
+            flush=True,
+        )
     start_step = 0; start_epoch = 0; start_batch = 0
     if args.resume:
         ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
@@ -1144,6 +1171,10 @@ def main() -> None:
                 )
 
     step = start_step; epoch = start_epoch
+    benchmark = StepBenchmark.from_environment(accelerator)
+    profiler = create_npu_profiler(accelerator)
+    if profiler is not None:
+        profiler.start()
     last_saved_step = start_step if args.resume else -1
     pbar = tqdm(total=max_steps, initial=step, disable=rank != 0, desc="uav-predictor-idm")
     model.train()
@@ -1162,6 +1193,8 @@ def main() -> None:
             if step >= max_steps:
                 break
             step += 1
+            if benchmark is not None:
+                benchmark.before_step(step)
             lr_schedule = str(cfg.training.get("lr_schedule", "cosine")).lower()
             if lr_schedule == "constant":
                 lr = float(cfg.training.lr)
@@ -1274,10 +1307,22 @@ def main() -> None:
                 * values["pose_consistency"]
             )
             optimizer.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            grad = torch.nn.utils.clip_grad_norm_(trainable, float(cfg.training.grad_clip))
-            scaler.step(optimizer); scaler.update()
+            with profile_phase("R1/backward"):
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                grad = torch.nn.utils.clip_grad_norm_(
+                    trainable, float(cfg.training.grad_clip)
+                )
+            with profile_phase("R1/optimizer"):
+                scaler.step(optimizer); scaler.update()
+            if profiler is not None:
+                profiler.step()
+            if benchmark is not None:
+                benchmark_line = benchmark.after_step(step)
+                if benchmark_line is not None and rank == 0:
+                    print("\n" + benchmark_line, flush=True)
+                    with (output / "train.log").open("a") as handle:
+                        handle.write(benchmark_line + "\n")
             if rank == 0 and step % int(cfg.training.log_every) == 0:
                 feat_steps = "/".join(
                     f"{float(value):.4f}"
@@ -1528,9 +1573,15 @@ def main() -> None:
             save_numbered_checkpoint(step, epoch, 0)
             last_saved_step = step
     pbar.close()
+    if profiler is not None:
+        profiler.stop()
     # Always persist the exact requested endpoint even when it is not aligned
     # to save_every (for example one physical epoch = 10,886 steps).
-    if rank == 0 and step != last_saved_step:
+    if (
+        rank == 0
+        and step != last_saved_step
+        and not env_truthy("UAVFLOW_SKIP_FINAL_CHECKPOINT")
+    ):
         save_numbered_checkpoint(step, epoch, 0)
     if is_dist:
         dist.destroy_process_group()

@@ -16,10 +16,11 @@ from pathlib import Path
 PINNED_RUNTIME = {
     "numpy": "1.26.4",
     "scipy": "1.15.3",
+    "transformers": "5.5.4",
+    "huggingface-hub": "1.10.1",
     "moviepy": "1.0.3",
     "addict": "2.4.0",
     "plyfile": "1.1.3",
-    "pycolmap": "3.13.0",
     "trimesh": "4.8.3",
     "evo": "1.33.0",
 }
@@ -57,6 +58,13 @@ def verify_runtime(accelerator: str = "auto") -> None:
             ) from exc
         if not torch_npu.npu.is_available():
             raise RuntimeError("torch_npu imported but no Ascend NPU is available")
+        if torch.__version__.split("+")[0] != "2.7.1":
+            raise RuntimeError(f"Ascend requires torch 2.7.1, got {torch.__version__}")
+        actual_npu = getattr(torch_npu, "__version__", "unknown")
+        if actual_npu != "2.7.1.post4":
+            raise RuntimeError(
+                f"Ascend requires torch_npu 2.7.1.post4, got {actual_npu}"
+            )
         device = torch.device("npu:0")
         probe = torch.arange(4, dtype=torch.float32, device=device)
         if float(probe.sum().cpu()) != 6.0:
@@ -83,8 +91,13 @@ def verify_runtime(accelerator: str = "auto") -> None:
         raise RuntimeError("torch.from_numpy interoperability smoke test failed")
     scipy.special.expit(np.asarray([-1.0, 0.0, 1.0], dtype=np.float64))
 
-    for module in ("moviepy.editor", "addict", "plyfile", "pycolmap", "trimesh", "evo"):
+    # pycolmap is offline-reconstruction-only and has no generally available
+    # CPython-3.11 aarch64 wheel. It must not gate the main training runtime.
+    for module in ("moviepy.editor", "addict", "plyfile", "trimesh", "evo"):
         importlib.import_module(module)
+    from robot.modeling.da3_giant_encoder import _install_da3_optional_stubs
+
+    _install_da3_optional_stubs()
     from depth_anything_3.api import DepthAnything3  # noqa: F401
 
     print("runtime smoke: OK")

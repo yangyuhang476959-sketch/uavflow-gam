@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import math
 import os
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
@@ -140,16 +141,126 @@ def autocast_context(
     return torch.amp.autocast(device_type=device_type, dtype=dtype, enabled=True)
 
 
-def create_grad_scaler(device_type: str, *, enabled: bool):
-    if device_type == "npu" and enabled:
+def grad_scaler_enabled(
+    device_type: str, *, amp_enabled: bool, dtype_name: str = "auto"
+) -> bool:
+    """Use loss scaling only for FP16; BF16 has enough exponent range."""
+    if not amp_enabled or device_type == "cpu":
+        return False
+    return amp_dtype(dtype_name, device_type) == torch.float16
+
+
+def create_grad_scaler(
+    device_type: str, *, enabled: bool, dtype_name: str = "auto"
+):
+    scaler_enabled = grad_scaler_enabled(
+        device_type, amp_enabled=enabled, dtype_name=dtype_name
+    )
+    if device_type == "npu" and scaler_enabled:
         bootstrap_accelerator_plugin()
         from torch_npu.npu import amp as npu_amp  # type: ignore
 
         return npu_amp.GradScaler()
     return torch.amp.GradScaler(
         "cuda" if device_type == "cuda" else "cpu",
-        enabled=bool(enabled and device_type == "cuda"),
+        enabled=bool(scaler_enabled and device_type == "cuda"),
     )
+
+
+def synchronize(accelerator: Accelerator) -> None:
+    """Synchronize the active accelerator for benchmark/profiler boundaries."""
+    if accelerator.module is None:
+        return
+    function = getattr(accelerator.module, "synchronize", None)
+    if function is not None:
+        function()
+
+
+def profile_phase(name: str):
+    """Return a zero-cost context unless explicit NPU profiling is enabled."""
+    if not env_truthy("UAVFLOW_PROFILE_NPU"):
+        return nullcontext()
+    return torch.profiler.record_function(name)
+
+
+def create_npu_profiler(accelerator: Accelerator):
+    """Create an opt-in TorchNPU profiler with an absolute-step schedule."""
+    if not env_truthy("UAVFLOW_PROFILE_NPU"):
+        return None
+    if accelerator.kind != "npu":
+        raise RuntimeError("UAVFLOW_PROFILE_NPU=1 requires UAVFLOW_ACCELERATOR=npu")
+    bootstrap_accelerator_plugin()
+    import torch_npu  # type: ignore
+
+    start = int(os.environ.get("UAVFLOW_PROFILE_START_STEP", "1"))
+    active = int(os.environ.get("UAVFLOW_PROFILE_STEPS", "1"))
+    if start < 1 or active < 1:
+        raise ValueError("NPU profiler start/steps must both be positive")
+    destination = os.environ.get("UAVFLOW_PROFILE_DIR", "results/npu_profile")
+    return torch_npu.profiler.profile(
+        activities=[
+            torch_npu.profiler.ProfilerActivity.CPU,
+            torch_npu.profiler.ProfilerActivity.NPU,
+        ],
+        schedule=torch_npu.profiler.schedule(
+            wait=start - 1, warmup=0, active=active, repeat=1
+        ),
+        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(destination),
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=False,
+    )
+
+
+@dataclass
+class StepBenchmark:
+    """Accelerator-synchronized step timer controlled entirely by env vars."""
+
+    accelerator: Accelerator
+    start_step: int
+    end_step: int
+    samples_per_step: int = 1
+    started_at: float | None = None
+
+    @classmethod
+    def from_environment(cls, accelerator: Accelerator) -> "StepBenchmark | None":
+        start = int(os.environ.get("UAVFLOW_BENCH_START_STEP", "0") or 0)
+        end = int(os.environ.get("UAVFLOW_BENCH_END_STEP", "0") or 0)
+        if start <= 0 and end <= 0:
+            return None
+        if start <= 0 or end < start:
+            raise ValueError(
+                "UAVFLOW_BENCH_START_STEP must be positive and END_STEP >= START_STEP"
+            )
+        samples_per_step = int(os.environ.get("GLOBAL_BATCH_SIZE", "1") or 1)
+        if samples_per_step < 1:
+            raise ValueError("GLOBAL_BATCH_SIZE must be positive")
+        return cls(
+            accelerator=accelerator,
+            start_step=start,
+            end_step=end,
+            samples_per_step=samples_per_step,
+        )
+
+    def before_step(self, step: int) -> None:
+        if step == self.start_step:
+            synchronize(self.accelerator)
+            self.started_at = time.perf_counter()
+
+    def after_step(self, step: int) -> str | None:
+        if step != self.end_step:
+            return None
+        if self.started_at is None:
+            raise RuntimeError("Benchmark end reached before its start boundary")
+        synchronize(self.accelerator)
+        elapsed = time.perf_counter() - self.started_at
+        count = self.end_step - self.start_step + 1
+        mean = elapsed / count
+        return (
+            f"[BENCH] steps={self.start_step}-{self.end_step} count={count} "
+            f"elapsed={elapsed:.6f}s mean={mean:.6f}s/step "
+            f"throughput={count * self.samples_per_step / elapsed:.3f} samples/s"
+        )
 
 
 def manual_seed_all(accelerator: Accelerator, seed: int) -> None:
@@ -245,4 +356,17 @@ def lr_scale(step: int, *, warmup: int, total: int, min_ratio: float) -> float:
     progress = min(1.0, (step - warmup) / max(1, total - warmup))
     return float(min_ratio) + (1.0 - float(min_ratio)) * 0.5 * (
         1.0 + math.cos(math.pi * progress)
+    )
+def env_truthy(name: str, default: bool = False) -> bool:
+    """Parse a boolean environment switch without accepting typos silently."""
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off", ""}:
+        return False
+    raise ValueError(
+        f"{name} must be one of 1/0, true/false, yes/no, on/off; got {value!r}."
     )

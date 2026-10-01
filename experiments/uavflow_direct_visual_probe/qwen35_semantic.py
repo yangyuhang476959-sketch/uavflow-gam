@@ -11,12 +11,92 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from contextlib import nullcontext
+import os
 from types import MethodType
 
 import torch
 from PIL import Image
 from torch import nn
 from robot.modeling.lora import LoRALinear
+from experiments.uavflow_predictor_idm.runtime import profile_phase
+
+
+def _qwen_fla_npu_requested() -> bool:
+    value = os.environ.get("UAVFLOW_QWEN_FLA_NPU", "0").strip().lower()
+    if value not in {"", "0", "1", "false", "true", "no", "yes", "off", "on"}:
+        raise ValueError(f"Invalid UAVFLOW_QWEN_FLA_NPU value: {value!r}")
+    enabled = value in {"1", "true", "yes", "on"}
+    accelerator = os.environ.get("UAVFLOW_ACCELERATOR", "auto").strip().lower()
+    return enabled and accelerator in {"npu", "ascend"}
+
+
+def _patch_qwen_fla_npu(qwen: nn.Module) -> int:
+    """Patch only full-sequence GatedDeltaNet kernels with Ascend FLA.
+
+    Imports are intentionally lazy: CUDA/CPU installations never need
+    torch_npu, Triton-Ascend, or the Ascend FLA checkout. Decode/cache keeps
+    HuggingFace's recurrent kernel unchanged.
+    """
+    if not _qwen_fla_npu_requested():
+        return 0
+    try:
+        from fla.modules.convolution import causal_conv1d as fla_causal_conv1d
+        from fla.ops.gated_delta_rule import (
+            chunk_gated_delta_rule as fla_chunk_gated_delta_rule,
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "UAVFLOW_QWEN_FLA_NPU=1 requires the pinned Ascend FLA checkout "
+            "and isolated triton-ascend target on PYTHONPATH."
+        ) from exc
+
+    def causal_conv_wrapper(*, x, weight, bias=None, activation=None, seq_idx=None):
+        if seq_idx is not None:
+            raise ValueError("Ascend FLA training wrapper does not support seq_idx")
+        result = fla_causal_conv1d(
+            x.transpose(1, 2).contiguous(),
+            weight,
+            bias=bias,
+            activation=activation,
+        )
+        if isinstance(result, tuple):
+            result = result[0]
+        return result.transpose(1, 2).contiguous()
+
+    def chunk_gdr_wrapper(
+        q, k, v, *, g, beta, initial_state=None, output_final_state=False,
+        use_qk_l2norm_in_kernel=True, **kwargs,
+    ):
+        # This flag is required for the Qwen3.5 parameterization; omitting it
+        # produced NaNs on the validated 910B2 environment.
+        if not use_qk_l2norm_in_kernel:
+            raise ValueError("Qwen3.5 Ascend FLA requires Q/K L2 normalization")
+        return fla_chunk_gated_delta_rule(
+            q, k, v,
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=True,
+            **kwargs,
+        )
+
+    count = 0
+    for layer in qwen.model.language_model.layers:
+        linear_attn = getattr(layer, "linear_attn", None)
+        if linear_attn is None:
+            continue
+        linear_attn.causal_conv1d_fn = causal_conv_wrapper
+        linear_attn.chunk_gated_delta_rule = chunk_gdr_wrapper
+        count += 1
+    if count == 0:
+        raise RuntimeError("No Qwen3.5 GatedDeltaNet layers found for Ascend FLA")
+    print(
+        f"[QWEN-FLA-NPU] patched {count} linear-attention layers with FLA "
+        "Triton-Ascend causal-conv + GDR",
+        flush=True,
+    )
+    return count
 
 
 def _replace_action_placeholder_embeddings(
@@ -149,6 +229,7 @@ class FrozenQwen35SemanticEncoder(nn.Module):
             dtype=torch.bfloat16,
             attn_implementation=attention_implementation,
         ).eval().requires_grad_(False)
+        self.fla_npu_patched_layers = _patch_qwen_fla_npu(self.qwen)
         self.lora_enabled = bool(lora_enabled)
         if self.lora_enabled:
             target_suffixes = {
@@ -440,22 +521,24 @@ class FrozenQwen35SemanticEncoder(nn.Module):
                 })
             conversations.append(messages)
 
-        inputs = self.processor.apply_chat_template(
-            conversations,
-            # Slot-VLA already contains an explicit assistant message holding
-            # its K action slots.  Every other mode intentionally ends at the
-            # user instruction and gets no assistant special token.
-            add_generation_prompt=False,
-            tokenize=True,
-            return_dict=True,
-            return_tensors="pt",
-            processor_kwargs={"padding": True},
-        )
-        tensor_inputs = {
-            key: value.to(self.device, non_blocking=True)
-            for key, value in inputs.items()
-            if isinstance(value, torch.Tensor)
-        }
+        with profile_phase("QWEN/processor"):
+            inputs = self.processor.apply_chat_template(
+                conversations,
+                # Slot-VLA already contains an explicit assistant message holding
+                # its K action slots.  Every other mode intentionally ends at the
+                # user instruction and gets no assistant special token.
+                add_generation_prompt=False,
+                tokenize=True,
+                return_dict=True,
+                return_tensors="pt",
+                processor_kwargs={"padding": True},
+            )
+        with profile_phase("QWEN/h2d"):
+            tensor_inputs = {
+                key: value.to(self.device, non_blocking=True)
+                for key, value in inputs.items()
+                if isinstance(value, torch.Tensor)
+            }
         input_ids = tensor_inputs["input_ids"]
         language_model = self.qwen.model.language_model
         if self.action_attention_mode == "full_attention_bidir":
@@ -475,12 +558,13 @@ class FrozenQwen35SemanticEncoder(nn.Module):
             else torch.no_grad()
         )
         try:
-            with grad_context:
-                output = self.qwen(
-                    **tensor_inputs,
-                    use_cache=False,
-                    return_dict=True,
-                )
+            with profile_phase("QWEN/model"):
+                with grad_context:
+                    output = self.qwen(
+                        **tensor_inputs,
+                        use_cache=False,
+                        return_dict=True,
+                    )
         finally:
             if hasattr(language_model, "_uav_action_token_mask"):
                 delattr(language_model, "_uav_action_token_mask")

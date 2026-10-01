@@ -1,0 +1,4 @@
+# Offline reconstruction/evaluation only.  pycolmap 3.13.0 has no generally
+# available CPython-3.11 Linux-aarch64 wheel; do not install this file on the
+# training node unless an administrator provides a compatible wheel.
+pycolmap==3.13.0

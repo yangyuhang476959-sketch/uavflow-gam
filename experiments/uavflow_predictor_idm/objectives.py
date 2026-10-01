@@ -15,7 +15,7 @@ from robot.modeling.da3_giant_encoder import DA3GiantEncoder
 from robot.modeling.lora import LoRALinear
 
 from .data import EpisodePoseNormalizer, move_batch
-from .runtime import autocast_context, randn_on_device
+from .runtime import autocast_context, profile_phase, randn_on_device
 from .vlm_conditioning import encode_stage2_condition
 
 
@@ -874,28 +874,32 @@ def forward_batch(
     )
     encoded_steps = needed + int(use_reference)
     flat = encoded_images.reshape(batch_size, encoded_steps * views, *images.shape[3:])
-    with torch.no_grad(), autocast_context(
-        images.device, enabled=bool(amp), dtype_name=amp_dtype
-    ):
-        encoded_shallow = da3.encode_shallow_visual_slots(flat, T=encoded_steps, V=views)["visual_tokens"]
+    with profile_phase("R1/da3_shallow"):
+        with torch.no_grad(), autocast_context(
+            images.device, enabled=bool(amp), dtype_name=amp_dtype
+        ):
+            encoded_shallow = da3.encode_shallow_visual_slots(
+                flat, T=encoded_steps, V=views
+            )["visual_tokens"]
     # Qwen is usually frozen, but the optional OpenVLA-UAV-scale LoRA must
     # retain its graph. The conditioner itself selects no_grad in frozen mode.
-    with autocast_context(
-        images.device, enabled=bool(amp), dtype_name=amp_dtype
-    ):
-        language = encode_stage2_condition(
-            text,
-            list(batch["task_description"]),
-            reference_images=(
-                reference_images if use_reference else images[:, 0]
-            ),
-            current_images=images[:, context_len - 1],
-            pad_to=int(getattr(model_ref.predictor, "language_len", 77)),
-            current_pose=(
-                batch["openvla_prompt_pose"][:, context_len - 1]
-                if "openvla_prompt_pose" in batch else None
-            ),
-        )
+    with profile_phase("R1/qwen_condition"):
+        with autocast_context(
+            images.device, enabled=bool(amp), dtype_name=amp_dtype
+        ):
+            language = encode_stage2_condition(
+                text,
+                list(batch["task_description"]),
+                reference_images=(
+                    reference_images if use_reference else images[:, 0]
+                ),
+                current_images=images[:, context_len - 1],
+                pad_to=int(getattr(model_ref.predictor, "language_len", 77)),
+                current_pose=(
+                    batch["openvla_prompt_pose"][:, context_len - 1]
+                    if "openvla_prompt_pose" in batch else None
+                ),
+            )
     reference_shallow = encoded_shallow[:, :1] if use_reference else None
     shallow_all = encoded_shallow[:, 1:] if use_reference else encoded_shallow
     observed = shallow_all[:, :context_len]
@@ -966,19 +970,20 @@ def forward_batch(
     with autocast_context(
         images.device, enabled=bool(amp), dtype_name=amp_dtype
     ):
-        output = model(
-            observed,
-            reference_shallow=reference_shallow,
-            observed_action_history=history,
-            observed_action_history_valid_mask=history_valid,
-            observed_pose_history=pose_history,
-            reference_pose=reference_pose,
-            stop_pose=stop_pose,
-            lang_feats=language["last_hidden_state"],
-            lang_padding_mask=language["attention_mask"],
-            action_targets_norm=target_norm_full,
-            conditioning_generator=conditioning_generator,
-        )
+        with profile_phase("R1/model_core"):
+            output = model(
+                observed,
+                reference_shallow=reference_shallow,
+                observed_action_history=history,
+                observed_action_history_valid_mask=history_valid,
+                observed_pose_history=pose_history,
+                reference_pose=reference_pose,
+                stop_pose=stop_pose,
+                lang_feats=language["last_hidden_state"],
+                lang_padding_mask=language["attention_mask"],
+                action_targets_norm=target_norm_full,
+                conditioning_generator=conditioning_generator,
+            )
         geometry_architecture = getattr(model_ref, "geometry_architecture", "legacy")
         if geometry_architecture != "legacy" and deep_feature_enabled:
             raise ValueError("New geometry architectures use shallow feature targets; deep distillation is unsupported")
