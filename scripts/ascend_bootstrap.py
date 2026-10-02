@@ -68,6 +68,33 @@ def parse_install_info(path: Path, *, expected_arch: str) -> str:
     return version
 
 
+def parse_global_cann_install_path(path: Path) -> Path:
+    """Read the runfile-selected prefix from ascend_cann_install.info.
+
+    This is deliberately a strict metadata read.  A present but malformed
+    global record must not be treated as permission to run an installer whose
+    effective destination cannot be predicted.
+    """
+    install_paths: list[str] = []
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if "=" not in raw:
+            continue
+        key, value = raw.split("=", 1)
+        if key.strip().lower() != "install_path":
+            continue
+        value = value.strip().strip('"\'')
+        if value:
+            install_paths.append(value)
+    unique = list(dict.fromkeys(install_paths))
+    if not unique:
+        raise ValueError(f"CANN global install record has no Install_Path: {path}")
+    if len(unique) != 1:
+        raise ValueError(
+            f"CANN global install record has conflicting Install_Path values: {path}"
+        )
+    return Path(unique[0]).expanduser()
+
+
 def detect_cann_version(root: Path, *, arch: str) -> tuple[str, Path]:
     """Read only Huawei's official Toolkit install-info metadata."""
     root = root.expanduser()
@@ -244,6 +271,8 @@ def _main() -> None:
     cann_parser = sub.add_parser("cann-version")
     cann_parser.add_argument("root", type=Path)
     cann_parser.add_argument("--arch", required=True)
+    global_cann = sub.add_parser("cann-global-install-path")
+    global_cann.add_argument("metadata", type=Path)
     ops_version = sub.add_parser("cann-ops-version")
     ops_version.add_argument("root", type=Path)
     ops_version.add_argument("--arch", required=True)
@@ -271,6 +300,11 @@ def _main() -> None:
     elif args.command == "cann-version":
         version, metadata = detect_cann_version(args.root, arch=args.arch)
         print(json.dumps({"version": version, "metadata": str(metadata)}))
+    elif args.command == "cann-global-install-path":
+        try:
+            print(parse_global_cann_install_path(args.metadata))
+        except (OSError, ValueError) as exc:
+            raise SystemExit(str(exc)) from exc
     elif args.command == "cann-ops-version":
         version, metadata, package = detect_ops_version(args.root, arch=args.arch)
         print(json.dumps({"version": version, "metadata": str(metadata), "package": package}))

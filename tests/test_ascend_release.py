@@ -35,6 +35,7 @@ from scripts.ascend_bootstrap import (
     miniconda_installer_url,
     normalize_arch,
     online_torch_commands,
+    parse_global_cann_install_path,
     validate_local_wheel,
 )
 
@@ -306,6 +307,28 @@ def test_cann_official_metadata_parser(tmp_path):
     assert selected == metadata
 
 
+def test_global_cann_install_path_parser(tmp_path):
+    metadata = tmp_path / "ascend_cann_install.info"
+    metadata.write_text(
+        "UserName=root\nInstall_Path = \"/usr/local/Ascend/cann\"\n"
+    )
+    assert parse_global_cann_install_path(metadata) == Path("/usr/local/Ascend/cann")
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "UserName=root\n",
+        "Install_Path=/usr/local/Ascend\nInstall_Path=/opt/Ascend\n",
+    ],
+)
+def test_global_cann_install_path_parser_rejects_ambiguous_metadata(tmp_path, content):
+    metadata = tmp_path / "ascend_cann_install.info"
+    metadata.write_text(content)
+    with pytest.raises(ValueError, match="Install_Path"):
+        parse_global_cann_install_path(metadata)
+
+
 def test_cann_metadata_parser_rejects_wrong_architecture(tmp_path):
     metadata = tmp_path / "x86_64-linux/ascend_toolkit_install.info"
     metadata.parent.mkdir(parents=True)
@@ -516,6 +539,24 @@ def test_cann_runfiles_are_checked_before_installation():
     assert source.index('"${ops}" --check') < source.index(
         '"${ops}" --quiet --install'
     )
+
+
+def test_reference_install_preflights_global_cann_record_before_download_or_install():
+    source = (ROOT / "scripts/setup_ascend_cann.sh").read_text()
+    function = source.split("install_reference_cann() {", 1)[1].split("\n}", 1)[0]
+    assert "preflight_reference_cann_install" in function
+    assert function.index("preflight_reference_cann_install") < function.index(
+        "find_package"
+    )
+    preflight = source.split("preflight_reference_cann_install() {", 1)[1].split(
+        "\n}", 1
+    )[0]
+    assert "/etc/Ascend/ascend_cann_install.info" in preflight
+    assert '${HOME}/Ascend/ascend_cann_install.info' in preflight
+    assert "cann-global-install-path" in preflight
+    assert "readlink -m" in preflight
+    assert "will not modify, move, or delete" in preflight
+    assert "rm " not in preflight and "mv " not in preflight
 
 
 def test_pythonless_bootstrap_precedes_cann_and_uses_no_python_helper():

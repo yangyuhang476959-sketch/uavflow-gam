@@ -76,6 +76,19 @@ untouched and a separate reference stack is installed under
 it is reused. Symlink aliases are canonicalized before deciding whether there
 are multiple installations.
 
+Before invoking either reference runfile, setup checks the per-user global
+CANN installer record: `/etc/Ascend/ascend_cann_install.info` for root, or
+`${HOME}/Ascend/ascend_cann_install.info` otherwise. Huawei runfiles may obey
+the `Install_Path` in this record instead of the supplied `--install-path`.
+If a present record selects a path different from `CANN_USER_ROOT`, or cannot
+be parsed unambiguously, reference installation stops before downloading or
+executing the packages. The script never moves, deletes, or rewrites the
+record and never modifies the existing installation. A host image with a
+global CANN 8.5.1 record should therefore use an explicitly selected vendor
+stack, or an administrator-provided isolated node/container; setup will not
+silently replace it. A project-local reference install is attempted only when
+the global record is absent or already selects that exact canonical prefix.
+
 Huawei's official CANN documentation requires both the Toolkit package and
 the hardware-specific ops package. For Atlas A2/Ascend 910B, the exact 9.0.0
 package names used here are:

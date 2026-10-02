@@ -88,8 +88,42 @@ verify_checksum_if_given() {
     echo "${label} SHA-256 mismatch: expected ${expected}, got ${actual}" >&2; return 2; }
 }
 
+preflight_reference_cann_install() {
+  local global_info recorded_path recorded_canonical target_canonical
+  if (( EUID == 0 )); then
+    global_info=/etc/Ascend/ascend_cann_install.info
+  else
+    global_info="${HOME}/Ascend/ascend_cann_install.info"
+  fi
+  [[ -f "${global_info}" ]] || return 0
+
+  if ! recorded_path="$("${HELPER_PY}" "${BOOTSTRAP_PY}" cann-global-install-path "${global_info}")"; then
+    echo "Unsafe CANN reference installation blocked: cannot reliably parse ${global_info}." >&2
+    echo 'Huawei runfiles may obey this global record instead of --install-path.' >&2
+    echo 'The setup script will not modify, move, or delete the record or the existing CANN installation.' >&2
+    echo 'Use ASCEND_STACK_MODE=vendor, or ask the administrator for an isolated node/container.' >&2
+    return 2
+  fi
+  recorded_canonical="$(readlink -m -- "${recorded_path}")"
+  target_canonical="$(readlink -m -- "${CANN_USER_ROOT}")"
+  if [[ "${recorded_canonical}" != "${target_canonical}" ]]; then
+    cat >&2 <<EOF
+Unsafe CANN reference installation blocked.
+Global install record: ${global_info}
+Recorded CANN install path: ${recorded_canonical}
+Requested project-local path: ${target_canonical}
+Huawei runfiles prioritize ascend_cann_install.info and may redirect --install-path.
+The setup script will not modify, move, or delete this record or the existing CANN installation.
+Use ASCEND_STACK_MODE=vendor with the existing stack, or ask the administrator for an isolated node/container.
+EOF
+    return 2
+  fi
+  echo "Global CANN install record already selects the requested prefix: ${target_canonical}"
+}
+
 install_reference_cann() {
   local toolkit_name ops_name toolkit ops toolkit_url ops_url
+  preflight_reference_cann_install
   toolkit_name="$("${HELPER_PY}" "${BOOTSTRAP_PY}" cann-installer-name --arch "${ARCH}")"
   ops_name="$("${HELPER_PY}" "${BOOTSTRAP_PY}" cann-ops-installer-name --arch "${ARCH}")"
   toolkit_url="${CANN_TOOLKIT_URL:-$("${HELPER_PY}" "${BOOTSTRAP_PY}" cann-installer-url --arch "${ARCH}")}"
