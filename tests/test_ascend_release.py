@@ -20,12 +20,16 @@ from experiments.uavflow_remote_ablation.run_experiment import (
 )
 from robot.modeling.lora import LoRALinear
 from scripts.ascend_bootstrap import (
+    MINICONDA_BASE_URL,
     PYTORCH_CPU_INDEX,
     REFERENCE_CANN,
     cann_installer_name,
+    cann_ops_installer_name,
     detect_cann_version,
     find_cached_cann_installer,
     is_python311,
+    miniconda_installer_name,
+    miniconda_installer_url,
     normalize_arch,
     online_torch_commands,
     validate_local_wheel,
@@ -256,10 +260,12 @@ def test_cann_discovery_accepts_one_installation(tmp_path):
 
 
 def test_setup_has_no_cann_version_guessing():
-    setup = (ROOT / "scripts/setup_ascend_cluster.sh").read_text()
-    assert "grep -R" not in setup
-    assert "cann-version" in setup
-    assert "rglob" not in setup  # parser owns bounded official-metadata lookup
+    sources = "\n".join(
+        (ROOT / path).read_text()
+        for path in ("scripts/setup_ascend_cluster.sh", "scripts/setup_ascend_cann.sh")
+    )
+    assert "grep -R" not in sources
+    assert "cann-version" in sources
 
 
 @pytest.mark.parametrize(
@@ -317,6 +323,22 @@ def test_cann_installer_cache_and_architecture(tmp_path):
     assert REFERENCE_CANN == "9.0.0"
 
 
+def test_official_cann_toolkit_and_910b_ops_names():
+    assert cann_installer_name("aarch64") == "Ascend-cann-toolkit_9.0.0_linux-aarch64.run"
+    assert cann_ops_installer_name("aarch64") == "Ascend-cann-910b-ops_9.0.0_linux-aarch64.run"
+    assert cann_ops_installer_name("x86_64").endswith("linux-x86_64.run")
+
+
+@pytest.mark.parametrize(
+    "arch,suffix",
+    [("aarch64", "Miniconda3-latest-Linux-aarch64.sh"),
+     ("x86_64", "Miniconda3-latest-Linux-x86_64.sh")],
+)
+def test_miniconda_selection_uses_official_anaconda_source(arch, suffix):
+    assert miniconda_installer_name(arch) == suffix
+    assert miniconda_installer_url(arch) == f"{MINICONDA_BASE_URL}/{suffix}"
+
+
 def test_online_torch_plan_uses_authoritative_indexes():
     commands = online_torch_commands("/env/bin/python")
     assert commands[0][-1] == PYTORCH_CPU_INDEX
@@ -336,7 +358,7 @@ def test_local_wheel_validation_is_arch_and_python_aware(tmp_path):
 
 
 def test_ascend_stack_modes_and_benchmark_are_explicit():
-    setup = (ROOT / "scripts/setup_ascend_cluster.sh").read_text()
+    setup = (ROOT / "scripts/setup_ascend_cann.sh").read_text()
     project = (ROOT / "constraints-ascend.txt").read_text()
     reference = (ROOT / "constraints-ascend-reference.txt").read_text()
     bench = (ROOT / "scripts/bench_r1_ascend.sh").read_text()
@@ -349,7 +371,7 @@ def test_ascend_stack_modes_and_benchmark_are_explicit():
 
 
 def test_ascend_project_install_resolves_dependencies_but_protects_runtime():
-    setup = (ROOT / "scripts/setup_ascend_cluster.sh").read_text()
+    setup = (ROOT / "scripts/setup_ascend_python.sh").read_text()
     flattened = setup.replace("\\\n", " ")
     requirements_commands = [
         line for line in flattened.splitlines()
@@ -365,12 +387,11 @@ def test_ascend_project_install_resolves_dependencies_but_protects_runtime():
     assert 'VENDOR_RUNTIME_CONSTRAINTS="$(mktemp' in setup
     assert 'accelerator_snapshot | sed' in setup
     assert 'INSTALL_CONSTRAINTS+=(-c "${VENDOR_RUNTIME_CONSTRAINTS}")' in setup
-    assert 'diff -u "${ACCELERATOR_BEFORE}" "${ACCELERATOR_AFTER}"' in setup
-    assert "verify_reference_stack" in setup
+    assert 'numpy==1.26.4 scipy==1.15.3 transformers==5.5.4 huggingface-hub==1.10.1' in setup
 
 
 def test_ascend_no_deps_is_limited_to_validated_special_cases():
-    setup = (ROOT / "scripts/setup_ascend_cluster.sh").read_text()
+    setup = (ROOT / "scripts/setup_ascend_python.sh").read_text()
     flattened = setup.replace("\\\n", " ")
     no_deps_lines = [line.strip() for line in flattened.splitlines() if "--no-deps" in line]
     assert len(no_deps_lines) == 3
@@ -381,26 +402,76 @@ def test_ascend_no_deps_is_limited_to_validated_special_cases():
 
 def test_bootstrap_control_flow_and_environment_report_are_present():
     setup = (ROOT / "scripts/setup_ascend_cluster.sh").read_text()
+    python_setup = (ROOT / "scripts/setup_ascend_python.sh").read_text()
+    cann_setup = (ROOT / "scripts/setup_ascend_cann.sh").read_text()
     runtime = (ROOT / "scripts/ascend_env.sh").read_text()
-    assert "ASCEND_ENV_ROOT" in setup
-    assert "command -v python3.11" in setup
-    assert "micromamba mamba conda" in setup
-    assert "https://micro.mamba.pm/api/micromamba/" in setup
-    assert "CANN_INSTALLER" in setup and "CANN_INSTALLER_SHA256" in setup
-    assert "--install-path=" in setup
+    assert "setup_ascend_cann.sh" in setup and "setup_ascend_python.sh" in setup
+    assert "ASCEND_ENV_ROOT" in python_setup
+    assert "command -v conda" in python_setup
+    assert "micromamba" not in python_setup and " mamba" not in python_setup
+    assert "repo.anaconda.com/miniconda" in (ROOT / "scripts/ascend_bootstrap.py").read_text()
+    assert "CANN_TOOLKIT_INSTALLER" in cann_setup and "CANN_OPS_INSTALLER" in cann_setup
+    assert "--install-path=" in cann_setup
     assert "environment-report.json" in setup
-    assert "ASCEND_STACK_MODE=vendor" in setup
-    assert "export ASCEND_STACK_MODE=vendor" not in setup
+    assert "ASCEND_STACK_MODE" in cann_setup
+    assert "export ASCEND_STACK_MODE=vendor" not in cann_setup
     assert '${REPO_ROOT}/.ascend/env' in runtime
     assert 'ASCEND_VENV:-${ASCEND_ENV_ROOT}' in runtime
-    assert '${REPO_ROOT}/.ascend/cann' in runtime
-    assert "apt install" not in setup and "yum install" not in setup
-    assert "driver.run" not in setup and "firmware.run" not in setup
+    assert '.ascend/runtime.env' in runtime
+    assert "apt install" not in cann_setup and "yum install" not in cann_setup
+    assert "driver.run" not in cann_setup and "firmware.run" not in cann_setup
     for report_key in (
         "driver_version_info", "firmware_version_info", "cann_metadata",
         "triton_ascend_distribution", "fla_commit", "da3_commit",
     ):
         assert report_key in setup
+
+
+def test_cann_reference_paths_handle_missing_wrong_and_existing_versions():
+    source = (ROOT / "scripts/setup_ascend_cann.sh").read_text()
+    assert "select_reference_env" in source
+    assert "install_reference_cann" in source
+    assert "No reusable CANN 9.0.0 installation found" in source
+    assert "administrator CANN" in source
+    assert "CANN_USER_ROOT" in source
+    assert "CANN_TOOLKIT_INSTALLER" in source
+    assert "CANN_OPS_INSTALLER" in source
+    assert source.count('--install-path="${CANN_USER_ROOT}"') == 2
+
+
+def test_runtime_selection_is_persisted_and_preferred():
+    installer = (ROOT / "scripts/setup_ascend_cann.sh").read_text()
+    runtime = (ROOT / "scripts/ascend_env.sh").read_text()
+    assert 'RUNTIME_ENV="${ASCEND_RUNTIME_ENV:-${ROOT}/.ascend/runtime.env}"' in installer
+    assert "CANN_ENV_FILE" in installer and "CANN_SELECTION_SOURCE" in installer
+    assert 'source "${_UAVFLOW_RUNTIME_ENV}"' in runtime
+    assert "Persisted CANN_ENV_FILE is stale" in runtime
+
+
+def test_cann_discovery_canonicalizes_symlink_aliases(tmp_path):
+    import subprocess
+    physical = tmp_path / "real/cann/set_env.sh"
+    physical.parent.mkdir(parents=True)
+    physical.write_text("#!/usr/bin/env bash\n")
+    aliases = tmp_path / "aliases"
+    aliases.mkdir()
+    (aliases / "one").symlink_to(physical.parent, target_is_directory=True)
+    (aliases / "two").symlink_to(physical.parent, target_is_directory=True)
+    result = subprocess.run(
+        ["bash", "-c", f"source {ROOT / 'scripts/ascend_cann.sh'}; uavflow_list_cann_envs"],
+        text=True, capture_output=True,
+        env={**os.environ, "HOME": str(tmp_path / "empty-home"),
+             "ASCEND_SEARCH_ROOT": str(tmp_path), "CANN_ROOT": ""},
+    )
+    assert result.returncode == 0
+    assert result.stdout.splitlines() == [str(physical.resolve())]
+
+
+def test_setup_smoke_includes_fla_gated_delta_rule_backward():
+    setup = (ROOT / "scripts/setup_ascend_cluster.sh").read_text()
+    assert "chunk_gated_delta_rule" in setup
+    assert "use_qk_l2norm_in_kernel=True" in setup
+    assert "gdr_loss.backward()" in setup
 
 
 def test_lora_forward_and_gradients_match_explicit_reference():

@@ -4,6 +4,12 @@ set -e
 
 _UAVFLOW_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export REPO_ROOT="${REPO_ROOT:-$(cd "${_UAVFLOW_SCRIPT_DIR}/.." && pwd)}"
+_UAVFLOW_RUNTIME_ENV="${ASCEND_RUNTIME_ENV:-${REPO_ROOT}/.ascend/runtime.env}"
+if [[ -f "${_UAVFLOW_RUNTIME_ENV}" ]]; then
+  # This generated file contains paths only, never credentials.
+  # shellcheck disable=SC1090
+  source "${_UAVFLOW_RUNTIME_ENV}"
+fi
 export ASCEND_ENV_ROOT="${ASCEND_ENV_ROOT:-${ASCEND_VENV:-${REPO_ROOT}/.ascend/env}}"
 export ASCEND_VENV="${ASCEND_VENV:-${ASCEND_ENV_ROOT}}"
 export TRITON_ASCEND_TARGET="${TRITON_ASCEND_TARGET:-${REPO_ROOT}/.ascend/triton}"
@@ -19,8 +25,15 @@ source "${ASCEND_VENV}/bin/activate"
 
 # shellcheck disable=SC1091
 source "${_UAVFLOW_SCRIPT_DIR}/ascend_cann.sh"
-_UAVFLOW_CANN_ENV="$(uavflow_select_cann_env)" || {
-  return 1 2>/dev/null || exit 1; }
+if [[ -n "${CANN_ENV_FILE:-}" ]]; then
+  [[ -f "${CANN_ENV_FILE}" ]] || {
+    echo "Persisted CANN_ENV_FILE is stale: ${CANN_ENV_FILE}" >&2
+    return 1 2>/dev/null || exit 1; }
+  _UAVFLOW_CANN_ENV="$(readlink -f "${CANN_ENV_FILE}")"
+else
+  _UAVFLOW_CANN_ENV="$(uavflow_select_cann_env)" || {
+    return 1 2>/dev/null || exit 1; }
+fi
 # shellcheck disable=SC1090
 source "${_UAVFLOW_CANN_ENV}"
 echo "Using CANN environment: ${_UAVFLOW_CANN_ENV}"

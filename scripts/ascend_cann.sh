@@ -1,6 +1,24 @@
 #!/usr/bin/env bash
 # Shared deterministic CANN environment discovery. Source; do not execute.
 
+uavflow_list_cann_envs() {
+  local -a search_roots=(/usr/local/Ascend "${HOME}/Ascend")
+  if [[ -n "${ASCEND_SEARCH_ROOT:-}" ]]; then
+    local -a configured_roots=()
+    IFS=':' read -r -a configured_roots <<< "${ASCEND_SEARCH_ROOT}"
+    search_roots+=("${configured_roots[@]}")
+  fi
+  local root path
+  local -a candidates=()
+  for root in "${search_roots[@]}"; do
+    [[ -d "${root}" ]] || continue
+    while IFS= read -r path; do
+      candidates+=("$(readlink -f "${path}")")
+    done < <(find "${root}" -maxdepth 6 -type f -name set_env.sh -print 2>/dev/null)
+  done
+  printf '%s\n' "${candidates[@]}" | sed '/^$/d' | sort -u
+}
+
 uavflow_select_cann_env() {
   local candidate=""
   if [[ -n "${CANN_ROOT:-}" ]]; then
@@ -22,20 +40,8 @@ uavflow_select_cann_env() {
       candidate="${explicit_candidates[0]}"
     fi
   else
-    local -a search_roots=(/usr/local/Ascend "${HOME}/Ascend")
-    if [[ -n "${ASCEND_SEARCH_ROOT:-}" ]]; then
-      IFS=':' read -r -a configured_roots <<< "${ASCEND_SEARCH_ROOT}"
-      search_roots+=("${configured_roots[@]}")
-    fi
     local -a candidates=()
-    local root
-    for root in "${search_roots[@]}"; do
-      [[ -d "${root}" ]] || continue
-      while IFS= read -r path; do
-        candidates+=("$(readlink -f "${path}")")
-      done < <(find "${root}" -maxdepth 5 -type f -name set_env.sh -print 2>/dev/null)
-    done
-    mapfile -t candidates < <(printf '%s\n' "${candidates[@]}" | sed '/^$/d' | sort -u)
+    mapfile -t candidates < <(uavflow_list_cann_envs)
     if (( ${#candidates[@]} == 0 )); then
       echo "No CANN Toolkit set_env.sh found under /usr/local/Ascend, ${HOME}/Ascend, or ASCEND_SEARCH_ROOT" >&2
       return 2

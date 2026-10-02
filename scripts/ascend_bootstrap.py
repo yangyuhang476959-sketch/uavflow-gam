@@ -24,6 +24,7 @@ REFERENCE_TORCH_NPU = "2.7.1.post4"
 REFERENCE_TORCHVISION = "0.22.1"
 PYTORCH_CPU_INDEX = "https://download.pytorch.org/whl/cpu"
 PYPI_INDEX = "https://pypi.org/simple"
+MINICONDA_BASE_URL = "https://repo.anaconda.com/miniconda"
 
 
 def normalize_arch(value: str | None = None) -> str:
@@ -88,12 +89,41 @@ def cann_installer_name(arch: str) -> str:
     return f"Ascend-cann-toolkit_{REFERENCE_CANN}_linux-{normalize_arch(arch)}.run"
 
 
+def cann_ops_installer_name(arch: str, chip: str = "910b") -> str:
+    """Official CANN >=8.5 operator-package naming documented by Huawei."""
+    chip = chip.strip().lower()
+    if chip != "910b":
+        raise ValueError(f"Unsupported reference ops target {chip!r}; expected 910b")
+    return f"Ascend-cann-{chip}-ops_{REFERENCE_CANN}_linux-{normalize_arch(arch)}.run"
+
+
+def miniconda_installer_name(arch: str) -> str:
+    suffix = "aarch64" if normalize_arch(arch) == "aarch64" else "x86_64"
+    return f"Miniconda3-latest-Linux-{suffix}.sh"
+
+
+def miniconda_installer_url(arch: str) -> str:
+    return f"{MINICONDA_BASE_URL}/{miniconda_installer_name(arch)}"
+
+
 def validate_cann_installer(path: Path, *, arch: str) -> Path:
     expected = cann_installer_name(arch)
     if path.name != expected:
         raise ValueError(
             f"Expected official {expected}, got {path.name}. "
             "Set CANN_INSTALLER to the exact official Toolkit package."
+        )
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    return path
+
+
+def validate_cann_ops_installer(path: Path, *, arch: str) -> Path:
+    expected = cann_ops_installer_name(arch)
+    if path.name != expected:
+        raise ValueError(
+            f"Expected official {expected}, got {path.name}. "
+            "Set CANN_OPS_INSTALLER to the exact official 910B ops package."
         )
     if not path.is_file():
         raise FileNotFoundError(path)
@@ -111,10 +141,17 @@ def find_cached_cann_installer(paths: Iterable[Path], *, arch: str) -> Path | No
     return matches[0] if matches else None
 
 
-def micromamba_platform(arch: str) -> str:
-    return {"aarch64": "linux-aarch64", "x86_64": "linux-64"}[
-        normalize_arch(arch)
-    ]
+def find_cached_package(
+    paths: Iterable[Path], *, expected_name: str, variable: str
+) -> Path | None:
+    matches = [path / expected_name for path in paths if (path / expected_name).is_file()]
+    unique = sorted({path.resolve() for path in matches})
+    if len(unique) > 1:
+        raise RuntimeError(
+            f"Multiple cached {expected_name} packages found; set {variable} explicitly: "
+            + ", ".join(str(path) for path in unique)
+        )
+    return unique[0] if unique else None
 
 
 def online_torch_commands(python: str) -> list[list[str]]:
@@ -154,6 +191,12 @@ def _main() -> None:
     cann_parser.add_argument("--arch", required=True)
     name_parser = sub.add_parser("cann-installer-name")
     name_parser.add_argument("--arch", required=True)
+    ops_parser = sub.add_parser("cann-ops-installer-name")
+    ops_parser.add_argument("--arch", required=True)
+    miniconda_name = sub.add_parser("miniconda-installer-name")
+    miniconda_name.add_argument("--arch", required=True)
+    miniconda_url = sub.add_parser("miniconda-installer-url")
+    miniconda_url.add_argument("--arch", required=True)
     torch_parser = sub.add_parser("torch-plan")
     torch_parser.add_argument("--python", required=True)
     args = parser.parse_args()
@@ -168,6 +211,12 @@ def _main() -> None:
         print(json.dumps({"version": version, "metadata": str(metadata)}))
     elif args.command == "cann-installer-name":
         print(cann_installer_name(args.arch))
+    elif args.command == "cann-ops-installer-name":
+        print(cann_ops_installer_name(args.arch))
+    elif args.command == "miniconda-installer-name":
+        print(miniconda_installer_name(args.arch))
+    elif args.command == "miniconda-installer-url":
+        print(miniconda_installer_url(args.arch))
     elif args.command == "torch-plan":
         for command in online_torch_commands(args.python):
             print(shlex.join(command))

@@ -32,8 +32,25 @@ bash scripts/setup_ascend_cluster.sh
 
 The script inventories but never modifies Driver/Firmware. It supports
 `aarch64` and `x86_64`, accepts any Python 3.11 patch release, and creates an
-isolated environment at `.ascend/env`. It reuses `python3.11`, conda/mamba, or
-micromamba; if none exists, it bootstraps micromamba from its official endpoint.
+isolated conda prefix at `.ascend/env`. If `conda` is absent it downloads the
+architecture-matched `Miniconda3-latest-Linux-{aarch64,x86_64}.sh` directly
+from the official `https://repo.anaconda.com/miniconda/` source and installs it
+under `.ascend/miniconda3`. It never modifies system Python. For an offline
+node, set `MINICONDA_INSTALLER` to the corresponding official installer.
+
+The one-command entry point is only an orchestrator. The two expensive phases
+can be prepared independently, which is useful on managed clusters:
+
+```bash
+# Toolkit/runtime phase; does not create the Python environment.
+bash scripts/setup_ascend_cann.sh
+
+# Python/package phase; consumes .ascend/runtime.env from the first phase.
+bash scripts/setup_ascend_python.sh
+
+# Full smoke test and environment report.
+bash scripts/setup_ascend_cluster.sh
+```
 
 It discovers CANN under `/usr/local/Ascend`, `${HOME}/Ascend`, and optional
 `ASCEND_SEARCH_ROOT`. Multiple installations are never guessed: set
@@ -42,22 +59,58 @@ Huawei's official `ascend_toolkit_install.info` metadata (`package_name`,
 `version`, and `arch`); it does not trust directory names or recursively grep
 arbitrary files.
 
-There is no stable unauthenticated CANN 9.0.0 binary URL embedded in this
-project. If reference CANN is absent, obtain the official architecture-matched
-package from Huawei Ascend and provide it with its published checksum:
+Reference mode looks for an existing, metadata-confirmed CANN 9.0.0. If the
+host has only CANN 8.x (or no CANN), that administrator installation is kept
+untouched and a separate reference stack is installed under
+`.ascend/cann-9.0.0`. If exactly one valid 9.0.0 installation already exists,
+it is reused. Symlink aliases are canonicalized before deciding whether there
+are multiple installations.
+
+Huawei's official CANN documentation requires both the Toolkit package and
+the hardware-specific ops package. For Atlas A2/Ascend 910B, the exact 9.0.0
+package names used here are:
+
+```text
+Ascend-cann-toolkit_9.0.0_linux-{aarch64,x86_64}.run
+Ascend-cann-910b-ops_9.0.0_linux-{aarch64,x86_64}.run
+```
+
+The authoritative acquisition page is `https://www.hiascend.com/cann/download`.
+Huawei does not provide a stable, unauthenticated binary URL that this project
+can safely embed, so the script never fabricates one. Download both official
+packages and provide them explicitly or place them in a supported cache:
 
 ```bash
-export CANN_INSTALLER=/packages/Ascend-cann-toolkit_9.0.0_linux-aarch64.run
-export CANN_INSTALLER_SHA256=<official-sha256>
-bash scripts/setup_ascend_cluster.sh
+export CANN_TOOLKIT_INSTALLER=/packages/Ascend-cann-toolkit_9.0.0_linux-aarch64.run
+export CANN_OPS_INSTALLER=/packages/Ascend-cann-910b-ops_9.0.0_linux-aarch64.run
+# Optional when authoritative checksums are available:
+export CANN_TOOLKIT_SHA256=<official-sha256>
+export CANN_OPS_SHA256=<official-sha256>
+bash scripts/setup_ascend_cann.sh
 ```
 
 The script also searches `.ascend/packages` and
-`${HOME}/.cache/uavflow-ascend`. It installs the verified package separately
-under `.ascend/cann`; it never overwrites an administrator installation.
+`${HOME}/.cache/uavflow-ascend`. An operator may supply authoritative direct
+HTTPS endpoints through `CANN_TOOLKIT_URL` and `CANN_OPS_URL`; URLs are never
+guessed. Toolkit and ops are installed into the same selected prefix.
+
+After selection, `.ascend/runtime.env` records the exact `CANN_ROOT`,
+`CANN_ENV_FILE`, Python environment, Triton target, FLA checkout, and DA3
+checkout. `source scripts/ascend_env.sh` loads this persisted selection first,
+so a second administrator CANN cannot silently change later runs. A stale
+persisted path fails clearly instead of falling back to another installation.
 
 Reference torch packages are installed online from the official PyTorch CPU
-wheel index and PyPI. Offline nodes may provide all three local wheels:
+wheel index and PyPI. The effective commands inside the selected conda prefix
+are:
+
+```bash
+python -m pip install -c constraints-ascend.txt -c constraints-ascend-reference.txt torch==2.7.1 --index-url https://download.pytorch.org/whl/cpu
+python -m pip install -c constraints-ascend.txt -c constraints-ascend-reference.txt torch-npu==2.7.1.post4 --index-url https://pypi.org/simple
+python -m pip install -c constraints-ascend.txt -c constraints-ascend-reference.txt torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cpu
+```
+
+Offline nodes may provide all three local wheels:
 
 ```bash
 export TORCH_WHEEL=/shared/wheels/torch-2.7.1+cpu-cp311-linux_aarch64.whl
@@ -82,8 +135,8 @@ export CANN_ROOT=/administrator/selected/cann
 bash scripts/setup_ascend_cluster.sh
 ```
 
-If more than one CANN installation is discovered, setup/runtime both stop and
-list every candidate rather than selecting the lexicographically first one.
+If more than one genuinely distinct matching installation remains, setup stops
+and asks for explicit `CANN_ROOT`; it never picks lexicographically.
 
 After smoke tests, the complete comparison record is written to
 `.ascend/environment-report.json`, including host/NPU inventory, CANN metadata,
