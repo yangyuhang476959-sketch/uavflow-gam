@@ -19,6 +19,17 @@ from experiments.uavflow_remote_ablation.run_experiment import (
     python_interpreter,
 )
 from robot.modeling.lora import LoRALinear
+from scripts.ascend_bootstrap import (
+    PYTORCH_CPU_INDEX,
+    REFERENCE_CANN,
+    cann_installer_name,
+    detect_cann_version,
+    find_cached_cann_installer,
+    is_python311,
+    normalize_arch,
+    online_torch_commands,
+    validate_local_wheel,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -212,10 +223,116 @@ def test_cann_discovery_rejects_multiple_installations(tmp_path):
     )
     result = subprocess.run(
         ["bash", "-c", command], text=True, capture_output=True,
-        env={**os.environ, "ASCEND_SEARCH_ROOT": str(tmp_path), "CANN_ROOT": ""},
+        env={
+            **os.environ,
+            "HOME": str(tmp_path / "home"),
+            "ASCEND_SEARCH_ROOT": str(tmp_path),
+            "CANN_ROOT": "",
+        },
     )
     assert result.returncode != 0
     assert "Multiple CANN installations" in result.stderr
+
+
+def test_cann_discovery_accepts_one_installation(tmp_path):
+    import subprocess
+
+    selected = tmp_path / "search/cann/set_env.sh"
+    selected.parent.mkdir(parents=True)
+    selected.write_text("#!/usr/bin/env bash\n")
+    result = subprocess.run(
+        ["bash", "-c", f"source {ROOT / 'scripts/ascend_cann.sh'}; uavflow_select_cann_env"],
+        text=True,
+        capture_output=True,
+        env={
+            **os.environ,
+            "HOME": str(tmp_path / "home"),
+            "ASCEND_SEARCH_ROOT": str(tmp_path / "search"),
+            "CANN_ROOT": "",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert Path(result.stdout.strip()) == selected.resolve()
+
+
+def test_setup_has_no_cann_version_guessing():
+    setup = (ROOT / "scripts/setup_ascend_cluster.sh").read_text()
+    assert "grep -R" not in setup
+    assert "cann-version" in setup
+    assert "rglob" not in setup  # parser owns bounded official-metadata lookup
+
+
+@pytest.mark.parametrize(
+    "value,expected", [("aarch64", "aarch64"), ("arm64", "aarch64"),
+                       ("x86_64", "x86_64"), ("amd64", "x86_64")]
+)
+def test_supported_architecture_detection(value, expected):
+    assert normalize_arch(value) == expected
+
+
+def test_unsupported_architecture_rejected():
+    with pytest.raises(ValueError, match="Unsupported CPU architecture"):
+        normalize_arch("ppc64le")
+
+
+@pytest.mark.parametrize("version", ["3.11", "3.11.0", "3.11.14", "3.11.16"])
+def test_python311_accepts_any_patch(version):
+    assert is_python311(version)
+
+
+@pytest.mark.parametrize("version", ["3.10.14", "3.12.0", "3.11rc1"])
+def test_python311_rejects_other_versions(version):
+    assert not is_python311(version)
+
+
+def test_cann_official_metadata_parser(tmp_path):
+    metadata = tmp_path / "ascend-toolkit/latest/aarch64-linux/ascend_toolkit_install.info"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text(
+        "package_name=Ascend-cann-toolkit\nversion=9.0.0\n"
+        "arch=aarch64\nos=linux\npath=/example\n"
+    )
+    version, selected = detect_cann_version(tmp_path, arch="aarch64")
+    assert version == "9.0.0"
+    assert selected == metadata
+
+
+def test_cann_metadata_parser_rejects_wrong_architecture(tmp_path):
+    metadata = tmp_path / "x86_64-linux/ascend_toolkit_install.info"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text(
+        "package_name=Ascend-cann-toolkit\nversion=9.0.0\narch=x86_64\n"
+    )
+    with pytest.raises(RuntimeError, match="architecture mismatch"):
+        detect_cann_version(tmp_path, arch="aarch64")
+
+
+def test_cann_installer_cache_and_architecture(tmp_path):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    installer = cache / cann_installer_name("aarch64")
+    installer.touch()
+    assert find_cached_cann_installer([cache], arch="aarch64") == installer
+    assert installer.name == "Ascend-cann-toolkit_9.0.0_linux-aarch64.run"
+    assert REFERENCE_CANN == "9.0.0"
+
+
+def test_online_torch_plan_uses_authoritative_indexes():
+    commands = online_torch_commands("/env/bin/python")
+    assert commands[0][-1] == PYTORCH_CPU_INDEX
+    assert "torch==2.7.1" in commands[0]
+    assert "torch-npu==2.7.1.post4" in commands[1]
+    assert commands[1][-1] == "https://pypi.org/simple"
+    assert "torchvision==0.22.1" in commands[2]
+    assert commands[2][-1] == PYTORCH_CPU_INDEX
+
+
+def test_local_wheel_validation_is_arch_and_python_aware(tmp_path):
+    wheel = tmp_path / "torch-2.7.1+cpu-cp311-cp311-manylinux_2_28_aarch64.whl"
+    wheel.touch()
+    validate_local_wheel(wheel, arch="aarch64")
+    with pytest.raises(ValueError, match="architecture"):
+        validate_local_wheel(wheel, arch="x86_64")
 
 
 def test_ascend_stack_modes_and_benchmark_are_explicit():
@@ -246,7 +363,7 @@ def test_ascend_project_install_resolves_dependencies_but_protects_runtime():
     assert 'INSTALL_CONSTRAINTS=(-c "${PROJECT_CONSTRAINTS}")' in setup
     assert 'INSTALL_CONSTRAINTS+=(-c "${REFERENCE_CONSTRAINTS}")' in setup
     assert 'VENDOR_RUNTIME_CONSTRAINTS="$(mktemp' in setup
-    assert 'accelerator_snapshot > "${VENDOR_RUNTIME_CONSTRAINTS}"' in setup
+    assert 'accelerator_snapshot | sed' in setup
     assert 'INSTALL_CONSTRAINTS+=(-c "${VENDOR_RUNTIME_CONSTRAINTS}")' in setup
     assert 'diff -u "${ACCELERATOR_BEFORE}" "${ACCELERATOR_AFTER}"' in setup
     assert "verify_reference_stack" in setup
@@ -260,6 +377,30 @@ def test_ascend_no_deps_is_limited_to_validated_special_cases():
     assert any('"${TORCHVISION_WHEEL}"' in line for line in no_deps_lines)
     assert any('triton-ascend==3.2.1' in line for line in no_deps_lines)
     assert any('-e "${DA3_DIR}"' in line for line in no_deps_lines)
+
+
+def test_bootstrap_control_flow_and_environment_report_are_present():
+    setup = (ROOT / "scripts/setup_ascend_cluster.sh").read_text()
+    runtime = (ROOT / "scripts/ascend_env.sh").read_text()
+    assert "ASCEND_ENV_ROOT" in setup
+    assert "command -v python3.11" in setup
+    assert "micromamba mamba conda" in setup
+    assert "https://micro.mamba.pm/api/micromamba/" in setup
+    assert "CANN_INSTALLER" in setup and "CANN_INSTALLER_SHA256" in setup
+    assert "--install-path=" in setup
+    assert "environment-report.json" in setup
+    assert "ASCEND_STACK_MODE=vendor" in setup
+    assert "export ASCEND_STACK_MODE=vendor" not in setup
+    assert '${REPO_ROOT}/.ascend/env' in runtime
+    assert 'ASCEND_VENV:-${ASCEND_ENV_ROOT}' in runtime
+    assert '${REPO_ROOT}/.ascend/cann' in runtime
+    assert "apt install" not in setup and "yum install" not in setup
+    assert "driver.run" not in setup and "firmware.run" not in setup
+    for report_key in (
+        "driver_version_info", "firmware_version_info", "cann_metadata",
+        "triton_ascend_distribution", "fla_commit", "da3_commit",
+    ):
+        assert report_key in setup
 
 
 def test_lora_forward_and_gradients_match_explicit_reference():

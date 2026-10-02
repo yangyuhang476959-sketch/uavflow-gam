@@ -19,39 +19,60 @@ their gradients continue through the decoded depth into DA3 features.
 Do not replace `torch 2.7.1+cpu` with a CUDA wheel. Ascend device support is
 registered by the matching `torch_npu` package.
 
-## New-node command order
+## One-command new-node setup
 
-First inventory the node before installing a wheel:
-
-```bash
-uname -a
-uname -m
-python3 --version
-python3 -c 'import platform; print(platform.machine()); print(platform.platform())'
-ldd --version | head
-npu-smi info
-find /usr/local/Ascend -maxdepth 3 -type f -name set_env.sh -print
-```
-
-Then clone this repository. The default `reference` mode is strict: it requires
-the exact Python/CANN/core triplet above and never asks pip to choose a torch
-stack. Supply the three architecture-matched wheels when they are not already
-present in the isolated environment:
+On a normal online node whose administrator has already installed compatible
+Ascend Driver/Firmware, the reference workflow is:
 
 ```bash
 git clone https://github.com/yangyuhang476959-sketch/uavflow-gam.git
 cd uavflow-gam
-export CANN_ROOT=/usr/local/Ascend/ascend-toolkit/latest
-export CANN_VERSION=9.0.0  # only after verifying this selected installation
-export ASCEND_VENV=$PWD/.venv-ascend
-export TORCH_WHEEL=/shared/wheels/torch-2.7.1+cpu-cp311-linux_aarch64.whl
-export TORCH_NPU_WHEEL=/shared/wheels/torch_npu-2.7.1.post4-cp311-linux_aarch64.whl
-export TORCHVISION_WHEEL=/shared/wheels/torchvision-0.22.1-cp311-manylinux_2_28_aarch64.whl
 bash scripts/setup_ascend_cluster.sh
 ```
 
+The script inventories but never modifies Driver/Firmware. It supports
+`aarch64` and `x86_64`, accepts any Python 3.11 patch release, and creates an
+isolated environment at `.ascend/env`. It reuses `python3.11`, conda/mamba, or
+micromamba; if none exists, it bootstraps micromamba from its official endpoint.
+
+It discovers CANN under `/usr/local/Ascend`, `${HOME}/Ascend`, and optional
+`ASCEND_SEARCH_ROOT`. Multiple installations are never guessed: set
+`CANN_ROOT` to the exact selected installation. CANN version detection reads
+Huawei's official `ascend_toolkit_install.info` metadata (`package_name`,
+`version`, and `arch`); it does not trust directory names or recursively grep
+arbitrary files.
+
+There is no stable unauthenticated CANN 9.0.0 binary URL embedded in this
+project. If reference CANN is absent, obtain the official architecture-matched
+package from Huawei Ascend and provide it with its published checksum:
+
+```bash
+export CANN_INSTALLER=/packages/Ascend-cann-toolkit_9.0.0_linux-aarch64.run
+export CANN_INSTALLER_SHA256=<official-sha256>
+bash scripts/setup_ascend_cluster.sh
+```
+
+The script also searches `.ascend/packages` and
+`${HOME}/.cache/uavflow-ascend`. It installs the verified package separately
+under `.ascend/cann`; it never overwrites an administrator installation.
+
+Reference torch packages are installed online from the official PyTorch CPU
+wheel index and PyPI. Offline nodes may provide all three local wheels:
+
+```bash
+export TORCH_WHEEL=/shared/wheels/torch-2.7.1+cpu-cp311-linux_aarch64.whl
+export TORCH_NPU_WHEEL=/shared/wheels/torch_npu-2.7.1.post4-cp311-linux_aarch64.whl
+export TORCHVISION_WHEEL=/shared/wheels/torchvision-0.22.1-cp311-linux_aarch64.whl
+bash scripts/setup_ascend_cluster.sh
+```
+
+Wheel Python and architecture tags are checked before installation. Override
+paths and caches with `ASCEND_ENV_ROOT`, `ASCEND_SEARCH_ROOT`, `CANN_USER_ROOT`,
+`CANN_PACKAGE_CACHE`, or explicit `CANN_ROOT`.
+
 Only when cluster driver/firmware policy makes the exact stack impossible,
-select the administrator runtime explicitly. This mode inherits and snapshots
+the user must select `ASCEND_STACK_MODE=vendor` explicitly; setup never switches
+modes automatically. This mode inherits and snapshots
 the core triplet, generates exact temporary constraints for it, and then lets
 pip resolve ordinary project dependencies without replacing that triplet:
 
@@ -63,6 +84,10 @@ bash scripts/setup_ascend_cluster.sh
 
 If more than one CANN installation is discovered, setup/runtime both stop and
 list every candidate rather than selecting the lexicographically first one.
+
+After smoke tests, the complete comparison record is written to
+`.ascend/environment-report.json`, including host/NPU inventory, CANN metadata,
+Python and package versions, and pinned FLA/DA3 commits.
 
 `pycolmap` is intentionally isolated in
 `requirements-optional-geometry.txt`; it is not needed for the training path

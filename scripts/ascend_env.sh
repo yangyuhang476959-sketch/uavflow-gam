@@ -4,9 +4,11 @@ set -e
 
 _UAVFLOW_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export REPO_ROOT="${REPO_ROOT:-$(cd "${_UAVFLOW_SCRIPT_DIR}/.." && pwd)}"
-export ASCEND_VENV="${ASCEND_VENV:-${REPO_ROOT}/.venv-ascend}"
+export ASCEND_ENV_ROOT="${ASCEND_ENV_ROOT:-${ASCEND_VENV:-${REPO_ROOT}/.ascend/env}}"
+export ASCEND_VENV="${ASCEND_VENV:-${ASCEND_ENV_ROOT}}"
 export TRITON_ASCEND_TARGET="${TRITON_ASCEND_TARGET:-${REPO_ROOT}/.ascend/triton}"
 export FLA_ASCEND_DIR="${FLA_ASCEND_DIR:-${REPO_ROOT}/.ascend/flash-linear-attention}"
+export ASCEND_SEARCH_ROOT="${ASCEND_SEARCH_ROOT:-${REPO_ROOT}/.ascend/cann}"
 
 if [[ ! -x "${ASCEND_VENV}/bin/python" ]]; then
   echo "Missing Ascend venv: ${ASCEND_VENV}; run scripts/setup_ascend_cluster.sh" >&2
