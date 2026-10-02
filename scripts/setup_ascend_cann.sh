@@ -108,6 +108,9 @@ PY
   verify_checksum_if_given "${ops}" "${CANN_OPS_SHA256:-}" Ops
   mkdir -p "${CANN_USER_ROOT}"
   chmod u+x "${toolkit}" "${ops}"
+  echo 'Checking official CANN runfile integrity.'
+  "${toolkit}" --check
+  "${ops}" --check
   echo "Installing CANN Toolkit and 910B ops into ${CANN_USER_ROOT}; administrator installations are untouched."
   "${toolkit}" --quiet --install --install-path="${CANN_USER_ROOT}" ${CANN_TOOLKIT_INSTALLER_ARGS:-}
   "${ops}" --quiet --install --install-path="${CANN_USER_ROOT}" ${CANN_OPS_INSTALLER_ARGS:-}

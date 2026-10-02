@@ -68,10 +68,6 @@ if [[ "${ASCEND_STACK_MODE}" == vendor ]]; then
   PY="${ASCEND_ENV_ROOT_EXPLICIT}/bin/python"
   [[ -x "${PY}" ]] || { echo "Vendor ASCEND_ENV_ROOT has no bin/python: ${ASCEND_ENV_ROOT_EXPLICIT}" >&2; exit 2; }
   python_is_311 "${PY}" || { echo 'Vendor ASCEND_ENV_ROOT must use Python 3.11.x.' >&2; exit 2; }
-  "${PY}" - <<'PY'
-import torch, torch_npu, torchvision
-print('Validated vendor core stack', torch.__version__, torch_npu.__version__, torchvision.__version__)
-PY
   ASCEND_ENV_ROOT="${ASCEND_ENV_ROOT_EXPLICIT}"
   PYTHON_ENVIRONMENT_TYPE=vendor-existing
 else
@@ -86,6 +82,15 @@ else
   PYTHON_ENVIRONMENT_TYPE=conda-prefix
 fi
 if (( BOOTSTRAP_ONLY == 1 )); then
+  if [[ "${ASCEND_STACK_MODE}" == reference ]]; then
+    command -v gcc >/dev/null || {
+      echo 'CANN installation requires gcc; ask the server administrator to install it.' >&2; exit 2; }
+    command -v g++ >/dev/null || {
+      echo 'CANN installation requires g++; ask the server administrator to install it.' >&2; exit 2; }
+    "${PY}" -m pip install \
+      attrs cython 'numpy>=1.19.2,<2.0' decorator sympy cffi pyyaml \
+      pathlib2 psutil 'protobuf==3.20.*' scipy requests absl-py
+  fi
   echo "Python bootstrap ready: ${ASCEND_ENV_ROOT}"
   exit 0
 fi
@@ -97,6 +102,13 @@ source "${RUNTIME_ENV}"
 [[ -f "${CANN_ENV_FILE:-}" ]] || { echo "Persisted CANN_ENV_FILE is stale: ${CANN_ENV_FILE:-unset}" >&2; exit 2; }
 # shellcheck disable=SC1090
 source "${CANN_ENV_FILE}"
+
+if [[ "${ASCEND_STACK_MODE}" == vendor ]]; then
+  "${PY}" - <<'PY'
+import torch, torch_npu, torchvision
+print('Validated vendor core stack', torch.__version__, torch_npu.__version__, torchvision.__version__)
+PY
+fi
 
 "${PY}" -m pip install --upgrade 'pip<26' setuptools wheel
 

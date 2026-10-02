@@ -37,6 +37,12 @@ architecture-matched `Miniconda3-latest-Linux-{aarch64,x86_64}.sh` directly
 from the official `https://repo.anaconda.com/miniconda/` source and installs it
 under `.ascend/miniconda3`. It never modifies system Python. For an offline
 node, set `MINICONDA_INSTALLER` to the corresponding official installer.
+Before CANN installation, reference bootstrap verifies that host `gcc` and
+`g++` are available (it never invokes `sudo`, `apt`, or `yum`) and installs the
+CANN Python prerequisites into the isolated prefix: attrs, Cython, NumPy below
+2, decorator, SymPy, CFFI, PyYAML, pathlib2, psutil, protobuf 3.20.x, SciPy,
+requests, and absl-py. The later project dependency phase applies the pinned
+UAVFlow-GAM versions.
 
 The one-command entry point is only an orchestrator. It first bootstraps the
 Python 3.11 conda prefix, so even a node without system `python3` can run the
@@ -98,6 +104,8 @@ The script first searches `.ascend/packages` and
 `${HOME}/.cache/uavflow-ascend`. An operator may override the authoritative
 HTTPS endpoints through `CANN_TOOLKIT_URL` and `CANN_OPS_URL`. Toolkit and ops
 are installed into the same selected prefix.
+Each downloaded or cached runfile is executed with `--check` before either
+installer is allowed to modify the project-local CANN prefix.
 
 An existing reference installation is accepted only when both official files
 report version `9.0.0`:
@@ -154,7 +162,10 @@ bash scripts/setup_ascend_cluster.sh
 
 Vendor mode never creates an empty conda prefix. `ASCEND_ENV_ROOT` is required
 and must point to an existing Python 3.11 environment where `torch`,
-`torch_npu`, and `torchvision` already import successfully.
+`torch_npu`, and `torchvision` import successfully after the selected
+`CANN_ENV_FILE` has been sourced. The initial `--bootstrap-only` phase checks
+only the interpreter path and Python version, deliberately delaying the NPU
+imports until CANN runtime libraries are active.
 
 If more than one genuinely distinct matching installation remains, setup stops
 and asks for explicit `CANN_ROOT`; it never picks lexicographically.

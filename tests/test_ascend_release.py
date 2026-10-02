@@ -485,7 +485,37 @@ def test_vendor_mode_requires_existing_explicit_python_environment():
     vendor_branch = source.split('if [[ "${ASCEND_STACK_MODE}" == vendor ]]', 1)[1]
     vendor_branch = vendor_branch.split("else", 1)[0]
     assert "conda create" not in vendor_branch
-    assert "import torch, torch_npu, torchvision" in vendor_branch
+    assert "import torch, torch_npu, torchvision" not in vendor_branch
+    assert source.index("BOOTSTRAP_ONLY == 1") < source.index('source "${CANN_ENV_FILE}"')
+    assert source.index('source "${CANN_ENV_FILE}"') < source.index(
+        "import torch, torch_npu, torchvision"
+    )
+
+
+def test_reference_bootstrap_installs_cann_prerequisites_without_sudo():
+    source = (ROOT / "scripts/setup_ascend_python.sh").read_text()
+    bootstrap_section = source.split("if (( BOOTSTRAP_ONLY == 1 )); then", 1)[1].split(
+        'echo "Python bootstrap ready', 1
+    )[0]
+    assert "command -v gcc" in bootstrap_section
+    assert "command -v g++" in bootstrap_section
+    for requirement in (
+        "attrs", "cython", "numpy>=1.19.2,<2.0", "decorator", "sympy",
+        "cffi", "pyyaml", "pathlib2", "psutil", "protobuf==3.20.*",
+        "scipy", "requests", "absl-py",
+    ):
+        assert requirement in bootstrap_section
+    assert "sudo" not in source and "apt " not in source and "yum " not in source
+
+
+def test_cann_runfiles_are_checked_before_installation():
+    source = (ROOT / "scripts/setup_ascend_cann.sh").read_text()
+    assert source.index('"${toolkit}" --check') < source.index(
+        '"${toolkit}" --quiet --install'
+    )
+    assert source.index('"${ops}" --check') < source.index(
+        '"${ops}" --quiet --install'
+    )
 
 
 def test_pythonless_bootstrap_precedes_cann_and_uses_no_python_helper():
