@@ -25,6 +25,10 @@ REFERENCE_TORCHVISION = "0.22.1"
 PYTORCH_CPU_INDEX = "https://download.pytorch.org/whl/cpu"
 PYPI_INDEX = "https://pypi.org/simple"
 MINICONDA_BASE_URL = "https://repo.anaconda.com/miniconda"
+CANN_900_BASE_URL = (
+    "https://ascend-repo.obs.cn-east-2.myhuaweicloud.com/"
+    "CANN/CANN%209.0.0"
+)
 
 
 def normalize_arch(value: str | None = None) -> str:
@@ -85,6 +89,49 @@ def detect_cann_version(root: Path, *, arch: str) -> tuple[str, Path]:
     return parsed[0]
 
 
+def parse_ops_install_info(path: Path, *, expected_arch: str) -> tuple[str, str]:
+    fields: dict[str, str] = {}
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if "=" not in raw:
+            continue
+        key, value = raw.split("=", 1)
+        fields[key.strip().lower()] = value.strip().strip('"\'')
+    metadata_arch = normalize_arch(fields.get("arch", expected_arch))
+    if metadata_arch != normalize_arch(expected_arch):
+        raise ValueError(
+            f"CANN ops metadata architecture mismatch: {metadata_arch} != {expected_arch}"
+        )
+    version = fields.get("version", "")
+    if not version:
+        raise ValueError(f"CANN ops metadata has no version field: {path}")
+    package = fields.get("package_name", "").lower()
+    if package and ("ops" not in package or "910b" not in package):
+        raise ValueError(f"Not the Atlas A2/910B ops metadata: {path} ({package})")
+    return version, package
+
+
+def detect_ops_version(root: Path, *, arch: str) -> tuple[str, Path, str]:
+    """Read Huawei's official ascend_ops_install.info metadata only."""
+    root = root.expanduser()
+    candidates = sorted(set(root.rglob("ascend_ops_install.info")))
+    parsed: list[tuple[str, Path, str]] = []
+    errors: list[str] = []
+    for path in candidates:
+        try:
+            version, package = parse_ops_install_info(path, expected_arch=arch)
+            parsed.append((version, path, package))
+        except ValueError as exc:
+            errors.append(str(exc))
+    if not parsed:
+        detail = "; ".join(errors) if errors else "no ascend_ops_install.info"
+        raise RuntimeError(f"Cannot detect CANN 910B ops version under {root}: {detail}")
+    versions = {version for version, _, _ in parsed}
+    if len(versions) != 1:
+        rendered = ", ".join(f"{version} ({path})" for version, path, _ in parsed)
+        raise RuntimeError(f"Conflicting CANN ops metadata under {root}: {rendered}")
+    return parsed[0]
+
+
 def cann_installer_name(arch: str) -> str:
     return f"Ascend-cann-toolkit_{REFERENCE_CANN}_linux-{normalize_arch(arch)}.run"
 
@@ -95,6 +142,14 @@ def cann_ops_installer_name(arch: str, chip: str = "910b") -> str:
     if chip != "910b":
         raise ValueError(f"Unsupported reference ops target {chip!r}; expected 910b")
     return f"Ascend-cann-{chip}-ops_{REFERENCE_CANN}_linux-{normalize_arch(arch)}.run"
+
+
+def cann_installer_url(arch: str) -> str:
+    return f"{CANN_900_BASE_URL}/{cann_installer_name(arch)}"
+
+
+def cann_ops_installer_url(arch: str) -> str:
+    return f"{CANN_900_BASE_URL}/{cann_ops_installer_name(arch)}"
 
 
 def miniconda_installer_name(arch: str) -> str:
@@ -189,10 +244,17 @@ def _main() -> None:
     cann_parser = sub.add_parser("cann-version")
     cann_parser.add_argument("root", type=Path)
     cann_parser.add_argument("--arch", required=True)
+    ops_version = sub.add_parser("cann-ops-version")
+    ops_version.add_argument("root", type=Path)
+    ops_version.add_argument("--arch", required=True)
     name_parser = sub.add_parser("cann-installer-name")
     name_parser.add_argument("--arch", required=True)
     ops_parser = sub.add_parser("cann-ops-installer-name")
     ops_parser.add_argument("--arch", required=True)
+    cann_url = sub.add_parser("cann-installer-url")
+    cann_url.add_argument("--arch", required=True)
+    ops_url = sub.add_parser("cann-ops-installer-url")
+    ops_url.add_argument("--arch", required=True)
     miniconda_name = sub.add_parser("miniconda-installer-name")
     miniconda_name.add_argument("--arch", required=True)
     miniconda_url = sub.add_parser("miniconda-installer-url")
@@ -209,10 +271,17 @@ def _main() -> None:
     elif args.command == "cann-version":
         version, metadata = detect_cann_version(args.root, arch=args.arch)
         print(json.dumps({"version": version, "metadata": str(metadata)}))
+    elif args.command == "cann-ops-version":
+        version, metadata, package = detect_ops_version(args.root, arch=args.arch)
+        print(json.dumps({"version": version, "metadata": str(metadata), "package": package}))
     elif args.command == "cann-installer-name":
         print(cann_installer_name(args.arch))
     elif args.command == "cann-ops-installer-name":
         print(cann_ops_installer_name(args.arch))
+    elif args.command == "cann-installer-url":
+        print(cann_installer_url(args.arch))
+    elif args.command == "cann-ops-installer-url":
+        print(cann_ops_installer_url(args.arch))
     elif args.command == "miniconda-installer-name":
         print(miniconda_installer_name(args.arch))
     elif args.command == "miniconda-installer-url":

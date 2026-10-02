@@ -5,13 +5,17 @@ set -Eeuo pipefail
 ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 export REPO_ROOT="${ROOT}"
 
-echo '== Phase 1/4: CANN Toolkit + 910B ops =='
+echo '== Phase 1/5: bootstrap Miniconda/Python 3.11 =='
+bash "${ROOT}/scripts/setup_ascend_python.sh" --bootstrap-only
+export ASCEND_BOOTSTRAP_PYTHON="${ASCEND_ENV_ROOT:-${ROOT}/.ascend/env}/bin/python"
+
+echo '== Phase 2/5: CANN Toolkit + 910B ops =='
 bash "${ROOT}/scripts/setup_ascend_cann.sh"
 
-echo '== Phase 2/4: Python 3.11 + accelerator/project dependencies =='
+echo '== Phase 3/5: accelerator/project Python dependencies =='
 bash "${ROOT}/scripts/setup_ascend_python.sh"
 
-echo '== Phase 3/4: Ascend compatibility smoke =='
+echo '== Phase 4/5: Ascend compatibility smoke =='
 # shellcheck disable=SC1091
 source "${ROOT}/scripts/ascend_env.sh"
 PY="${ASCEND_ENV_ROOT}/bin/python"
@@ -48,7 +52,7 @@ for tensor in (q, k, v, g):
 print("NPU BF16 + FLA GatedDeltaRule forward/backward PASS", torchvision.__version__, triton.__version__)
 PY
 
-echo '== Phase 4/4: environment report =='
+echo '== Phase 5/5: environment report =='
 REPORT="${ROOT}/.ascend/environment-report.json"
 export UAVFLOW_REPORT="${REPORT}"
 "${PY}" - <<'PY'
@@ -71,6 +75,7 @@ for line in (root / ".ascend/runtime.env").read_text().splitlines():
         runtime[key] = shlex.split(value)[0] if value else ""
 admin = cmd("bash", "-lc", f"source {root}/scripts/ascend_cann.sh; uavflow_list_cann_envs").splitlines()
 metadata_candidates = list(Path(runtime.get("CANN_ROOT", "/nonexistent")).rglob("ascend_toolkit_install.info"))
+ops_metadata_candidates = list(Path(runtime.get("CANN_ROOT", "/nonexistent")).rglob("ascend_ops_install.info"))
 report = {
     "date": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     "architecture": platform.machine(),
@@ -82,9 +87,10 @@ report = {
     "selected_cann_source": runtime.get("CANN_SELECTION_SOURCE"),
     "cann_metadata": str(metadata_candidates[0]) if metadata_candidates else None,
     "toolkit_version": runtime.get("CANN_VERSION"),
-    "ops_package_version": runtime.get("CANN_VERSION") if os.environ.get("ASCEND_OPP_PATH") else None,
+    "ops_package_version": runtime.get("CANN_OPS_VERSION"),
+    "ops_metadata": str(ops_metadata_candidates[0]) if ops_metadata_candidates else None,
     "cann_set_env": runtime.get("CANN_ENV_FILE"),
-    "python_environment_type": "conda-prefix",
+    "python_environment_type": runtime.get("PYTHON_ENVIRONMENT_TYPE"),
     "python_environment_path": os.environ["ASCEND_ENV_ROOT"],
     "python": platform.python_version(),
     "torch": torch.__version__, "torch_npu": torch_npu.__version__,

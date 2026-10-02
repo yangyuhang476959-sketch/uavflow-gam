@@ -38,11 +38,15 @@ from the official `https://repo.anaconda.com/miniconda/` source and installs it
 under `.ascend/miniconda3`. It never modifies system Python. For an offline
 node, set `MINICONDA_INSTALLER` to the corresponding official installer.
 
-The one-command entry point is only an orchestrator. The two expensive phases
-can be prepared independently, which is useful on managed clusters:
+The one-command entry point is only an orchestrator. It first bootstraps the
+Python 3.11 conda prefix, so even a node without system `python3` can run the
+metadata helpers. The phases can also be prepared independently:
 
 ```bash
-# Toolkit/runtime phase; does not create the Python environment.
+# On a Python-less node, prepare only Miniconda/Python first.
+bash scripts/setup_ascend_python.sh --bootstrap-only
+
+# Toolkit/runtime phase; reuses that Python but installs no Python packages.
 bash scripts/setup_ascend_cann.sh
 
 # Python/package phase; consumes .ascend/runtime.env from the first phase.
@@ -75,10 +79,11 @@ Ascend-cann-toolkit_9.0.0_linux-{aarch64,x86_64}.run
 Ascend-cann-910b-ops_9.0.0_linux-{aarch64,x86_64}.run
 ```
 
-The authoritative acquisition page is `https://www.hiascend.com/cann/download`.
-Huawei does not provide a stable, unauthenticated binary URL that this project
-can safely embed, so the script never fabricates one. Download both official
-packages and provide them explicitly or place them in a supported cache:
+Huawei's CANN 9.0 installation guide publishes direct URLs for both packages.
+Reference mode downloads the architecture-matched files automatically from
+`ascend-repo.obs.cn-east-2.myhuaweicloud.com/CANN/CANN%209.0.0/` when neither
+an explicit installer nor a cached copy is available. Offline/manual overrides
+remain available:
 
 ```bash
 export CANN_TOOLKIT_INSTALLER=/packages/Ascend-cann-toolkit_9.0.0_linux-aarch64.run
@@ -89,10 +94,21 @@ export CANN_OPS_SHA256=<official-sha256>
 bash scripts/setup_ascend_cann.sh
 ```
 
-The script also searches `.ascend/packages` and
-`${HOME}/.cache/uavflow-ascend`. An operator may supply authoritative direct
-HTTPS endpoints through `CANN_TOOLKIT_URL` and `CANN_OPS_URL`; URLs are never
-guessed. Toolkit and ops are installed into the same selected prefix.
+The script first searches `.ascend/packages` and
+`${HOME}/.cache/uavflow-ascend`. An operator may override the authoritative
+HTTPS endpoints through `CANN_TOOLKIT_URL` and `CANN_OPS_URL`. Toolkit and ops
+are installed into the same selected prefix.
+
+An existing reference installation is accepted only when both official files
+report version `9.0.0`:
+
+```text
+<arch>-linux/ascend_toolkit_install.info
+<arch>-linux/ascend_ops_install.info
+```
+
+The presence of an `opp/` directory alone is not treated as proof that the
+matching 910B ops package is installed.
 
 After selection, `.ascend/runtime.env` records the exact `CANN_ROOT`,
 `CANN_ENV_FILE`, Python environment, Triton target, FLA checkout, and DA3
@@ -132,8 +148,13 @@ pip resolve ordinary project dependencies without replacing that triplet:
 ```bash
 export ASCEND_STACK_MODE=vendor
 export CANN_ROOT=/administrator/selected/cann
+export ASCEND_ENV_ROOT=/administrator/python311/environment
 bash scripts/setup_ascend_cluster.sh
 ```
+
+Vendor mode never creates an empty conda prefix. `ASCEND_ENV_ROOT` is required
+and must point to an existing Python 3.11 environment where `torch`,
+`torch_npu`, and `torchvision` already import successfully.
 
 If more than one genuinely distinct matching installation remains, setup stops
 and asks for explicit `CANN_ROOT`; it never picks lexicographically.

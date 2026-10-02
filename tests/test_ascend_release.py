@@ -23,9 +23,12 @@ from scripts.ascend_bootstrap import (
     MINICONDA_BASE_URL,
     PYTORCH_CPU_INDEX,
     REFERENCE_CANN,
+    cann_installer_url,
     cann_installer_name,
+    cann_ops_installer_url,
     cann_ops_installer_name,
     detect_cann_version,
+    detect_ops_version,
     find_cached_cann_installer,
     is_python311,
     miniconda_installer_name,
@@ -327,6 +330,35 @@ def test_official_cann_toolkit_and_910b_ops_names():
     assert cann_installer_name("aarch64") == "Ascend-cann-toolkit_9.0.0_linux-aarch64.run"
     assert cann_ops_installer_name("aarch64") == "Ascend-cann-910b-ops_9.0.0_linux-aarch64.run"
     assert cann_ops_installer_name("x86_64").endswith("linux-x86_64.run")
+    assert cann_installer_url("aarch64") == (
+        "https://ascend-repo.obs.cn-east-2.myhuaweicloud.com/CANN/"
+        "CANN%209.0.0/Ascend-cann-toolkit_9.0.0_linux-aarch64.run"
+    )
+    assert cann_ops_installer_url("x86_64").endswith(
+        "/Ascend-cann-910b-ops_9.0.0_linux-x86_64.run"
+    )
+
+
+def test_cann_ops_official_metadata_parser(tmp_path):
+    metadata = tmp_path / "cann/aarch64-linux/ascend_ops_install.info"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text(
+        "package_name=Ascend-cann-910b-ops\nversion=9.0.0\narch=aarch64\n"
+    )
+    version, selected, package = detect_ops_version(tmp_path, arch="aarch64")
+    assert version == "9.0.0"
+    assert selected == metadata
+    assert package == "ascend-cann-910b-ops"
+
+
+def test_cann_ops_metadata_rejects_wrong_chip(tmp_path):
+    metadata = tmp_path / "cann/aarch64-linux/ascend_ops_install.info"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text(
+        "package_name=Ascend-cann-310p-ops\nversion=9.0.0\narch=aarch64\n"
+    )
+    with pytest.raises(RuntimeError, match="910B"):
+        detect_ops_version(tmp_path, arch="aarch64")
 
 
 @pytest.mark.parametrize(
@@ -406,11 +438,15 @@ def test_bootstrap_control_flow_and_environment_report_are_present():
     cann_setup = (ROOT / "scripts/setup_ascend_cann.sh").read_text()
     runtime = (ROOT / "scripts/ascend_env.sh").read_text()
     assert "setup_ascend_cann.sh" in setup and "setup_ascend_python.sh" in setup
+    assert "--bootstrap-only" in setup
+    assert "ASCEND_BOOTSTRAP_PYTHON" in setup
     assert "ASCEND_ENV_ROOT" in python_setup
     assert "command -v conda" in python_setup
     assert "micromamba" not in python_setup and " mamba" not in python_setup
     assert "repo.anaconda.com/miniconda" in (ROOT / "scripts/ascend_bootstrap.py").read_text()
     assert "CANN_TOOLKIT_INSTALLER" in cann_setup and "CANN_OPS_INSTALLER" in cann_setup
+    assert "cann-installer-url" in cann_setup and "cann-ops-installer-url" in cann_setup
+    assert "ascend_ops_install.info" in (ROOT / "scripts/ascend_bootstrap.py").read_text()
     assert "--install-path=" in cann_setup
     assert "environment-report.json" in setup
     assert "ASCEND_STACK_MODE" in cann_setup
@@ -437,6 +473,30 @@ def test_cann_reference_paths_handle_missing_wrong_and_existing_versions():
     assert "CANN_TOOLKIT_INSTALLER" in source
     assert "CANN_OPS_INSTALLER" in source
     assert source.count('--install-path="${CANN_USER_ROOT}"') == 2
+    assert "CANN_OPS_VERSION_DETECTED" in source
+    assert "ops_json_for_env" in source
+
+
+def test_vendor_mode_requires_existing_explicit_python_environment():
+    source = (ROOT / "scripts/setup_ascend_python.sh").read_text()
+    assert "ASCEND_ENV_ROOT_EXPLICIT" in source
+    assert "Vendor mode does not create a new environment" in source
+    assert "Vendor ASCEND_ENV_ROOT has no bin/python" in source
+    vendor_branch = source.split('if [[ "${ASCEND_STACK_MODE}" == vendor ]]', 1)[1]
+    vendor_branch = vendor_branch.split("else", 1)[0]
+    assert "conda create" not in vendor_branch
+    assert "import torch, torch_npu, torchvision" in vendor_branch
+
+
+def test_pythonless_bootstrap_precedes_cann_and_uses_no_python_helper():
+    orchestrator = (ROOT / "scripts/setup_ascend_cluster.sh").read_text()
+    python_setup = (ROOT / "scripts/setup_ascend_python.sh").read_text()
+    assert orchestrator.index("--bootstrap-only") < orchestrator.index("setup_ascend_cann.sh")
+    bootstrap_body = python_setup.split("bootstrap_conda() {", 1)[1].split(
+        "\n}\n\nif [[", 1
+    )[0]
+    assert "python3" not in bootstrap_body
+    assert "https://repo.anaconda.com/miniconda/${expected}" in bootstrap_body
 
 
 def test_runtime_selection_is_persisted_and_preferred():

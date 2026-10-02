@@ -6,6 +6,7 @@ ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 BOOTSTRAP_PY="${ROOT}/scripts/ascend_bootstrap.py"
 ASCEND_STACK_MODE="${ASCEND_STACK_MODE:-reference}"
 MINICONDA_ROOT="${MINICONDA_ROOT:-${ROOT}/.ascend/miniconda3}"
+ASCEND_ENV_ROOT_EXPLICIT="${ASCEND_ENV_ROOT:-}"
 ASCEND_ENV_ROOT="${ASCEND_ENV_ROOT:-${ROOT}/.ascend/env}"
 TRITON_ASCEND_TARGET="${TRITON_ASCEND_TARGET:-${ROOT}/.ascend/triton}"
 FLA_ASCEND_DIR="${FLA_ASCEND_DIR:-${ROOT}/.ascend/flash-linear-attention}"
@@ -17,20 +18,15 @@ DA3_COMMIT="${DA3_COMMIT:-2c21ea849ceec7b469a3e62ea0c0e270afc3281a}"
 RUNTIME_ENV="${ASCEND_RUNTIME_ENV:-${ROOT}/.ascend/runtime.env}"
 PYTORCH_CPU_INDEX="${PYTORCH_CPU_INDEX:-https://download.pytorch.org/whl/cpu}"
 TORCH_NPU_INDEX="${TORCH_NPU_INDEX:-https://pypi.org/simple}"
+BOOTSTRAP_ONLY=0
+if [[ "${1:-}" == --bootstrap-only ]]; then BOOTSTRAP_ONLY=1; shift; fi
+(( $# == 0 )) || { echo "Usage: $0 [--bootstrap-only]" >&2; exit 2; }
 
 case "$(uname -m)" in
   aarch64|arm64) ARCH=aarch64 ;;
   x86_64|amd64) ARCH=x86_64 ;;
   *) echo "Unsupported CPU architecture: $(uname -m)" >&2; exit 2 ;;
 esac
-[[ -f "${RUNTIME_ENV}" ]] || {
-  echo "Missing ${RUNTIME_ENV}; run scripts/setup_ascend_cann.sh first." >&2; exit 2; }
-# shellcheck disable=SC1090
-source "${RUNTIME_ENV}"
-[[ -f "${CANN_ENV_FILE:-}" ]] || { echo "Persisted CANN_ENV_FILE is stale: ${CANN_ENV_FILE:-unset}" >&2; exit 2; }
-# shellcheck disable=SC1090
-source "${CANN_ENV_FILE}"
-
 python_is_311() { [[ "$("$1" -c 'import platform; print(platform.python_version())' 2>/dev/null || true)" == 3.11.* ]]; }
 
 bootstrap_conda() {
@@ -44,13 +40,14 @@ bootstrap_conda() {
   fi
   [[ "${ASCEND_STACK_MODE}" == reference ]] || {
     echo 'Vendor mode requires an existing conda and administrator-compatible Python environment.' >&2; return 2; }
-  local expected installer url
-  expected="$(python3 "${BOOTSTRAP_PY}" miniconda-installer-name --arch "${ARCH}")"
+  local expected installer url miniconda_arch
+  [[ "${ARCH}" == aarch64 ]] && miniconda_arch=aarch64 || miniconda_arch=x86_64
+  expected="Miniconda3-latest-Linux-${miniconda_arch}.sh"
   installer="${MINICONDA_INSTALLER:-${ROOT}/.ascend/packages/${expected}}"
   if [[ ! -f "${installer}" ]]; then
     [[ -z "${MINICONDA_INSTALLER:-}" ]] || { echo "MINICONDA_INSTALLER does not exist: ${installer}" >&2; return 2; }
     command -v curl >/dev/null || { echo 'curl is required to download official Miniconda.' >&2; return 2; }
-    url="$(python3 "${BOOTSTRAP_PY}" miniconda-installer-url --arch "${ARCH}")"
+    url="https://repo.anaconda.com/miniconda/${expected}"
     mkdir -p "$(dirname "${installer}")"
     echo "Downloading official Miniconda: ${url}" >&2
     curl --fail --location --retry 3 --output "${installer}.part" "${url}"
@@ -62,14 +59,45 @@ bootstrap_conda() {
   printf '%s\n' "${MINICONDA_ROOT}/bin/conda"
 }
 
-echo '== Isolated Python 3.11 environment (conda) =='
-CONDA_BIN="$(bootstrap_conda)"
-if [[ ! -x "${ASCEND_ENV_ROOT}/bin/python" ]]; then
-  "${CONDA_BIN}" create -y -p "${ASCEND_ENV_ROOT}" python=3.11 pip
+if [[ "${ASCEND_STACK_MODE}" == vendor ]]; then
+  [[ -n "${ASCEND_ENV_ROOT_EXPLICIT}" ]] || {
+    echo 'Vendor mode does not create a new environment.' >&2
+    echo 'Set ASCEND_ENV_ROOT to an existing administrator Python 3.11 environment that can import torch_npu.' >&2
+    exit 2
+  }
+  PY="${ASCEND_ENV_ROOT_EXPLICIT}/bin/python"
+  [[ -x "${PY}" ]] || { echo "Vendor ASCEND_ENV_ROOT has no bin/python: ${ASCEND_ENV_ROOT_EXPLICIT}" >&2; exit 2; }
+  python_is_311 "${PY}" || { echo 'Vendor ASCEND_ENV_ROOT must use Python 3.11.x.' >&2; exit 2; }
+  "${PY}" - <<'PY'
+import torch, torch_npu, torchvision
+print('Validated vendor core stack', torch.__version__, torch_npu.__version__, torchvision.__version__)
+PY
+  ASCEND_ENV_ROOT="${ASCEND_ENV_ROOT_EXPLICIT}"
+  PYTHON_ENVIRONMENT_TYPE=vendor-existing
+else
+  echo '== Isolated Python 3.11 environment (conda) =='
+  CONDA_BIN="$(bootstrap_conda)"
+  if [[ ! -x "${ASCEND_ENV_ROOT}/bin/python" ]]; then
+    "${CONDA_BIN}" create -y -p "${ASCEND_ENV_ROOT}" python=3.11 pip
+  fi
+  PY="${ASCEND_ENV_ROOT}/bin/python"
+  python_is_311 "${PY}" || {
+    echo "Existing ${ASCEND_ENV_ROOT} is not Python 3.11.x; choose a new ASCEND_ENV_ROOT." >&2; exit 2; }
+  PYTHON_ENVIRONMENT_TYPE=conda-prefix
 fi
-PY="${ASCEND_ENV_ROOT}/bin/python"
-python_is_311 "${PY}" || {
-  echo "Existing ${ASCEND_ENV_ROOT} is not Python 3.11.x; choose a new ASCEND_ENV_ROOT." >&2; exit 2; }
+if (( BOOTSTRAP_ONLY == 1 )); then
+  echo "Python bootstrap ready: ${ASCEND_ENV_ROOT}"
+  exit 0
+fi
+
+[[ -f "${RUNTIME_ENV}" ]] || {
+  echo "Missing ${RUNTIME_ENV}; run scripts/setup_ascend_cann.sh first." >&2; exit 2; }
+# shellcheck disable=SC1090
+source "${RUNTIME_ENV}"
+[[ -f "${CANN_ENV_FILE:-}" ]] || { echo "Persisted CANN_ENV_FILE is stale: ${CANN_ENV_FILE:-unset}" >&2; exit 2; }
+# shellcheck disable=SC1090
+source "${CANN_ENV_FILE}"
+
 "${PY}" -m pip install --upgrade 'pip<26' setuptools wheel
 
 PROJECT_CONSTRAINTS="${ROOT}/constraints-ascend.txt"
@@ -103,11 +131,6 @@ if [[ "${ASCEND_STACK_MODE}" == reference ]]; then
     "${PY}" -m pip install -c "${PROJECT_CONSTRAINTS}" -c "${REFERENCE_CONSTRAINTS}" torch-npu==2.7.1.post4 --index-url "${TORCH_NPU_INDEX}"
     "${PY}" -m pip install -c "${PROJECT_CONSTRAINTS}" -c "${REFERENCE_CONSTRAINTS}" torchvision==0.22.1 --index-url "${PYTORCH_CPU_INDEX}"
   fi
-else
-  "${PY}" - <<'PY'
-import torch, torch_npu, torchvision
-print('Using vendor core stack', torch.__version__, torch_npu.__version__, torchvision.__version__)
-PY
 fi
 
 ACCELERATOR_BEFORE="$(mktemp /tmp/uavflow-accelerator-before-XXXXXX.txt)"
@@ -143,11 +166,12 @@ git -C "${DA3_DIR}" checkout --detach "${DA3_COMMIT}"
 "${PY}" -m pip install --no-deps -e "${DA3_DIR}"
 
 tmp_runtime="$(mktemp "${RUNTIME_ENV}.XXXXXX")"
-grep -Ev '^export (MINICONDA_ROOT|ASCEND_ENV_ROOT|ASCEND_VENV|TRITON_ASCEND_TARGET|FLA_ASCEND_DIR|DA3_DIR)=' "${RUNTIME_ENV}" > "${tmp_runtime}" || true
+grep -Ev '^export (MINICONDA_ROOT|ASCEND_ENV_ROOT|ASCEND_VENV|PYTHON_ENVIRONMENT_TYPE|TRITON_ASCEND_TARGET|FLA_ASCEND_DIR|DA3_DIR)=' "${RUNTIME_ENV}" > "${tmp_runtime}" || true
 {
   printf 'export MINICONDA_ROOT=%q\n' "${MINICONDA_ROOT}"
   printf 'export ASCEND_ENV_ROOT=%q\n' "${ASCEND_ENV_ROOT}"
   printf 'export ASCEND_VENV=%q\n' "${ASCEND_ENV_ROOT}"
+  printf 'export PYTHON_ENVIRONMENT_TYPE=%q\n' "${PYTHON_ENVIRONMENT_TYPE}"
   printf 'export TRITON_ASCEND_TARGET=%q\n' "${TRITON_ASCEND_TARGET}"
   printf 'export FLA_ASCEND_DIR=%q\n' "${FLA_ASCEND_DIR}"
   printf 'export DA3_DIR=%q\n' "${DA3_DIR}"
