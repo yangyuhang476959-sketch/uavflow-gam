@@ -40,7 +40,7 @@ source "$CANN_ENV_FILE"
 npu-smi info
 # Fresh Python environments may need yaml before torch_npu can be imported.
 python -m pip install --no-deps PyYAML==6.0.2 --index-url https://pypi.org/simple
-python -c 'import torch, torch_npu, torchvision, triton; print(torch.__version__, torch_npu.__version__, torchvision.__version__, triton.__version__)'
+python -c 'import torch, torch_npu, torchvision; print(torch.__version__, torch_npu.__version__, torchvision.__version__)'
 
 git clone https://github.com/yangyuhang476959-sketch/uavflow-gam.git
 cd uavflow-gam
@@ -49,6 +49,13 @@ export PROJECT_ROOT="$PWD"
 # Engineer-provided file: pin the exact approved torch, torch-npu and torchvision.
 export PLATFORM_CONSTRAINTS=/path/to/engineer-provided/platform-constraints.txt
 test -f "$PLATFORM_CONSTRAINTS"
+# Reference ONLY: previously validated 910B2/aarch64, CANN 9.0.0,
+# torch_npu 2.7.1.post4. Engineer must approve compatibility before running.
+# Skip installation if an approved Triton-Ascend is already installed.
+python -m pip install -c "$PLATFORM_CONSTRAINTS" 'triton-ascend==3.2.1' \
+  --only-binary=:all: --index-url https://pypi.org/simple \
+  --extra-index-url https://triton-ascend.osinfra.cn/pypi/simple
+python -c 'import triton, importlib.metadata as m; print("triton-ascend:", m.version("triton-ascend"), "imported triton:", triton.__version__)'
 python -m pip install -c "$PLATFORM_CONSTRAINTS" -c constraints-ascend.txt \
   -r requirements-ascend.txt
 # Check the base/project stack before DA3 adds its full dependency metadata.
@@ -71,6 +78,18 @@ export UAVFLOW_ACCELERATOR=npu
 export UAVFLOW_QWEN_FLA_NPU=1
 export UAVFLOW_DISABLE_FLEX_ATTENTION=1
 ```
+
+The Triton-Ascend command above follows the [official installation guide](https://github.com/Ascend/triton-ascend/blob/main/docs/en/installation_guide.md),
+which supplies an additional package index for 3.2.1; do not assume PyPI alone
+hosts that release. `--only-binary=:all:` requires wheels matching this Python,
+architecture and platform and fails rather than silently compiling. Review pip's
+dependency changes (use `--dry-run` first if needed); 3.2.1 also declares a
+community `triton` dependency whose version varies by architecture. Do not bypass
+platform constraints or automatically uninstall a working stack. Other
+CANN/torch_npu/hardware combinations require a separately approved version, not
+blind reuse of this reference. The distribution version and imported
+`triton.__version__` may differ; the recorded environment reports 3.2.1 and
+3.2.0 respectively. Verify the later FLA forward/backward smoke, not just import.
 
 Both DA3 installation flags are required: `--no-deps` skips its runtime
 dependency resolution but **does not disable isolated build dependencies**.

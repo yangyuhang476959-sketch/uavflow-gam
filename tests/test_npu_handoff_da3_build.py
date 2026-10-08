@@ -18,3 +18,11 @@ def test_yaml_precedes_runtime_import_and_pip_check_precedes_da3():
     assert document.index('pip install --no-deps PyYAML==6.0.2') < document.index("python -c 'import torch, torch_npu")
     assert document.index('python -m pip check') < document.index('git clone https://github.com/ByteDance-Seed/Depth-Anything-3.git')
     assert document.count('python -m pip check') == 1
+
+
+def test_triton_reference_install_uses_official_extra_index_and_platform_constraints():
+    document = (Path(__file__).resolve().parents[1] / 'NPU_SETUP.md').read_text()
+    assert 'pip install -c "$PLATFORM_CONSTRAINTS" \'triton-ascend==3.2.1\'' in document
+    assert '--extra-index-url https://triton-ascend.osinfra.cn/pypi/simple' in document
+    assert '--only-binary=:all:' in document
+    assert document.index("'triton-ascend==3.2.1'") < document.index("python -c 'import triton")
