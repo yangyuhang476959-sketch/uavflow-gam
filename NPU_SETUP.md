@@ -10,9 +10,9 @@ and the target hardware's installation guide: Driver/Firmware, CANN and matching
 ops, PyTorch/torch_npu/torchvision, and Triton-Ascend for the Qwen FLA path.
 Different A2/A3 hardware or software versions require manual compatibility checks.
 This guide does not install or modify those components, or use the automatic
-bootstrap scripts. The audit defaults to strict validation of the recorded
-PyTorch/torch_npu pair. For an officially compatible alternative, the engineer
-must explicitly enable compatibility testing (see Section 3).
+bootstrap scripts. The audit checks runtime usability without hard-coding the
+historical PyTorch/torch_npu pair; official stack compatibility remains the
+receiving engineer's responsibility.
 
 The steps below install only the project environment, prepare data, and verify
 the model. Run them from one Bash session. This document was prepared on an
@@ -134,22 +134,12 @@ export OUTPUT_ROOT="$PROJECT_ROOT/results/vla_gam_matrix_v2"
 
 Run on the receiving NPU node after environment preparation:
 
-Keep `ASCEND_RUNTIME_POLICY` unset (or `reference`) for the recorded pair. Only
-after checking the alternative against Huawei's official compatibility guidance:
+No compatibility-mode switch is needed. Project package pins, NPU availability,
+tensor/ABI checks and data audit remain active; they do not establish full
+hardware/software compatibility. A standalone import audit is:
 
 ```bash
-export ASCEND_RUNTIME_POLICY=compatibility
-```
-
-This explicitly relaxes the historical PyTorch/torch_npu version gate only.
-Project package pins, NPU availability, tensor/ABI checks and data audit remain
-active. It prints a warning, does not install/repair anything, and does not claim
-the alternative stack is validated. The same environment variable is passed by
-all ten job entrypoints to their pre-training audit. A standalone import audit is:
-
-```bash
-python scripts/verify_uavflow_remote.py --imports-only --accelerator npu \
-  --ascend-runtime-policy "${ASCEND_RUNTIME_POLICY:-reference}"
+python scripts/verify_uavflow_remote.py --imports-only --accelerator npu
 ```
 
 ```bash
@@ -171,7 +161,6 @@ print('Imports, NumPy/SciPy and NPU BF16 forward/backward PASS')
 PY
 
 python scripts/verify_uavflow_remote.py --accelerator npu \
-  --ascend-runtime-policy "${ASCEND_RUNTIME_POLICY:-reference}" \
   --sim-root "$UAVFLOW_SIM_ROOT" --depth-root "$UAVFLOW_DEPTH_ROOT" \
   --da3-checkpoint "$DA3_CHECKPOINT" --qwen-model "$QWEN_MODEL" --t5-model "$T5_MODEL"
 
