@@ -38,6 +38,8 @@ Then load the exact existing CANN installation selected by the engineer:
 export CANN_ENV_FILE=/path/to/selected/CANN/set_env.sh
 source "$CANN_ENV_FILE"
 npu-smi info
+# Fresh Python environments may need yaml before torch_npu can be imported.
+python -m pip install --no-deps PyYAML==6.0.2 --index-url https://pypi.org/simple
 python -c 'import torch, torch_npu, torchvision, triton; print(torch.__version__, torch_npu.__version__, torchvision.__version__, triton.__version__)'
 
 git clone https://github.com/yangyuhang476959-sketch/uavflow-gam.git
@@ -49,9 +51,16 @@ export PLATFORM_CONSTRAINTS=/path/to/engineer-provided/platform-constraints.txt
 test -f "$PLATFORM_CONSTRAINTS"
 python -m pip install -c "$PLATFORM_CONSTRAINTS" -c constraints-ascend.txt \
   -r requirements-ascend.txt
+# Check the base/project stack before DA3 adds its full dependency metadata.
+python -m pip check
 git clone https://github.com/ByteDance-Seed/Depth-Anything-3.git Depth-Anything-3
 git -C Depth-Anything-3 checkout --detach 2c21ea849ceec7b469a3e62ea0c0e270afc3281a
-python -m pip install --no-deps -e Depth-Anything-3
+# Prepare editable-build tools in this environment before disabling isolation.
+# Use an accessible index; PyPI is shown here instead of the failing mirror.
+python -m pip install -c "$PLATFORM_CONSTRAINTS" -c constraints-ascend.txt \
+  'hatchling>=1.25' 'hatch-vcs>=0.4' editables \
+  --index-url https://pypi.org/simple
+python -m pip install --no-build-isolation --no-deps -e ./Depth-Anything-3
 
 export FLA_ASCEND_DIR="$PROJECT_ROOT/.ascend/flash-linear-attention"
 mkdir -p "$PROJECT_ROOT/.ascend"
@@ -61,7 +70,30 @@ export PYTHONPATH="$FLA_ASCEND_DIR:$PROJECT_ROOT/src:$PROJECT_ROOT${PYTHONPATH:+
 export UAVFLOW_ACCELERATOR=npu
 export UAVFLOW_QWEN_FLA_NPU=1
 export UAVFLOW_DISABLE_FLEX_ATTENTION=1
-python -m pip check
+```
+
+Both DA3 installation flags are required: `--no-deps` skips its runtime
+dependency resolution but **does not disable isolated build dependencies**.
+`--no-build-isolation` uses the already-installed build tools, avoiding another
+temporary environment trying to download `hatchling`/`editables` from a failing
+index. Network access to the chosen index still requires manual verification.
+
+Run `pip check` before installing DA3 to audit the base/project stack. After
+the deliberate `--no-deps` DA3 install, a subsequent `pip check` audits DA3's
+complete declared dependency set, not just our training path. It may report
+missing `e3nn`, `open3d`, `pycolmap`, `xformers`, `fastapi`, or other packages
+used outside this path. Do not blindly install them or rerun DA3 installation
+without `--no-deps`: review each finding, retain platform constraints, and run
+the repository-path import check below and the later runtime/R1 smoke tests.
+Conflicts in actual training dependencies still require resolution.
+
+```bash
+PYTHONPATH="$PROJECT_ROOT/src:$PROJECT_ROOT${PYTHONPATH:+:$PYTHONPATH}" python - <<'PY'
+from robot.modeling.da3_giant_encoder import _install_da3_optional_stubs
+_install_da3_optional_stubs()
+from depth_anything_3.api import DepthAnything3
+print("DA3 training-path import OK")
+PY
 ```
 
 `requirements-ascend.txt` pins the project packages, including NumPy/SciPy and
