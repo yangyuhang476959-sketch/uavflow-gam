@@ -899,6 +899,7 @@ class GAMFuturePredictor(nn.Module):
         input_proj_norm: str = "ln",
         gradient_checkpointing: bool = False,
         num_action_slots: int = 1,
+        action_slot_position_encoding: bool = True,
     ):
         super().__init__()
         self.d_da3 = int(d_da3)
@@ -1019,7 +1020,7 @@ class GAMFuturePredictor(nn.Module):
             nn.SiLU(),
             nn.Linear(d_model, d_model),
         )
-        if self.num_action_slots > 1:
+        if self.num_action_slots > 1 and action_slot_position_encoding:
             self.action_slot_embed = nn.Parameter(
                 torch.zeros(1, 1, self.num_action_slots, d_model)
             )

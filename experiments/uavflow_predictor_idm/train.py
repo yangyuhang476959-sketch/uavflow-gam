@@ -381,6 +381,7 @@ def main() -> None:
         parallel_action_decode_mode=str(
             cfg.model.get("parallel_action_decode_mode", "full")
         ),
+        parallel_action_position_mode=str(cfg.model.get("parallel_action_position_mode", "legacy")),
         train_deep_backbone=train_deep_parameters,
         deep_train_start_block=int(
             deep_lora_cfg.get("start_block", cfg.model.get("deep_train_start_block", da3.out_layers[0]))
@@ -636,6 +637,7 @@ def main() -> None:
             "stage1.qwen_prompt_mode",
             "stage1.qwen_token_selection",
             "stage1.qwen_lora_enabled",
+            "stage1.qwen_lora_scope",
             "stage1.qwen_action_attention_mode",
             "stage1.qwen_lora_rank",
             "stage1.qwen_lora_alpha",
@@ -692,6 +694,7 @@ def main() -> None:
             "model.parallel_vla_gfm_heads",
             "model.parallel_vla_gfm_mode",
             "model.parallel_action_post_bidir_layers",
+            "model.parallel_action_position_mode",
             "model.parallel_current_depth_enabled",
             "model.parallel_current_geometry_read_enabled",
             "model.relative_pose_head_enabled",

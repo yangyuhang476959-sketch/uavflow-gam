@@ -41,6 +41,7 @@ class FrozenQwen35Conditioner(nn.Module):
         lora_rank: int = 32,
         lora_alpha: float = 16.0,
         lora_dropout: float = 0.0,
+        lora_scope: str = "all_linear",
         action_placeholder_count: int = 0,
         action_attention_mode: str = "causal",
     ) -> None:
@@ -55,6 +56,7 @@ class FrozenQwen35Conditioner(nn.Module):
             lora_rank=lora_rank,
             lora_alpha=lora_alpha,
             lora_dropout=lora_dropout,
+            lora_scope=lora_scope,
             action_placeholder_count=action_placeholder_count,
             action_attention_mode=action_attention_mode,
         )
@@ -139,6 +141,9 @@ def build_stage2_conditioner(stage1_cfg, model_cfg) -> nn.Module:
             lora_rank=int(stage1_cfg.get("qwen_lora_rank", 32)),
             lora_alpha=float(stage1_cfg.get("qwen_lora_alpha", 16)),
             lora_dropout=float(stage1_cfg.get("qwen_lora_dropout", 0.0)),
+            # Old checkpoints predate scope metadata; keep their exact module
+            # names/shapes instead of silently introducing new adapters.
+            lora_scope=str(stage1_cfg.get("qwen_lora_scope", "legacy_language")),
             action_placeholder_count=int(
                 stage1_cfg.get("qwen_action_placeholder_count", 0)
             ),

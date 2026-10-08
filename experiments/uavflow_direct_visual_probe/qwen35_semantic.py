@@ -18,6 +18,7 @@ import torch
 from PIL import Image
 from torch import nn
 from robot.modeling.lora import LoRALinear
+from experiments.uavflow_direct_visual_probe.qwen_lora import inject_qwen_lora
 from experiments.uavflow_predictor_idm.runtime import profile_phase
 
 
@@ -230,6 +231,7 @@ class FrozenQwen35SemanticEncoder(nn.Module):
         lora_rank: int = 32,
         lora_alpha: float = 16.0,
         lora_dropout: float = 0.0,
+        lora_scope: str = "all_linear",
         action_placeholder_count: int = 0,
         action_attention_mode: str = "causal",
     ) -> None:
@@ -247,26 +249,19 @@ class FrozenQwen35SemanticEncoder(nn.Module):
         ).eval().requires_grad_(False)
         self.fla_npu_patched_layers = _patch_qwen_fla_npu(self.qwen)
         self.lora_enabled = bool(lora_enabled)
+        self.lora_scope = str(lora_scope)
+        self.lora_module_names = ()
         if self.lora_enabled:
-            target_suffixes = {
-                "q_proj", "k_proj", "v_proj", "o_proj",
-                "gate_proj", "up_proj", "down_proj",
-            }
-            replacements = []
-            language_model = self.qwen.model.language_model
-            for name, module in language_model.named_modules():
-                if isinstance(module, nn.Linear) and name.rsplit(".", 1)[-1] in target_suffixes:
-                    replacements.append((name, module))
-            for name, module in replacements:
-                parent_name, child_name = name.rsplit(".", 1)
-                parent = language_model.get_submodule(parent_name)
-                setattr(parent, child_name, LoRALinear(
-                    module, rank=int(lora_rank), alpha=float(lora_alpha),
-                    dropout=float(lora_dropout),
-                ))
-            if not replacements:
-                raise RuntimeError("Qwen LoRA enabled but no target Linear modules were found")
-            self.lora_module_count = len(replacements)
+            self.lora_module_names = inject_qwen_lora(
+                self.qwen, rank=lora_rank, alpha=lora_alpha,
+                dropout=lora_dropout, scope=self.lora_scope,
+            )
+            self.lora_module_count = len(self.lora_module_names)
+            trainable = sum(p.numel() for p in self.qwen.parameters() if p.requires_grad)
+            print(f"Qwen LoRA scope={self.lora_scope} modules={self.lora_module_count} "
+                  f"rank={lora_rank} alpha={lora_alpha} dropout={lora_dropout} "
+                  f"trainable_adapter_parameters={trainable}", flush=True)
+            print(f"Qwen LoRA targets={list(self.lora_module_names)}", flush=True)
         else:
             self.lora_module_count = 0
         self.action_placeholder_count = int(action_placeholder_count)

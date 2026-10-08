@@ -138,6 +138,22 @@ class ActionHeadV2(nn.Module):
 
         raise ValueError(f"Expected 3 or 4 dims, got {action_tokens.shape}.")
 
+    def forward_slots(self, action_tokens: torch.Tensor) -> torch.Tensor:
+        """Decode K existing slots with the same head/step offsets as GAM.
+
+        Unlike forward(), this does not broadcast one hidden into K copies.
+        Input is [B,T,K,D]; step embedding is applied only in the decoder.
+        """
+        if self.chunk_position_encoding != "learned":
+            raise ValueError("forward_slots requires learned chunk_position_encoding")
+        if action_tokens.ndim != 4 or action_tokens.shape[-2] != self.chunk_size:
+            raise ValueError("Expected [B,T,chunk_size,D] existing action slots")
+        x = F.relu(self.input_proj(action_tokens.to(dtype=self.input_proj.weight.dtype)))
+        x = x + self.chunk_pos_embed.to(dtype=x.dtype).view(1, 1, self.chunk_size, -1)
+        for block in self.blocks:
+            x = block(x)
+        return self.output(self.norm_out(x))
+
     def forward(self, action_tokens: torch.Tensor, view_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         x, batch_size, timesteps = self._reshape_input(action_tokens, view_mask=view_mask)
         proj_dtype = self.input_proj.weight.dtype

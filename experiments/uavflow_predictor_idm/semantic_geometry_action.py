@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import torch
 from torch import nn
+from robot.modeling.action_head_v2 import ActionHeadV2
 
 
 def _append_safe_key(language, mask):
@@ -205,8 +206,16 @@ SemanticGeometryActionBridge = SemanticActionInitializer
 
 class ParallelContinuousActionHead(nn.Module):
     """Shared token-wise head: [B,T,V,K,D] -> [B,T,K,A]."""
-    def __init__(self, input_dim, action_dim):
+    def __init__(self, input_dim, action_dim, *, chunk_size=5, decoder_step_embedding=False):
         super().__init__()
+        self.decoder_step_embedding = bool(decoder_step_embedding)
+        if self.decoder_step_embedding:
+            self.decoder = ActionHeadV2(
+                input_dim=input_dim, hidden_dim=input_dim, n_views=1,
+                n_dims=action_dim, chunk_size=chunk_size, num_blocks=2,
+                pool_mode="mean", chunk_position_encoding="learned",
+            )
+            return
         self.model = nn.Sequential(
             nn.LayerNorm(input_dim), nn.Linear(input_dim, input_dim), nn.GELU(),
             nn.Linear(input_dim, input_dim), nn.GELU(), nn.Linear(input_dim, action_dim),
@@ -220,4 +229,6 @@ class ParallelContinuousActionHead(nn.Module):
                 "parallel action tokens must be [B,T,V,K,D] or [B,T,K,D], got "
                 f"{tuple(tokens.shape)}"
             )
+        if self.decoder_step_embedding:
+            return self.decoder.forward_slots(tokens)
         return self.model(tokens)

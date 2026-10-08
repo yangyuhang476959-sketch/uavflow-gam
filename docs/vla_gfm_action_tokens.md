@@ -31,9 +31,21 @@ and whether the action is decoded before or after GFM.
    matching Current Geometry Bank levels through gated cross-attention, then
    continue with predicted-future tokens. This is configurable for controlled
    cost/representation ablations.
-6. A shared token-wise MLP maps the five refined tokens to `[5,4]` continuous
+6. A shared token-wise decoder maps the five refined tokens to `[5,4]` continuous
    UAV actions. Current geometry never reads Future or Action, so the observed
    representation remains causal and action-free.
+
+### Decoder-only action step encoding
+
+New matrix VLA runs set `model.parallel_action_position_mode=decoder_only`.
+Qwen keeps its native RoPE and distinct learned action-placeholder embeddings.
+No extra action-slot embedding is added in the Future Predictor or before DA3
+deep. The five existing hidden states are decoded with the same `ActionHeadV2`
+structure as GAM: input projection, one learned five-step embedding, two
+residual MLP blocks, output normalization and a shared four-dimensional output.
+The five slots are not pooled into one hidden state. Backbone spatial/time RoPE
+is unchanged. Configurations/checkpoints without this option retain `legacy`
+behavior; the two parameter layouts are not interchangeable for strict resume.
 
 ## Modes
 
@@ -79,9 +91,19 @@ The complete ten-command list and required environment variables are in
 `docs/REMOTE_TRAINING.md`.  No shell launcher is required by the scheduler.
 
 The primary external-Query and internal-Slot VLA runs both use dependency-free
-LoRA on Qwen language-model `q/k/v/o` and MLP projections at rank 32, alpha 16
-and dropout 0. Frozen-Qwen variants are retained only as conditioning/architecture
-controls and are not labelled VLA-init results.
+LoRA with OpenVLA-UAV's `all-linear` targeting rule: all Qwen `nn.Linear`
+modules, including language full/linear attention, MLPs, visual attention/MLPs,
+and the visual merger, excluding the final vocabulary output head. Rank is 32,
+alpha 16, dropout 0; A uses Gaussian initialization with std `1/r`, and B is zero.
+New matrix jobs explicitly set `stage1.qwen_lora_scope=all_linear` and print the
+target list and trainable adapter parameter count. This aligns the rule, not the
+parameter count across different backbones. Frozen-Qwen variants are retained
+only as conditioning/architecture controls and are not labelled VLA-init results.
+
+Older checkpoints without scope metadata retain `legacy_language` targeting
+(only seven language projection suffixes) when loaded through the conditioner.
+They must not silently resume with all-linear adapters or be described as
+all-linear results. Scope is included in the strict resume configuration checks.
 
 ## Geometry Bank ablations
 

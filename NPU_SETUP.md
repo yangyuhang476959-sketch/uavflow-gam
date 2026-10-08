@@ -222,13 +222,13 @@ python experiments/uavflow_remote_ablation/jobs_v2/09_r1.py \
 
 Then submit **one experiment per eight-NPU node**; choose one line, not all ten on
 the same node. The reference defaults are batch 4/NPU, total batch 32, Stage 1
-20 epochs constant LR, Stage 2 20 epochs cosine LR with Stop. The base LR is
+10 epochs constant LR, Stage 2 10 epochs cosine LR with Stop. The base LR is
 `5e-5`; Stage 2 policy base LR is divided by 10, Stop LR is `5e-4` (the model's
 existing parameter-group multipliers still apply).
 
 ```bash
 export NPROC=8 GLOBAL_BATCH_SIZE=32 DEVICE_IDS=0,1,2,3,4,5,6,7
-export STAGE1_EPOCHS=20 STAGE2_EPOCHS=20
+export STAGE1_EPOCHS=10 STAGE2_EPOCHS=10
 python experiments/uavflow_remote_ablation/jobs_v2/01_g0.py  # T5, no numeric pose
 python experiments/uavflow_remote_ablation/jobs_v2/02_g1.py  # T5 + numeric pose
 python experiments/uavflow_remote_ablation/jobs_v2/03_c0.py  # frozen Qwen condition

@@ -146,8 +146,8 @@ def main() -> None:
             "CUDA_DEVICES", ",".join(str(index) for index in range(nproc))
         ),
     )
-    stage1_epochs = int(os.environ.get("STAGE1_EPOCHS", "20"))
-    stage2_epochs = int(os.environ.get("STAGE2_EPOCHS", "20"))
+    stage1_epochs = int(os.environ.get("STAGE1_EPOCHS", "10"))
+    stage2_epochs = int(os.environ.get("STAGE2_EPOCHS", "10"))
     base_lr = float(os.environ.get("BASE_LR", "5e-5"))
 
     env = os.environ.copy()

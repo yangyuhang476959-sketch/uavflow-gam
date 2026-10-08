@@ -578,9 +578,13 @@ class UAVFlowPredictorIDM(nn.Module):
         parallel_current_depth_enabled: bool = True,
         parallel_current_geometry_read_enabled: bool = True,
         parallel_action_decode_mode: str = "full",
+        parallel_action_position_mode: str = "legacy",
     ) -> None:
         super().__init__()
         self.da3 = da3
+        self.parallel_action_position_mode = str(parallel_action_position_mode)
+        if self.parallel_action_position_mode not in {"legacy", "decoder_only"}:
+            raise ValueError("parallel_action_position_mode must be legacy or decoder_only")
         self.idm = idm
         self.rollout_steps = int(rollout_steps)
         self.action_dim = int(action_dim)
@@ -731,6 +735,7 @@ class UAVFlowPredictorIDM(nn.Module):
             input_proj_norm="ln",
             gradient_checkpointing=bool(gradient_checkpointing),
             num_action_slots=(self.action_chunk_size if self.parallel_vla_gfm_enabled else 1),
+            action_slot_position_encoding=self.parallel_action_position_mode == "legacy",
         )
         if self.vlm_action_seed_enabled:
             # Select one already multimodally contextualized Qwen token, then
@@ -818,7 +823,7 @@ class UAVFlowPredictorIDM(nn.Module):
             self.semantic_geometry_action = initializer_cls(**initializer_kwargs)
         self.deep_action_step_embed = (
             nn.Parameter(torch.empty(1, 1, 1, self.action_chunk_size, int(da3.embed_dim)))
-            if self.parallel_vla_gfm_enabled else None
+            if self.parallel_vla_gfm_enabled and self.parallel_action_position_mode == "legacy" else None
         )
         if self.deep_action_step_embed is not None:
             nn.init.normal_(self.deep_action_step_embed, std=0.02)
@@ -837,13 +842,17 @@ class UAVFlowPredictorIDM(nn.Module):
             self.semantic_geometry_action = None
         self.parallel_action_head = (
             ParallelContinuousActionHead(
-                input_dim=int(da3.embed_dim), action_dim=int(action_dim)
+                input_dim=int(da3.embed_dim), action_dim=int(action_dim),
+                chunk_size=self.action_chunk_size,
+                decoder_step_embedding=self.parallel_action_position_mode == "decoder_only",
             )
             if self.parallel_vla_gfm_enabled else None
         )
         self.parallel_action_correction_head = (
             ParallelContinuousActionHead(
-                input_dim=int(da3.embed_dim), action_dim=int(action_dim)
+                input_dim=int(da3.embed_dim), action_dim=int(action_dim),
+                chunk_size=self.action_chunk_size,
+                decoder_step_embedding=self.parallel_action_position_mode == "decoder_only",
             )
             if self.parallel_vla_gfm_enabled
             and self.parallel_action_decode_mode == "geometry_residual"
@@ -852,7 +861,11 @@ class UAVFlowPredictorIDM(nn.Module):
         if self.parallel_action_correction_head is not None:
             # R1 starts as the exact VLA base policy. Geometry must learn only
             # a correction, rather than replacing the semantic plan at step 0.
-            final = self.parallel_action_correction_head.model[-1]
+            final = (
+                self.parallel_action_correction_head.decoder.output
+                if self.parallel_action_position_mode == "decoder_only"
+                else self.parallel_action_correction_head.model[-1]
+            )
             nn.init.zeros_(final.weight)
             nn.init.zeros_(final.bias)
         # Auxiliary endpoint supervision. Given the observed episode-relative

@@ -112,6 +112,7 @@ def architecture_state(model):
         "parallel_action_decode_mode": getattr(
             model, "parallel_action_decode_mode", "full"
         ),
+        "parallel_action_position_mode": getattr(model, "parallel_action_position_mode", "legacy"),
     }
 
 
@@ -123,6 +124,8 @@ def load_architecture_state(model, checkpoint):
         return
     if state["mode"] != model.geometry_architecture:
         raise ValueError("Geometry architecture changed; checkpoint is not compatible")
+    if state.get("parallel_action_position_mode", "legacy") != getattr(model, "parallel_action_position_mode", "legacy"):
+        raise ValueError("Parallel action position mode changed; checkpoint is not compatible")
     saved_decode = state.get("parallel_action_decode_mode", "full")
     current_decode = getattr(model, "parallel_action_decode_mode", "full")
     if saved_decode != current_decode:

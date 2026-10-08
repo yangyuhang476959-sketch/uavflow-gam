@@ -9,11 +9,11 @@ horizon, GAM `3:1:3` action/feature/depth loss, full-rank DA3 blocks 13+, no
 first-frame duplication, and the natural five terminal absorbing windows. No
 artificial 20% terminal rebalance is applied.
 
-Stage 1 trains action/feature/depth for 20 epochs at constant LR. During
+Stage 1 trains action/feature/depth for 10 epochs at constant LR. During
 validation it atomically maintains `best_action.pt` using the lowest H=1
 validation Action loss. Stage 2 starts from that checkpoint (not blindly from
 the final epoch) and jointly fine-tunes the same policy plus the Stop head for
-20 epochs with cosine decay. Only Stop receives its separate normalized pose
+10 epochs with cosine decay. Only Stop receives its separate normalized pose
 branch; this does not alter the main pose ablation. For five-slot policies,
 Stop preserves order by concatenating the five refined states before its MLP.
 
@@ -49,8 +49,13 @@ full-rotation coordinates, xyz in centimetres and yaw in degrees. Literal
 The prepended F0 reference contains visual tokens only from the attention
 graph: its rectangular placeholder action slots are fully key-masked and
 zeroed. Only the real current Ft block owns control slots. Five-slot VLA--GAM
-also adds a learned DA3-width chunk-step embedding before deep refinement, so
-action order remains explicit in both the Future Predictor and geometry path.
+keeps Qwen's native RoPE and placeholder embeddings, but adds no extra slot-step
+embedding in the Future Predictor or DA3 deep path. Its `decoder_only` mode adds
+one learned five-step embedding at the ActionHeadV2 decoder. Existing GAM baseline
+heads are unchanged. New LoRA-enabled matrix cells use `all_linear`, including
+visual and linear-attention projections while excluding the vocabulary output
+head; rank 32, alpha 16 and dropout 0 are unchanged. Old checkpoints retain their
+legacy layouts and must not be silently resumed into these new variants.
 
 ## One Python command per 8-GPU cluster job
 
