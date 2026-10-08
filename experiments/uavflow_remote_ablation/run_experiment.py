@@ -176,6 +176,7 @@ def main() -> None:
         "--sim-root", str(sim), "--depth-root", str(depth),
         "--da3-checkpoint", str(da3), "--qwen-model", str(qwen),
         "--t5-model", str(t5), "--accelerator", requested_accelerator,
+        "--ascend-runtime-policy", os.environ.get("ASCEND_RUNTIME_POLICY", "reference"),
     ], cwd=ROOT, env=env, check=True)
 
     common = [

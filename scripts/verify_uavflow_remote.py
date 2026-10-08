@@ -31,7 +31,34 @@ def require(path: Path, description: str) -> None:
         raise FileNotFoundError(f"Missing {description}: {path}")
 
 
-def verify_runtime(accelerator: str = "auto") -> None:
+def verify_ascend_versions(torch_version: str, npu_version: str,
+                           policy: str = "reference") -> None:
+    """Compatibility mode relaxes only the historical version gate, not smoke tests."""
+    if policy not in {"reference", "compatibility"}:
+        raise ValueError(f"Unknown Ascend runtime policy: {policy}")
+    if policy == "compatibility":
+        print(
+            "WARNING: Ascend compatibility-test mode; "
+            f"torch={torch_version} torch_npu={npu_version}. "
+            "The operator must confirm official hardware/Driver/CANN compatibility. "
+            "Passing this audit does not establish full model/platform validation."
+        )
+        return
+    if torch_version.split("+")[0] != "2.7.1":
+        raise RuntimeError(
+            f"Reference Ascend audit requires torch 2.7.1, got {torch_version}. "
+            "For an operator-confirmed alternative stack, explicitly select "
+            "--ascend-runtime-policy compatibility."
+        )
+    if npu_version != "2.7.1.post4":
+        raise RuntimeError(
+            f"Reference Ascend audit requires torch_npu 2.7.1.post4, got {npu_version}. "
+            "For an operator-confirmed alternative stack, explicitly select "
+            "--ascend-runtime-policy compatibility."
+        )
+
+
+def verify_runtime(accelerator: str = "auto", ascend_runtime_policy: str = "reference") -> None:
     versions = {}
     for distribution, expected in PINNED_RUNTIME.items():
         actual = importlib.metadata.version(distribution)
@@ -58,13 +85,8 @@ def verify_runtime(accelerator: str = "auto") -> None:
             ) from exc
         if not torch_npu.npu.is_available():
             raise RuntimeError("torch_npu imported but no Ascend NPU is available")
-        if torch.__version__.split("+")[0] != "2.7.1":
-            raise RuntimeError(f"Ascend requires torch 2.7.1, got {torch.__version__}")
         actual_npu = getattr(torch_npu, "__version__", "unknown")
-        if actual_npu != "2.7.1.post4":
-            raise RuntimeError(
-                f"Ascend requires torch_npu 2.7.1.post4, got {actual_npu}"
-            )
+        verify_ascend_versions(torch.__version__, actual_npu, ascend_runtime_policy)
         device = torch.device("npu:0")
         probe = torch.arange(4, dtype=torch.float32, device=device)
         if float(probe.sum().cpu()) != 6.0:
@@ -204,6 +226,12 @@ def main() -> None:
     parser.add_argument(
         "--accelerator", choices=("auto", "cuda", "npu", "ascend"), default="auto"
     )
+    parser.add_argument(
+        "--ascend-runtime-policy", choices=("reference", "compatibility"),
+        default="reference",
+        help="Keep the validated version pair strict by default; explicitly allow "
+             "an operator-confirmed alternative pair for compatibility testing.",
+    )
     parser.add_argument("--sim-root", type=Path)
     parser.add_argument("--depth-root", type=Path)
     parser.add_argument("--da3-checkpoint", type=Path)
@@ -212,7 +240,7 @@ def main() -> None:
     parser.add_argument("--depth-samples", type=int, default=3)
     args = parser.parse_args()
 
-    verify_runtime(args.accelerator)
+    verify_runtime(args.accelerator, args.ascend_runtime_policy)
     if args.imports_only:
         return
 

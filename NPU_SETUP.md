@@ -10,8 +10,9 @@ and the target hardware's installation guide: Driver/Firmware, CANN and matching
 ops, PyTorch/torch_npu/torchvision, and Triton-Ascend for the Qwen FLA path.
 Different A2/A3 hardware or software versions require manual compatibility checks.
 This guide does not install or modify those components, or use the automatic
-bootstrap scripts. The current matrix audit still enforces the validated
-PyTorch/torch_npu pair; a different pair requires project compatibility review.
+bootstrap scripts. The audit defaults to strict validation of the recorded
+PyTorch/torch_npu pair. For an officially compatible alternative, the engineer
+must explicitly enable compatibility testing (see Section 3).
 
 The steps below install only the project environment, prepare data, and verify
 the model. Run them from one Bash session. This document was prepared on an
@@ -43,7 +44,11 @@ git clone https://github.com/yangyuhang476959-sketch/uavflow-gam.git
 cd uavflow-gam
 export PROJECT_ROOT="$PWD"
 
-python -m pip install -c constraints-ascend.txt -r requirements-ascend.txt
+# Engineer-provided file: pin the exact approved torch, torch-npu and torchvision.
+export PLATFORM_CONSTRAINTS=/path/to/engineer-provided/platform-constraints.txt
+test -f "$PLATFORM_CONSTRAINTS"
+python -m pip install -c "$PLATFORM_CONSTRAINTS" -c constraints-ascend.txt \
+  -r requirements-ascend.txt
 git clone https://github.com/ByteDance-Seed/Depth-Anything-3.git Depth-Anything-3
 git -C Depth-Anything-3 checkout --detach 2c21ea849ceec7b469a3e62ea0c0e270afc3281a
 python -m pip install --no-deps -e Depth-Anything-3
@@ -60,7 +65,11 @@ python -m pip check
 ```
 
 `requirements-ascend.txt` pins the project packages, including NumPy/SciPy and
-DA3's import dependencies. Do not install the CUDA environment file or optional
+DA3's import dependencies. The engineer must supply `PLATFORM_CONSTRAINTS` with
+exact `torch==...`, `torch-npu==...` and `torchvision==...` entries matching the
+approved installed stack (including local version suffixes where applicable).
+It is a separate local file, not automatically detected or generated. pip must
+fail on a conflict rather than replace these versions. Do not install the CUDA environment file or optional
 `pycolmap` requirements on this training path. Review pip's proposed changes if
 it reports conflicts; do not let it replace the engineer-provided runtime.
 Clone dependencies once; for transferred checkouts, verify their pinned commits.
@@ -74,7 +83,7 @@ The existing helper downloads RGB/parquet and weights through the HF mirror,
 downloads our depth archive from ModelScope, and verifies/extracts that archive:
 
 ```bash
-python -m pip install -c constraints-ascend.txt modelscope==1.38.1
+python -m pip install -c "$PLATFORM_CONSTRAINTS" -c constraints-ascend.txt modelscope==1.38.1
 python scripts/download_uavflow_assets.py \
   --hf-endpoint https://hf-mirror.com \
   --depth-repo acetaffy123/UAV-Flow-Sim-Depth --workers 2
@@ -125,6 +134,24 @@ export OUTPUT_ROOT="$PROJECT_ROOT/results/vla_gam_matrix_v2"
 
 Run on the receiving NPU node after environment preparation:
 
+Keep `ASCEND_RUNTIME_POLICY` unset (or `reference`) for the recorded pair. Only
+after checking the alternative against Huawei's official compatibility guidance:
+
+```bash
+export ASCEND_RUNTIME_POLICY=compatibility
+```
+
+This explicitly relaxes the historical PyTorch/torch_npu version gate only.
+Project package pins, NPU availability, tensor/ABI checks and data audit remain
+active. It prints a warning, does not install/repair anything, and does not claim
+the alternative stack is validated. The same environment variable is passed by
+all ten job entrypoints to their pre-training audit. A standalone import audit is:
+
+```bash
+python scripts/verify_uavflow_remote.py --imports-only --accelerator npu \
+  --ascend-runtime-policy "${ASCEND_RUNTIME_POLICY:-reference}"
+```
+
 ```bash
 python - <<'PY'
 import numpy as np, scipy.special, torch, torch_npu, triton, fla
@@ -144,6 +171,7 @@ print('Imports, NumPy/SciPy and NPU BF16 forward/backward PASS')
 PY
 
 python scripts/verify_uavflow_remote.py --accelerator npu \
+  --ascend-runtime-policy "${ASCEND_RUNTIME_POLICY:-reference}" \
   --sim-root "$UAVFLOW_SIM_ROOT" --depth-root "$UAVFLOW_DEPTH_ROOT" \
   --da3-checkpoint "$DA3_CHECKPOINT" --qwen-model "$QWEN_MODEL" --t5-model "$T5_MODEL"
 
