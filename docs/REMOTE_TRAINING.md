@@ -1,9 +1,9 @@
-# Remote training handoff
+# NVIDIA remote training handoff
 
 This release runs the ten-cell VLA--GAM matrix. Every experiment is one Python
 command intended for one complete 8x64GB GPU node.
 
-For Huawei Ascend nodes, use [ASCEND_TRAINING.md](ASCEND_TRAINING.md). Do not
+For Huawei Ascend nodes, use [NPU_SETUP.md](../NPU_SETUP.md). Do not
 install this CUDA environment on top of a vendor torch_npu image.
 
 ## 1. Environment

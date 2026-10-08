@@ -81,7 +81,8 @@ only through environment variables when the node differs. For a cheap launch
 audit, append `--max-trajectories 20 --stage stage1` and set
 `STAGE1_EPOCHS=1`.
 
-The same entrypoints run on Huawei Ascend after sourcing
-`scripts/ascend_env.sh` and exporting `DEVICE_IDS=0,1,2,3,4,5,6,7`. See
-`docs/ascend_cluster.md` for the exact 910B2/CANN environment, FLA setup,
-full audit, mandatory smoke test, and the 50-step R1 benchmark.
+For Huawei Ascend, follow the manual environment, data and smoke-test steps in
+[NPU_SETUP.md](../../NPU_SETUP.md), then use the same Python entrypoints with
+`UAVFLOW_ACCELERATOR=npu` and `DEVICE_IDS=0,1,2,3,4,5,6,7`. The receiving
+engineer prepares the officially compatible hardware stack; the former automatic
+Ascend bootstrap is not the handoff workflow.
