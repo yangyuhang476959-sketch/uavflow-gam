@@ -281,7 +281,8 @@ class StepBenchmark:
         return (
             f"[BENCH] steps={self.start_step}-{self.end_step} count={count} "
             f"elapsed={elapsed:.6f}s mean={mean:.6f}s/step "
-            f"throughput={count * self.samples_per_step / elapsed:.3f} samples/s"
+            f"throughput={count * self.samples_per_step / elapsed:.3f} samples/s "
+            f"peak_mem={max_memory_allocated_gb(self.accelerator):.2f}GB"
         )
 
 

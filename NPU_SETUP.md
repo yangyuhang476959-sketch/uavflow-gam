@@ -15,8 +15,11 @@ historical PyTorch/torch_npu pair; official stack compatibility remains the
 receiving engineer's responsibility.
 
 The steps below install only the project environment, prepare data, and verify
-the model. Run them from one Bash session. This document was prepared on an
-NVIDIA host; no new NPU validation was performed here.
+the model. Run them from one Bash session. The receiving engineer reported
+successful environment, FLA, dataset audit and actual single-card R1 training
+on 910B2, including the 2026-10-09 batch-size measurements recorded in
+[docs/ascend_cluster.md](docs/ascend_cluster.md). These are not eight-card
+training validation; documentation edits/tests here run on an NVIDIA host.
 
 ## 1. Python environment and project packages
 

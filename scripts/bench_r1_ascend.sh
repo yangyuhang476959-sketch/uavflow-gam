@@ -2,8 +2,14 @@
 set -Eeuo pipefail
 ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 export REPO_ROOT="${ROOT}"
-# shellcheck disable=SC1091
-source "${ROOT}/scripts/ascend_env.sh"
+# Use the engineer's already activated Python/CANN environment (NPU_SETUP.md).
+# Do not activate the historical .ascend/env or change the selected CANN stack.
+cd "${ROOT}"
+export UAVFLOW_ACCELERATOR=npu
+export UAVFLOW_DISABLE_FLEX_ATTENTION=1
+export TRITON_ASCEND_TARGET="${TRITON_ASCEND_TARGET:-${ROOT}/.ascend/triton}"
+export FLA_ASCEND_DIR="${FLA_ASCEND_DIR:-${ROOT}/.ascend/flash-linear-attention}"
+export PYTHONPATH="${TRITON_ASCEND_TARGET}:${FLA_ASCEND_DIR}:${ROOT}/src:${ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
 # A benchmark must not inherit profiling or experimental fusion flags from an
 # interactive shell. Keep only the validated FLA full-sequence path.
@@ -14,7 +20,7 @@ export UAVFLOW_QWEN_BENCHMARK_MODE=normal
 export UAVFLOW_GRAD_SCALER=auto
 
 export NPROC=1
-export GLOBAL_BATCH_SIZE=4
+export GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-4}"
 export DEVICE_IDS="${DEVICE_IDS:-0}"
 export STAGE1_EPOCHS=0
 export UAVFLOW_BENCH_START_STEP=11

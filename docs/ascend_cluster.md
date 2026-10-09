@@ -22,6 +22,34 @@ The full method measured 1.377254 s/step, about 2.904 samples/s and about
 checkpointing, evaluation and checkpoint writes disabled. These historical
 measurements are not expected performance on an arbitrary new node.
 
+### 2026-10-09 single-card batch-size test
+
+Reported by the receiving engineer on the 910B2 deployment, not measured on
+the documentation-editing NVIDIA host. Environment/dependencies, FLA, dataset
+audit and actual R1 training passed. This does not validate eight-card training.
+
+| Per-card batch | s/step | samples/s | Peak memory |
+| --- | --- | --- | --- |
+| 2 | 1.609 | 1.243 | 31.01 GB |
+| 4 | 1.683 | 2.376 | 36.99 GB |
+| 8 | 1.869 | 4.280 | 49.52 GB |
+| 12 | OOM | — | — |
+| 16 | OOM | — | — |
+
+These single-card results do not change the formal experiment default:
+8 cards, global batch 32 (per-card batch 4). For a repeat measurement, first
+activate the manually configured environment and source its CANN environment
+as in `NPU_SETUP.md`, then run:
+
+```bash
+GLOBAL_BATCH_SIZE=8 bash scripts/bench_r1_ascend.sh
+```
+
+The helper defaults to batch 4 and uses the active Python, not `.ascend/env`.
+`[BENCH]` reports synchronized timing over steps 11–50 and `peak_mem`, the
+process peak allocated accelerator memory (bytes / 1024³), not reserved memory
+or total device use. Raw logs/configuration remain necessary for comparing nodes.
+
 The production path did not enable NpuFusedAdamW (incompatible with the tested
 BF16 trainable parameters), fused RMSNorm (negligible gain), concatenated GDN
 projections, FLA gate/beta fusion, forced 192KiB UB, DA3 alias rewrites or a
