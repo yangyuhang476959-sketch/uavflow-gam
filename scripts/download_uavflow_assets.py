@@ -41,11 +41,16 @@ def main() -> None:
         "google-t5/t5-base", local_dir=models / "t5-base",
         max_workers=args.workers,
     )
-    hf_hub_download(
-        "SeonghuJeon/3da-libero-training-assets",
-        "checkpoints/track4world_da3.pth", repo_type="dataset",
-        local_dir=ROOT,
-    )
+    da3_checkpoint = models / "track4world_da3.pth"
+    if not da3_checkpoint.is_file():
+        downloaded = hf_hub_download(
+            "SeonghuJeon/3da-libero-training-assets",
+            "checkpoints/track4world_da3.pth", repo_type="dataset",
+            local_dir=models,
+        )
+        # HF retains the remote checkpoints/ prefix. Keep the public local
+        # layout flat beside Qwen/T5, including when --model-root is custom.
+        Path(downloaded).replace(da3_checkpoint)
     archive = data / "UAV-Flow-Sim-Depth-Archive"
     subprocess.run([
         "modelscope", "download", args.depth_repo, "--repo-type", "dataset",

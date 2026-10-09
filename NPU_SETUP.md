@@ -168,10 +168,25 @@ guess `LD_LIBRARY_PATH` or `ASCEND_OPP_PATH`.
 
 The existing helper downloads RGB/parquet and weights through the HF mirror,
 downloads our depth archive from ModelScope, and verifies/extracts that archive:
+Set `DATA_ROOT`, `MODEL_ROOT`, and `OUTPUT_ROOT` to your chosen directories
+before this block if needed. Unset variables retain the existing repository-local
+defaults; the same selected paths are used for downloads and training.
+
+For example, replace these placeholder paths with your storage directories:
+
+```bash
+export DATA_ROOT="/path/to/datasets"
+export MODEL_ROOT="/path/to/pretrained-models"
+export OUTPUT_ROOT="/path/to/training-output"
+```
 
 ```bash
 python -m pip install -c "$PLATFORM_CONSTRAINTS" -c constraints-ascend.txt modelscope==1.38.1
+export DATA_ROOT="${DATA_ROOT:-$PROJECT_ROOT/data_remote}"
+export MODEL_ROOT="${MODEL_ROOT:-$PROJECT_ROOT/checkpoints}"
+export OUTPUT_ROOT="${OUTPUT_ROOT:-$PROJECT_ROOT/results/vla_gam_matrix_v2}"
 python scripts/download_uavflow_assets.py \
+  --data-root "$DATA_ROOT" --model-root "$MODEL_ROOT" \
   --hf-endpoint https://hf-mirror.com \
   --depth-repo acetaffy123/UAV-Flow-Sim-Depth --workers 2
 ```
@@ -181,11 +196,12 @@ archive was transferred but not extracted:
 
 ```bash
 python scripts/extract_uavflow_depth.py \
-  --dataset-root "$PROJECT_ROOT/data_remote/UAV-Flow-Sim-Depth-Archive" \
-  --output "$PROJECT_ROOT/data_remote/UAV-Flow-Sim-Depth"
+  --dataset-root "$DATA_ROOT/UAV-Flow-Sim-Depth-Archive" \
+  --output "$DATA_ROOT/UAV-Flow-Sim-Depth"
 ```
 
-Required layout:
+Required layout (shown with the defaults; subdirectory names are unchanged
+under the engineer-selected data/model roots):
 
 ```text
 data_remote/UAV-Flow-Sim/train-*-of-00021.parquet       # 21 unchanged shards
@@ -209,12 +225,11 @@ parquet unchanged: the loader applies seven instruction corrections from metadat
 and handles RGB/trajectory preprocessing; the runner creates the shared split.
 
 ```bash
-export UAVFLOW_SIM_ROOT="$PROJECT_ROOT/data_remote/UAV-Flow-Sim"
-export UAVFLOW_DEPTH_ROOT="$PROJECT_ROOT/data_remote/UAV-Flow-Sim-Depth"
-export DA3_CHECKPOINT="$PROJECT_ROOT/checkpoints/track4world_da3.pth"
-export QWEN_MODEL="$PROJECT_ROOT/checkpoints/qwen3.5-2b"
-export T5_MODEL="$PROJECT_ROOT/checkpoints/t5-base"
-export OUTPUT_ROOT="$PROJECT_ROOT/results/vla_gam_matrix_v2"
+export UAVFLOW_SIM_ROOT="$DATA_ROOT/UAV-Flow-Sim"
+export UAVFLOW_DEPTH_ROOT="$DATA_ROOT/UAV-Flow-Sim-Depth"
+export DA3_CHECKPOINT="$MODEL_ROOT/track4world_da3.pth"
+export QWEN_MODEL="$MODEL_ROOT/qwen3.5-2b"
+export T5_MODEL="$MODEL_ROOT/t5-base"
 ```
 
 ## 3. Smoke tests

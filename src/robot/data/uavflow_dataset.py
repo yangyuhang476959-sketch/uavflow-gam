@@ -88,6 +88,11 @@ def _stratified_episode_split(ids, logs, eval_ratio, split_seed):
         quota[name] += 1
     while sum(quota.values()) > target_eval:
         candidates = [name for name in groups if quota[name] > 1]
+        if not candidates:
+            # Small smoke samples may have more represented classes than
+            # validation slots. Relax the per-class minimum only when it is
+            # infeasible; preserve the existing allocation/tie-break otherwise.
+            candidates = [name for name in groups if quota[name] > 0]
         name = min(
             candidates,
             key=lambda key: (exact[key] - quota[key], _UAVFLOW_TASK_CLASSES.index(key)),
