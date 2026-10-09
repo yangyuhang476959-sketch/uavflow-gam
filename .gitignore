@@ -11,6 +11,7 @@ outputs/
 wandb/
 .env
 server.env
+platform-constraints.txt
 .venv/
 .venv-ascend/
 .ascend/

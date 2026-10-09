@@ -46,8 +46,17 @@ git clone https://github.com/yangyuhang476959-sketch/uavflow-gam.git
 cd uavflow-gam
 export PROJECT_ROOT="$PWD"
 
-# Engineer-provided file: pin the exact approved torch, torch-npu and torchvision.
-export PLATFORM_CONSTRAINTS=/path/to/engineer-provided/platform-constraints.txt
+# EXAMPLE ONLY: previously validated Ascend 910B2 + CANN 9.0.0 stack.
+# Before executing, replace these pins with the receiving machine's actual
+# officially compatible PyTorch / torch_npu / torchvision versions, including
+# local version suffixes. Do not overwrite an existing engineer-provided file.
+cat > platform-constraints.txt <<'EOF'
+torch==2.7.1+cpu
+torch-npu==2.7.1.post4
+torchvision==0.22.1
+EOF
+
+export PLATFORM_CONSTRAINTS="$PWD/platform-constraints.txt"
 test -f "$PLATFORM_CONSTRAINTS"
 # Reference ONLY: previously validated 910B2/aarch64, CANN 9.0.0,
 # torch_npu 2.7.1.post4. Engineer must approve compatibility before running.
