@@ -51,11 +51,15 @@ export PLATFORM_CONSTRAINTS=/path/to/engineer-provided/platform-constraints.txt
 test -f "$PLATFORM_CONSTRAINTS"
 # Reference ONLY: previously validated 910B2/aarch64, CANN 9.0.0,
 # torch_npu 2.7.1.post4. Engineer must approve compatibility before running.
-# Skip installation if an approved Triton-Ascend is already installed.
-python -m pip install -c "$PLATFORM_CONSTRAINTS" 'triton-ascend==3.2.1' \
+# Isolate the reference package; never resolve/replace base-environment deps.
+# Use an empty target for first installation; inspect existing contents before
+# reinstalling rather than blindly overwriting a previously working target.
+export TRITON_ASCEND_TARGET="$PROJECT_ROOT/.ascend/triton"
+mkdir -p "$TRITON_ASCEND_TARGET"
+python -m pip install --target "$TRITON_ASCEND_TARGET" --ignore-installed \
+  --no-deps 'triton-ascend==3.2.1' pybind11 \
   --only-binary=:all: --index-url https://pypi.org/simple \
   --extra-index-url https://triton-ascend.osinfra.cn/pypi/simple
-python -c 'import triton, importlib.metadata as m; print("triton-ascend:", m.version("triton-ascend"), "imported triton:", triton.__version__)'
 python -m pip install -c "$PLATFORM_CONSTRAINTS" -c constraints-ascend.txt \
   -r requirements-ascend.txt
 # Check the base/project stack before DA3 adds its full dependency metadata.
@@ -73,19 +77,37 @@ export FLA_ASCEND_DIR="$PROJECT_ROOT/.ascend/flash-linear-attention"
 mkdir -p "$PROJECT_ROOT/.ascend"
 git clone https://github.com/fla-org/flash-linear-attention.git "$FLA_ASCEND_DIR"
 git -C "$FLA_ASCEND_DIR" checkout --detach 9f38d24980c46d46bd38614e743cdacd21906578
-export PYTHONPATH="$FLA_ASCEND_DIR:$PROJECT_ROOT/src:$PROJECT_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$TRITON_ASCEND_TARGET:$FLA_ASCEND_DIR:$PROJECT_ROOT/src:$PROJECT_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 export UAVFLOW_ACCELERATOR=npu
 export UAVFLOW_QWEN_FLA_NPU=1
 export UAVFLOW_DISABLE_FLEX_ATTENTION=1
+python - <<'PY'
+import os
+from pathlib import Path
+import triton
+import fla
+
+print("Triton version:", triton.__version__)
+print("Triton path:", triton.__file__)
+assert Path(triton.__file__).resolve().is_relative_to(
+    Path(os.environ["TRITON_ASCEND_TARGET"]).resolve()
+), "Wrong Triton loaded: expected the project-local Triton-Ascend target"
+print("FLA import OK")
+PY
 ```
 
 The Triton-Ascend command above follows the [official installation guide](https://github.com/Ascend/triton-ascend/blob/main/docs/en/installation_guide.md),
 which supplies an additional package index for 3.2.1; do not assume PyPI alone
 hosts that release. `--only-binary=:all:` requires wheels matching this Python,
-architecture and platform and fails rather than silently compiling. Review pip's
-dependency changes (use `--dry-run` first if needed); 3.2.1 also declares a
-community `triton` dependency whose version varies by architecture. Do not bypass
-platform constraints or automatically uninstall a working stack. Other
+architecture and platform and fails rather than silently compiling. The
+`--target --ignore-installed --no-deps` installation writes only the requested
+Triton-Ascend and pybind11 packages into the project-local target, without
+resolving or replacing SciPy, Decorator, PyTorch or other environment packages.
+The isolated Triton target must be first in `PYTHONPATH` in every new job/shell;
+the path assertion above detects accidental use of a different installed Triton.
+This deliberately bypasses the full upstream dependency set; verify actual FLA
+forward/backward, and do not automatically install missing dependencies or
+uninstall a working platform stack. Other
 CANN/torch_npu/hardware combinations require a separately approved version, not
 blind reuse of this reference. The distribution version and imported
 `triton.__version__` may differ; the recorded environment reports 3.2.1 and
@@ -105,9 +127,14 @@ used outside this path. Do not blindly install them or rerun DA3 installation
 without `--no-deps`: review each finding, retain platform constraints, and run
 the repository-path import check below and the later runtime/R1 smoke tests.
 Conflicts in actual training dependencies still require resolution.
+Platform-supplied packages such as `ms-service-profiler` or `te` may also report
+their own dependency conflicts. Review those with the platform engineer; such
+reports alone neither prove this training path unusable nor prove the environment
+safe. Do not force pip to repair the platform packages. The import audit and
+real R1 training/FLA smoke below are the required usability checks.
 
 ```bash
-PYTHONPATH="$PROJECT_ROOT/src:$PROJECT_ROOT${PYTHONPATH:+:$PYTHONPATH}" python - <<'PY'
+PYTHONPATH="$TRITON_ASCEND_TARGET:$FLA_ASCEND_DIR:$PROJECT_ROOT/src:$PROJECT_ROOT${PYTHONPATH:+:$PYTHONPATH}" python - <<'PY'
 from robot.modeling.da3_giant_encoder import _install_da3_optional_stubs
 _install_da3_optional_stubs()
 from depth_anything_3.api import DepthAnything3
