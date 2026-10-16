@@ -486,7 +486,7 @@ class DA3GiantEncoder(nn.Module):
                     continue
                 if isinstance(module, LoRALinear):
                     continue
-                if not any(relative_name == name or relative_name.endswith(name) for name in targets):
+                if 'all-linear' not in targets and not any(relative_name == name or relative_name.endswith(name) for name in targets):
                     continue
                 parent_name, _, child_name = relative_name.rpartition(".")
                 parent = block.get_submodule(parent_name) if parent_name else block
@@ -1198,6 +1198,39 @@ class DA3GiantEncoder(nn.Module):
             "layer": torch.tensor(target_layer, device=visual.device),
         }
 
+    def encode_shallow_rgb_grad(self, images, *, invalid_mask=None, mask_projection=None,
+                                gradient_checkpointing=True):
+        """Opt-in RGB[0,1] path with full shallow LoRA graph and pixel mask.
+
+        Native CLS/register/position packing is unchanged. The zero-initialized
+        mask Conv14/14 is added only to RGB patch embeddings before block0.
+        """
+        if images.ndim != 4 or images.shape[1] != 3:
+            raise ValueError('Expected raw RGB [B,3,H,W]')
+        trans=self.backbone.pretrained
+        images=self.normalize_images(images)
+        b,_,h,w=images.shape
+        x=trans.prepare_tokens_with_masks(images[:,None])
+        prefix=1+int(self.num_register_tokens)
+        if invalid_mask is not None:
+            if mask_projection is None or invalid_mask.shape!=(b,1,h,w):
+                raise ValueError('Binary mask must align with RGB and projection')
+            extra=mask_projection(invalid_mask.detach().float()).flatten(2).transpose(1,2)[:,None]
+            if extra.shape!=x[:,:,prefix:].shape:
+                raise ValueError('Mask grid differs from native RGB grid')
+            x=torch.cat((x[:,:,:prefix],x[:,:,prefix:]+extra.to(x.dtype)),2)
+        pos,_=trans._prepare_rope(b,1,h,w,x.device)
+        if int(self.shallow_target_layer)!=int(trans.alt_start)-1:
+            raise ValueError('RGB warp requires the native pre-global boundary')
+        for index in range(int(trans.alt_start)):
+            block=trans.blocks[index]
+            position=pos if index>=trans.rope_start and trans.rope is not None else None
+            def step(value,block=block,position=position):
+                return trans.process_attention(value,block,attn_type='local',pos=position)
+            x=(torch_checkpoint(step,x,use_reentrant=False)
+               if gradient_checkpointing and torch.is_grad_enabled() and x.requires_grad else step(x))
+        return x[:,None]
+
     @torch.no_grad()
     def encode_shallow_and_deep_visual_slots(
         self,
@@ -1522,6 +1555,12 @@ class DA3GiantEncoder(nn.Module):
         dual_state_attention: str = "full",
         current_geometry_by_layer=None,
         current_geometry_read=None,
+        provenance_rho=None,
+        reliability_head=None,
+        apply_reliability: bool = True,
+        correspondence_read=None,
+        correspondence_by_layer=None,
+        correspondence_mask=None,
     ) -> Dict[str, torch.Tensor]:
         """Resume DA3 from shallow visual tokens plus supplied action seeds.
 
@@ -1546,6 +1585,8 @@ class DA3GiantEncoder(nn.Module):
             raise ValueError("action_bridge requires H=1 and two state views")
         if dim != self.embed_dim:
             raise ValueError(f"Expected visual dim {self.embed_dim}, got {dim}.")
+        if provenance_rho is not None and step_valid_mask is not None:
+            raise ValueError('Provenance correction does not support temporal prefix compaction')
         legacy_single_action = action_tokens.ndim == 4
         if legacy_single_action:
             expected = (b, steps, v_count, dim)
@@ -1647,6 +1688,20 @@ class DA3GiantEncoder(nn.Module):
 
         current_x = torch.cat([current_x[:, :, :1], action_x, current_x[:, :, 1:]], dim=2)
         local_x = torch.cat([local_x[:, :, :1], action_x, local_x[:, :, 1:]], dim=2)
+        unsupported_x = action_x.clone() if provenance_rho is not None else None
+        reliability_records, provenance_stats = {}, {}
+        if provenance_rho is not None:
+            if steps != 1 or v_count != 1:
+                raise ValueError('Provenance correction requires one future view')
+            if provenance_rho.shape != (b, num_patches):
+                raise ValueError('provenance_rho must be [B, spatial patches]')
+            provenance_rho = provenance_rho.detach().float()
+            if not torch.isfinite(provenance_rho).all() or (provenance_rho < 0).any() or (provenance_rho > 1).any():
+                raise ValueError('provenance_rho must be finite and in [0,1]')
+            if reliability_head is not None and any(
+                    l <= int(trans.alt_start) or l >= len(trans.blocks)
+                    for l in reliability_head.layers):
+                raise ValueError('Reliability layers must be inside the resumed deep stack')
         if pos_all is not None:
             act_pos = torch.zeros(
                 b, total_view, action_count, 2,
@@ -1718,7 +1773,30 @@ class DA3GiantEncoder(nn.Module):
             else:
                 attn_type, pos_emb = "local", l_pos
             use_flex = attn_type == "global" and global_block_mask is not None
-            if dual_state_attention == "action_bridge":
+            if provenance_rho is not None:
+                from robot.modeling.provenance_attention import routed_block
+                confidence = None
+                if reliability_head is not None and i in reliability_head.layers:
+                    patches = current_x[:, 0, patch_start:].detach()
+                    u, c = reliability_head(patches, i)
+                    reliability_records[i] = {'patches': patches, 'uncertainty': u, 'confidence': c}
+                    if apply_reliability:
+                        confidence = c
+                def provenance_step(x, ustate, block=blk, pos=pos_emb, conf=confidence):
+                    x, ustate, stats = routed_block(
+                        x, ustate, block, pos, action_count=action_count,
+                        rho=provenance_rho, confidence=conf)
+                    return x, ustate, stats['unsupported_read_before'], stats['unsupported_read_after'], stats['supported_read']
+                result_step = (torch_checkpoint(provenance_step, current_x, unsupported_x, use_reentrant=False)
+                               if use_checkpoint and current_x.requires_grad
+                               else provenance_step(current_x, unsupported_x))
+                current_x, unsupported_x, before, after, supported_read = result_step
+                provenance_stats[f'supported_read_L{i}'] = supported_read
+                provenance_stats[f'unsupported_read_L{i}'] = after
+                if reliability_head is not None and i in reliability_head.layers:
+                    provenance_stats[f'unsupported_read_before_L{i}'] = before
+                    provenance_stats[f'unsupported_read_after_L{i}'] = after
+            elif dual_state_attention == "action_bridge":
                 from robot.modeling.dual_geometry_attention import run_dual_masked_block
                 # Also mask LOCAL layers: otherwise current patches can read
                 # their local action token and leak future information back.
@@ -1773,6 +1851,28 @@ class DA3GiantEncoder(nn.Module):
                     action_now.reshape(b, total_view, action_count, dim),
                     current_x[:, :, 1 + action_count:],
                 ], dim=2)
+                if unsupported_x is not None:
+                    unsupported_now = unsupported_x.reshape(b, steps, v_count, action_count, dim)
+                    # Same CA parameters and observation bank, independent
+                    # queries. No averaging, cross-branch edge, rho/c gating,
+                    # or writes to Current geometry activations.
+                    unsupported_now = (
+                        torch_checkpoint(
+                            lambda action, patches, layer=i: current_geometry_read(
+                                action, patches, layer_index=layer),
+                            unsupported_now, memory, use_reentrant=False)
+                        if use_checkpoint else current_geometry_read(
+                            unsupported_now, memory, layer_index=i)
+                    )
+                    unsupported_x = unsupported_now.reshape(b, total_view, action_count, dim)
+            if correspondence_read is not None and i in correspondence_by_layer:
+                patches=current_x[:,:,patch_start:].reshape(b,num_patches,dim)
+                memory=correspondence_by_layer[i][:,0,0]
+                def corr_step(q,kv,layer=i):
+                    return correspondence_read(q,kv,correspondence_mask,layer)
+                patches=(torch_checkpoint(corr_step,patches,memory,use_reentrant=False)
+                         if use_checkpoint else corr_step(patches,memory))
+                current_x=torch.cat((current_x[:,:,:patch_start],patches[:,None]),2)
             if attn_type == "local":
                 local_x = current_x
             if (
@@ -1829,6 +1929,10 @@ class DA3GiantEncoder(nn.Module):
         result["action_tokens"] = (
             action_output[:, 0] if legacy_single_action else action_output
         )
+        if unsupported_x is not None:
+            result['unsupported_action_tokens'] = trans.norm(unsupported_x[:, 0])
+            result['reliability_records'] = reliability_records
+            result['provenance_stats'] = provenance_stats
         _cuda_profile_mark(profile, "deep_final_done")
         # Optional: expose deep multi-level (OUT_LAYERS) features for
         # teacher-vs-student feature distillation (Path B feature reg).
@@ -2005,6 +2109,12 @@ class DA3GiantEncoder(nn.Module):
         dual_state_attention: str = "full",
         current_geometry_by_layer=None,
         current_geometry_read=None,
+        provenance_rho=None,
+        reliability_head=None,
+        apply_reliability: bool = True,
+        correspondence_read=None,
+        correspondence_by_layer=None,
+        correspondence_mask=None,
     ) -> Dict[str, torch.Tensor]:
         return self._propagate_shallow_with_actions_impl(
             visual_tokens,
@@ -2020,6 +2130,12 @@ class DA3GiantEncoder(nn.Module):
             dual_state_attention=dual_state_attention,
             current_geometry_by_layer=current_geometry_by_layer,
             current_geometry_read=current_geometry_read,
+            provenance_rho=provenance_rho,
+            reliability_head=reliability_head,
+            apply_reliability=apply_reliability,
+            correspondence_read=correspondence_read,
+            correspondence_by_layer=correspondence_by_layer,
+            correspondence_mask=correspondence_mask,
         )
 
     def _propagate_and_decode_impl(

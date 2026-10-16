@@ -1,8 +1,7 @@
 # UAVFlow-GAM
 
-Active matrix: **10 cells** covering GAM/T5, frozen VLM conditioning,
-Query-VLA, Slot-VLA, Current Geometry Bank, geometry-action residual, and a
-dual-view diagnostic.
+Active release: **three metric-depth experiments** — GAM baseline LoRA,
+the original VLM/GAM correction with Current Bank CA, and RGB-warp correction.
 
 Minimal research code for transferring Geometric Action Models to
 UAV-Flow-Sim. This repository contains only the source, configurations and
@@ -28,8 +27,9 @@ and its application order.
 - `scripts/`: data download/audit and training helpers.
 - `data/instruction_overrides.json`: seven reviewed instruction corrections.
 - `data/uavflow_stats_sim_openvla_yaw4d/`: fixed action normalization statistics.
-- `experiments/uavflow_remote_ablation/`: restartable ten-cell remote matrix;
-  each cluster job is one Python command on one eight-device node.
+- `experiments/metric_jobs/`: three independent Python training entry points.
+- `experiments/uavflow_remote_ablation/`: shared configuration/split machinery
+  and historical benchmark compatibility, not the active ten-cell matrix.
 
 ## Remote experiment quick start
 
@@ -45,10 +45,10 @@ Follow the manual Python/package, data preparation and smoke-test commands in
 `NPU_SETUP.md`; the previous automatic Ascend bootstrap is no longer the handoff
 workflow. This workflow does not install or modify Driver, Firmware or CANN.
 
-Choose one experiment from the [ten-cell matrix](experiments/uavflow_remote_ablation/README.md),
-one job per eight-device node. Defaults are global batch 32, Stage 1 **10 epochs
-constant LR**, then Stage 2 **10 epochs cosine LR with Stop**. Re-run the same
-job command to resume.
+Choose one of the [three metric experiments](docs/METRIC_EXPERIMENTS.md).
+Defaults are **5 epochs, constant LR, no Stop phase**, per-process batch 4.
+One distributed experiment per node is supported through the existing trainer;
+use explicit `--resume` with unchanged data/batch/world-size for exact continuation.
 
 For NVIDIA-only environment instructions, see
 [`docs/REMOTE_TRAINING.md`](docs/REMOTE_TRAINING.md); do not apply that CUDA setup
@@ -78,3 +78,15 @@ Machine-specific paths are supplied through the environment variables listed
 in `NPU_SETUP.md` (Ascend) or `docs/REMOTE_TRAINING.md` (NVIDIA).
 Large checkpoints, depth arrays and all generated
 experiment outputs are deliberately excluded from Git.
+
+## Maintained architectures
+
+See [the three-experiment handoff](docs/METRIC_EXPERIMENTS.md) for architecture,
+pose conventions, losses and exact commands. Detailed geometry implementation:
+[RGB-warp correction](docs/dual_stream_rgbwarp.md).
+
+Unused local launchers, triangle/visibility probes and ten obsolete matrix
+job wrappers have been removed. Shared backend modules and regression fixtures
+are retained where the three experiments or the working environment benchmark
+still import them. Local debug products are ignored, not published. No datasets,
+policy checkpoints or evaluation annotations are part of this cleanup.

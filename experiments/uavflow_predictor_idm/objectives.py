@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import math
 from typing import Any
 
 import torch
@@ -854,6 +855,11 @@ def forward_batch(
     conditioning_generator: torch.Generator | None = None,
 ) -> dict[str, torch.Tensor]:
     """Run sliding-IDM training or evaluate a legacy multi-step checkpoint."""
+    model_ref = model.module if hasattr(model, "module") else model
+    if getattr(model_ref,'dual_stream_rgbwarp_enabled',False):
+        from .rgbwarp_objectives import forward_rgbwarp_batch
+        return forward_rgbwarp_batch(model=model,da3=da3,text=text,normalizer=normalizer,batch=batch,
+            context_len=context_len,rollout_steps=rollout_steps,amp=amp,amp_dtype=amp_dtype)
     images = batch["all_view_images"]
     model_ref = model.module if hasattr(model, "module") else model
     use_reference = bool(getattr(model_ref, "use_fixed_first_frame", False))
@@ -967,6 +973,24 @@ def forward_batch(
     target_norm_full = normalizer.normalize(
         target_raw_full, stats_keys=list(batch["action_stats_key"])
     )
+    transport_enabled = getattr(model_ref, "transport_policy", None) is not None
+    correction_mode = getattr(model_ref, 'correction_mode', 'legacy')
+    uncertain = correction_mode == 'uncertain'
+    transport_teacher = None
+    if transport_enabled or uncertain:
+        from .support_aware_transport import FrozenDeepTeacher
+        teacher = getattr(da3, "_transport_teacher", None)
+        if teacher is None:
+            if uncertain:
+                from .provenance_correction import JointDeepTeacher
+                teacher = JointDeepTeacher(da3, model_ref.provenance_correction.reliability.layers)
+            else:
+                if any(parameter.requires_grad for parameter in da3.parameters()):
+                    raise RuntimeError("Initialize FrozenDeepTeacher before loading student weights")
+                teacher = FrozenDeepTeacher(da3)
+        with autocast_context(images.device, enabled=bool(amp), dtype_name=amp_dtype):
+            transport_teacher = teacher(target_future[:, :1])
+    transport_metrics = {}
     with autocast_context(
         images.device, enabled=bool(amp), dtype_name=amp_dtype
     ):
@@ -983,6 +1007,10 @@ def forward_batch(
                 lang_padding_mask=language["attention_mask"],
                 action_targets_norm=target_norm_full,
                 conditioning_generator=conditioning_generator,
+                **({"action_denormalizer": lambda x: normalizer.denormalize(
+                    x, stats_keys=list(batch["action_stats_key"])),
+                    "camera_intrinsics": batch.get("camera_intrinsics")}
+                   if transport_enabled or correction_mode != 'legacy' else {}),
             )
         geometry_architecture = getattr(model_ref, "geometry_architecture", "legacy")
         if geometry_architecture != "legacy" and deep_feature_enabled:
@@ -994,10 +1022,50 @@ def forward_batch(
             cls_weight=feature_cls_weight,
             register_weight=feature_register_weight,
         )
+        feature_output = output
+        if transport_enabled:
+            from .support_aware_transport import transport_losses
+            gate = output["transport"]["supervision_gate"]
+            feature_output = dict(output)
+            feature_output["future_shallow"] = torch.where(
+                gate[:, None, None, None, None], output["future_shallow"], target_future.detach())
+            transport_values = transport_losses(
+                output, transport_teacher["deep_levels"],
+                prefix=1+int(getattr(da3, "num_register_tokens", 0)), visual_dim=int(da3.embed_dim))
+            uncertainty = output["transport"]["completion_uncertainty"]
+            transport_metrics = {
+                "transport_geometry": transport_values["geometry"],
+                "transport_support_raw": output["transport"]["rho_raw"].mean().detach(),
+                "transport_support_coarse": output["transport"]["rho"].mean().detach(),
+                "transport_matched_fraction": gate.float().mean().detach(),
+            }
+            if uncertainty is not None:
+                transport_metrics["completion_uncertainty_loss"] = transport_values["uncertainty"]
+                missing_weight = (1-output["transport"]["rho"]).detach().float()
+                denominator = missing_weight.sum().clamp_min(1e-8)
+                transport_metrics["completion_predicted_error"] = (uncertainty*missing_weight).sum().detach()/denominator
+                transport_metrics["completion_confidence"] = (output["transport"]["completion_confidence"]*missing_weight).sum().detach()/denominator
+                matched_weight = missing_weight*gate[:, None]
+                matched_denominator = matched_weight.sum().clamp_min(1e-8)
+                transport_metrics["completion_matched_mass"] = matched_weight.mean().detach()
+                transport_metrics["completion_target_error_matched"] = (
+                    transport_values["error_target"]*matched_weight).sum().detach()/matched_denominator
+                transport_metrics["completion_error_mae_matched"] = (
+                    (uncertainty-transport_values["error_target"]).abs()*matched_weight).sum().detach()/matched_denominator
         feature_values = architecture_feature_loss(
-            geometry_architecture, output, observed, target_future, **feature_kwargs
+            geometry_architecture, feature_output, observed, target_future, **feature_kwargs
         )
         zero = output["actions_norm"].new_zeros(())
+        provenance_metrics = {}
+        info = output.get('provenance_correction')
+        if info is not None:
+            rho = info['rho'].detach()
+            provenance_metrics = {'provenance_support': rho.mean(),
+                                  'provenance_unsupported': (1-rho).mean(), **info['stats']}
+            if uncertain:
+                u_loss, u_stats = model_ref.provenance_correction.reliability.loss(
+                    info['reliability_records'], transport_teacher, rho)
+                provenance_metrics.update(provenance_uncertainty_loss=u_loss, **u_stats)
         direct_prediction = output.get("direct_actions_norm")
         refine_prediction = output.get("refine_actions_norm")
         token_logits = output.get("action_token_logits")
@@ -1131,7 +1199,7 @@ def forward_batch(
             stop_negative_probability_sum = zero
             stop_positive_probability = zero
             stop_negative_probability = zero
-        if bool(deep_feature_enabled):
+        if bool(deep_feature_enabled) and not transport_enabled:
             if int(rollout_steps) != 1:
                 raise ValueError("Deep feature distillation currently requires rollout_steps=1.")
             if feature_target_offset != 1:
@@ -1243,6 +1311,8 @@ def forward_batch(
                 ) -> dict[str, torch.Tensor]:
                     target = depth_gt[:, target_start : target_start + action_steps]
                     target_mask = depth_mask[:, target_start : target_start + action_steps]
+                    if transport_enabled and target_start != 0:
+                        target_mask = target_mask & output["transport"]["supervision_gate"][:, None, None, None, None]
                     target_semantic = (
                         None if semantic_mask is None else
                         semantic_mask[:, target_start : target_start + action_steps]
@@ -1405,6 +1475,8 @@ def forward_batch(
         for key in ("total", "linear_l1", "log_l1", "grad", "valid_ratio", "semantic_ratio")
     }
     return {
+        **transport_metrics,
+        **provenance_metrics,
         **branch_metrics,
         "action_raw_moments": action_moments,
         "feature": feature_values["total"],
@@ -1541,6 +1613,28 @@ def evaluate(
     # Per rollout step: total feature MSE, patch MSE, CLS MSE, cosine.
     model_ref = model.module if hasattr(model, "module") else model
     dense_context = bool(getattr(model_ref, "dense_context_supervision", False))
+    if getattr(model_ref,'dual_stream_rgbwarp_enabled',False):
+        branch_keys += ['depth_current_mse','depth_future_mse']
+        branch_sums = {h:torch.zeros(len(branch_keys),device=device) for h in contexts}
+    transport_keys = ("transport_geometry", "transport_support_raw",
+                      "transport_support_coarse", "transport_matched_fraction")
+    if getattr(model_ref, 'correction_mode', 'legacy') in {'support_aware', 'uncertain'}:
+        transport_keys += ('provenance_support', 'provenance_unsupported', 'support_residual_norm',
+                           'unsupported_residual_norm', 'unsupported_residual_ratio', 'alpha_sup', 'alpha_unsup', 'residual_norm',
+                           'supported_read', 'unsupported_read')
+    if getattr(model_ref, 'correction_mode', 'legacy') == 'uncertain':
+        transport_keys += ('provenance_uncertainty_loss',)
+        for layer in model_ref.provenance_correction.reliability.layers:
+            transport_keys += tuple(f'{key}_L{layer}' for key in ('uncertainty', 'confidence', 'uncertainty_mae',
+                                    'unsupported_read_before', 'unsupported_read_after'))
+    if getattr(model_ref,'dual_stream_rgbwarp_enabled',False):
+        transport_keys+=('rgbwarp_valid_ratio','rgbwarp_correspondence_ratio',
+                         'rgbwarp_proposal_loss','rgbwarp_refine_loss')
+        transport_keys+=tuple('rgbwarp_'+name+'_'+axis for name in ('residual_abs','saturation') for axis in ('x','y','z','yaw'))
+    if getattr(model_ref, "transport_policy", None) is not None and model_ref.transport_policy.error_head is not None:
+        transport_keys += ("completion_uncertainty_loss", "completion_predicted_error", "completion_confidence", "completion_matched_mass",
+                           "completion_target_error_matched", "completion_error_mae_matched")
+    transport_sums = {h: torch.zeros(len(transport_keys), device=device) for h in contexts}
     horizon_sums = {
         h: torch.zeros(int(h if dense_context else rollout), 4, device=device)
         for h in contexts
@@ -1655,6 +1749,9 @@ def evaluate(
             ]) * count
             sums[context][36] += count
             moment_sums[context] += values["action_raw_moments"].double()
+            for index, key in enumerate(transport_keys):
+                if key in values:
+                    transport_sums[context][index] += values[key].detach()*count
             for index, key in enumerate(branch_keys):
                 if key in values:
                     branch_sums[context][index] += values[key] * count
@@ -1698,6 +1795,8 @@ def evaluate(
                 threshold_counts[2] += (~stop_prediction & stop_positive).sum()
                 threshold_counts[3] += (~stop_prediction & ~stop_positive).sum()
     if dist.is_initialized():
+        for value in transport_sums.values():
+            dist.all_reduce(value)
         for value in moment_sums.values():
             dist.all_reduce(value)
         for value in branch_sums.values():
@@ -1721,6 +1820,10 @@ def evaluate(
     result: dict[str, float] = {}
     for context, value in sums.items():
         count = value[36].clamp_min(1.0)
+        if (getattr(model_ref, "transport_policy", None) is not None or getattr(model_ref, 'correction_mode', 'legacy') in {'support_aware', 'uncertain'}
+                or getattr(model_ref,'dual_stream_rgbwarp_enabled',False)):
+            for index, key in enumerate(transport_keys):
+                result[f"H{context}_{key}"] = float(transport_sums[context][index]/count)
         for metric, vector in action_statistics(moment_sums[context]).items():
             for axis, scalar in zip(("x", "y", "z", "yaw"), vector):
                 result[f"H{context}_action_raw_{metric}_{axis}"] = float(scalar)
@@ -1781,6 +1884,9 @@ def evaluate(
             f"H{context}_depth_scale_l1": float((value[34] / count).item()),
             f"H{context}_depth_scene_scale_m": float((value[35] / count).item()),
         }
+        if getattr(model_ref,'dual_stream_rgbwarp_enabled',False):
+            result[f'H{context}_direct_action']=result[f'H{context}_rgbwarp_proposal_loss']
+            result[f'H{context}_refine_action']=result[f'H{context}_rgbwarp_refine_loss']
         pose_axes = pose_axis_sums[context] / count
         result |= {
             f"H{context}_pose5_x": float(pose_axes[0].item()),

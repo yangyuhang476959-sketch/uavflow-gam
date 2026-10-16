@@ -28,3 +28,7 @@ Depth-Anything-3/
 
 # Training outputs belong on the compute server, not in the source release.
 results/
+
+# Local exploratory outputs are not part of the three-experiment handoff.
+debug/
+debug.jpg

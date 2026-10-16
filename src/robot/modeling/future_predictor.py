@@ -1504,6 +1504,8 @@ class GAMFuturePredictor(nn.Module):
         lang_padding_mask: Optional[torch.Tensor] = None,
         context_valid_mask: Optional[torch.Tensor] = None,  # (B, H) bool
         view_valid_mask: Optional[torch.Tensor] = None,     # (B, H, V) bool
+        geometry_context: Optional[torch.Tensor] = None,   # (B,N,d_model)
+        geometry_context_keep_mask: Optional[torch.Tensor] = None,
     ) -> dict:
         b, H, V, P, d = past_visual_tokens.shape
         if P != self.visual_tokens_per_view or d != self.d_da3:
@@ -1690,6 +1692,17 @@ class GAMFuturePredictor(nn.Module):
                     dtype=context.dtype,
                 )
                 visual_token_mask = self._build_visual_token_mask(H, V, device)
+
+        if geometry_context is not None:
+            if self.condition_mode != "cross_attn" or self.use_language:
+                raise ValueError("Geometry K/V requires cross_attn with language CA disabled")
+            if geometry_context.ndim != 3 or geometry_context.shape[0] != b or geometry_context.shape[-1] != self.d_model:
+                raise ValueError("geometry_context must be [B,N,d_model]")
+            lang_emb = geometry_context.to(device=device, dtype=context.dtype)
+            lang_keep_mask = self._language_keep_mask(
+                lang_padding_mask=geometry_context_keep_mask, batch_size=b,
+                lang_len=lang_emb.shape[1], device=device,
+            )
 
         # 6. Attention mask + RoPE positions, possibly extended for concat lang prefix.
         flex_block_mask = self._get_flex_block_mask(H, V, device, lang_len=prepended_lang_len)

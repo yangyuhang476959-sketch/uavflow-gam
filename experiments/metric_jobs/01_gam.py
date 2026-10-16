@@ -1,0 +1,6 @@
+"""GAM/T5/pose baseline, deep LoRA, metric future depth."""
+import sys
+from pathlib import Path
+sys.path.insert(0,str(Path(__file__).resolve().parents[2]))
+from experiments.uavflow_predictor_idm.metric_train import main
+if __name__=='__main__':main('gam')

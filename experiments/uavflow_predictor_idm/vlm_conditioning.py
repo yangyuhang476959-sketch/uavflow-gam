@@ -44,6 +44,7 @@ class FrozenQwen35Conditioner(nn.Module):
         lora_scope: str = "all_linear",
         action_placeholder_count: int = 0,
         action_attention_mode: str = "causal",
+        numeric_pose_token: bool = False,
     ) -> None:
         super().__init__()
         self.encoder = FrozenQwen35SemanticEncoder(
@@ -62,6 +63,16 @@ class FrozenQwen35Conditioner(nn.Module):
         )
         self.use_reference_image = bool(use_reference_image)
         self.hidden_size = int(self.encoder.hidden_size)
+        self.numeric_pose_token=bool(numeric_pose_token)
+        if self.numeric_pose_token:
+            tokenizer=self.encoder.processor.tokenizer
+            tokenizer.add_special_tokens({'additional_special_tokens':self.encoder.action_placeholder_tokens+['<|uav_state|>']})
+            self.encoder.qwen.resize_token_embeddings(len(tokenizer))
+            self.encoder.qwen.get_input_embeddings().requires_grad_(False)
+            self.encoder.qwen.get_output_embeddings().requires_grad_(False)
+            self.state_token_id=tokenizer.convert_tokens_to_ids('<|uav_state|>')
+            self.register_buffer('state_scale',torch.tensor([1000.,1000.,1000.,180.]))
+            self.state_encoder=nn.Sequential(nn.Linear(4,256),nn.GELU(),nn.Linear(256,self.hidden_size))
 
     def encode_tokens(
         self,
@@ -100,7 +111,22 @@ class FrozenQwen35Conditioner(nn.Module):
                     f"{tuple(pose.shape)}."
                 )
             current_states = pose.cpu().tolist()
-        encoded = self.encoder(images, texts, current_states=current_states)
+        if self.numeric_pose_token:
+            if current_pose is None or current_pose.shape!=(len(texts),4) or not torch.isfinite(current_pose).all():
+                raise ValueError('Numeric pose token requires finite [B,4] first-yaw-frame cm/deg state')
+            state=current_pose.to(self.state_scale.device,dtype=torch.float32)
+            embedding=self.state_encoder(state/self.state_scale)
+            def inject(_module,inputs,output):
+                mask=inputs[0].eq(self.state_token_id)
+                if not mask.sum(1).eq(1).all():raise ValueError('Expected one numeric pose token')
+                return torch.where(mask[:,:,None],embedding.to(output.dtype)[:,None],output)
+            hook=self.encoder.qwen.get_input_embeddings().register_forward_hook(inject)
+            try:
+                encoded=self.encoder(images,texts,omit_prompt_pose=True,state_placeholder=True)
+            finally:
+                hook.remove()
+        else:
+            encoded = self.encoder(images, texts, current_states=current_states)
         # A one-element layer list returns the true final-layer representation;
         # legacy multi-layer configs retain their historical equal average.
         hidden = encoded["joint_layers"].float().mean(dim=1).to(
@@ -150,6 +176,7 @@ def build_stage2_conditioner(stage1_cfg, model_cfg) -> nn.Module:
             action_attention_mode=str(
                 stage1_cfg.get("qwen_action_attention_mode", "causal")
             ),
+            numeric_pose_token=bool(stage1_cfg.get('qwen_numeric_pose_token',False)),
         )
     return TextConditioner(
         encoder_type=encoder_type,

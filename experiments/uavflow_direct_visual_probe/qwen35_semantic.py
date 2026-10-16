@@ -391,6 +391,8 @@ class FrozenQwen35SemanticEncoder(nn.Module):
         images: torch.Tensor,
         instructions: Sequence[str],
         current_states: Sequence[Sequence[float]] | None = None,
+        omit_prompt_pose: bool = False,
+        state_placeholder: bool = False,
     ) -> dict[str, torch.Tensor]:
         """Jointly encode instruction, F0, and Ft.
 
@@ -425,7 +427,7 @@ class FrozenQwen35SemanticEncoder(nn.Module):
             raise ValueError(
                 f"Expected {batch_size} instructions, got {len(instructions)}."
             )
-        if self.prompt_mode in {
+        if not omit_prompt_pose and self.prompt_mode in {
             "current_image_action_question",
             "current_image_openvla",
         }:
@@ -460,7 +462,7 @@ class FrozenQwen35SemanticEncoder(nn.Module):
                 # OpenVLA-style action question below.
                 prompt_text = instruction_text
                 if self.prompt_mode == "current_image_action_question":
-                    state = [float(value) for value in current_states[batch_index]]
+                    state = [float(value) for value in current_states[batch_index]] if not omit_prompt_pose else [0.] * 4
                     if len(state) != 4:
                         raise ValueError(
                             "Action-question prompt state must be "
@@ -478,6 +480,8 @@ class FrozenQwen35SemanticEncoder(nn.Module):
                         "What action should the uav take to "
                         f"{instruction_stem}?"
                     )
+                    if omit_prompt_pose:
+                        prompt_text = f"What action should the uav take to {instruction_stem}?"
                 if self.prompt_mode == "current_image_openvla":
                     state = [float(value) for value in current_states[batch_index]]
                     if len(state) != 4:
@@ -527,7 +531,7 @@ class FrozenQwen35SemanticEncoder(nn.Module):
                     "role": "assistant",
                     "content": [{
                         "type": "text",
-                        "text": "".join(self.action_placeholder_tokens),
+                        "text": ("<|uav_state|>" if state_placeholder else "") + "".join(self.action_placeholder_tokens),
                     }],
                 })
             conversations.append(messages)

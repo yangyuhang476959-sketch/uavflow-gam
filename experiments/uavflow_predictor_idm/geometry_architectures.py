@@ -95,7 +95,7 @@ def select_dual_view(outputs, batch_size, view):
 
 
 def architecture_state(model):
-    return {
+    state = {
         "mode": model.geometry_architecture,
         "direct_current_seed": (None if model.direct_current_seed is None
                                 else model.direct_current_seed.state_dict()),
@@ -114,9 +114,20 @@ def architecture_state(model):
         ),
         "parallel_action_position_mode": getattr(model, "parallel_action_position_mode", "legacy"),
     }
+    transport = getattr(model, "transport_policy", None)
+    rgbwarp=getattr(model,'rgbwarp_correction',None)
+    if rgbwarp is not None:
+        state['rgbwarp_correction']={'config':rgbwarp.config,'weights':rgbwarp.state_dict()}
+    from .provenance_correction import checkpoint_state
+    correction = checkpoint_state(model)
+    if correction is not None:
+        state['provenance_correction'] = correction
+    if transport is not None:
+        state["support_aware_transport"] = {"config": transport.config, "weights": transport.state_dict()}
+    return state
 
 
-def load_architecture_state(model, checkpoint):
+def load_architecture_state(model, checkpoint, *, allow_new_transport=False):
     state = checkpoint.get("geometry_architecture_state")
     if state is None:
         if model.geometry_architecture != "legacy":
@@ -124,6 +135,44 @@ def load_architecture_state(model, checkpoint):
         return
     if state["mode"] != model.geometry_architecture:
         raise ValueError("Geometry architecture changed; checkpoint is not compatible")
+    rgbwarp=getattr(model,'rgbwarp_correction',None)
+    saved_rgb=state.get('rgbwarp_correction')
+    if (rgbwarp is None)!=(saved_rgb is None):
+        raise ValueError('RGB-warp topology changed; no silent checkpoint reinterpretation')
+    if rgbwarp is not None:
+        if rgbwarp.config!=saved_rgb['config']:
+            raise ValueError('RGB-warp settings changed during checkpoint load')
+        loaded=rgbwarp.load_state_dict(saved_rgb['weights'],strict=True)
+        print(f'RGB-warp load: missing={loaded.missing_keys}, unexpected={loaded.unexpected_keys}',flush=True)
+    from .provenance_correction import load_checkpoint_state
+    load_checkpoint_state(model, state.get('provenance_correction'), initialize=allow_new_transport)
+    transport = getattr(model, "transport_policy", None)
+    saved_transport = state.get("support_aware_transport")
+    if transport is None and saved_transport is not None:
+        raise ValueError("Candidate B checkpoint requires support_aware_transport")
+    if transport is not None:
+        if saved_transport is None:
+            if not allow_new_transport:
+                raise KeyError("Candidate B resume checkpoint has no support_aware_transport state")
+        else:
+            # GT->proposal is an explicitly requested NEW training stage, not
+            # an exact resume. Other storage/tau/render semantics stay fixed.
+            saved_cfg, current_cfg = dict(saved_transport["config"]), dict(transport.config)
+            adding_scalar = False
+            if allow_new_transport:
+                saved_cfg.pop("geometry_action_source", None)
+                current_cfg.pop("geometry_action_source", None)
+                adding_scalar = (saved_cfg.get("uncertainty", "none") == "none"
+                                 and current_cfg.get("uncertainty", "none") == "scalar")
+                if adding_scalar:
+                    saved_cfg.pop("uncertainty", None)
+                    current_cfg.pop("uncertainty", None)
+            if saved_cfg != current_cfg:
+                raise ValueError("Candidate B transport configuration changed")
+            missing = transport.load_state_dict(saved_transport["weights"], strict=not adding_scalar)
+            if adding_scalar and (missing.unexpected_keys or any(
+                    not key.startswith("error_head.") for key in missing.missing_keys)):
+                raise ValueError("B->C transfer may initialize only the scalar error head")
     if state.get("parallel_action_position_mode", "legacy") != getattr(model, "parallel_action_position_mode", "legacy"):
         raise ValueError("Parallel action position mode changed; checkpoint is not compatible")
     saved_decode = state.get("parallel_action_decode_mode", "full")

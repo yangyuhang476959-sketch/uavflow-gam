@@ -17,6 +17,9 @@ def action_statistics(moments):
 def enabled_metric(key, cfg):
     key = re.sub(r"^H\d+_", "", key)
     loss = cfg.loss
+    if bool(cfg.model.get('dual_stream_rgbwarp_enabled',False)) and (
+            'feat' in key or key.startswith(('cls','reg','patch','cos_steps'))):
+        return False
     if key.startswith("step"):
         if key.endswith("_cls"):
             return float(loss.get("feature_cls_weight", 0)) > 0
@@ -54,6 +57,8 @@ def compact_train_line(line, values, cfg):
     fields = [field for field in fields if enabled_metric(field.split("=", 1)[0], cfg)]
     for key, value in values.items():
         if key.startswith(("depth_current_", "depth_future_")):
+            fields.append(f"{key}={float(value):.5f}")
+        if key.startswith(("rgbwarp_", "transport_", "completion_", "provenance_", "support_residual", "unsupported_", "supported_read", "alpha_", "residual_norm", "uncertainty_L", "confidence_L", "uncertainty_mae_L")) and getattr(value, "ndim", 1) == 0:
             fields.append(f"{key}={float(value):.5f}")
     for key, value in action_statistics(values["action_raw_moments"]).items():
         vector = ",".join(f"{x:.6f}" for x in value.tolist())

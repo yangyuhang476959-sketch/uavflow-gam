@@ -579,9 +579,18 @@ class UAVFlowPredictorIDM(nn.Module):
         parallel_current_geometry_read_enabled: bool = True,
         parallel_action_decode_mode: str = "full",
         parallel_action_position_mode: str = "legacy",
+        support_aware_transport: dict | None = None,
+        correction_mode: str = "legacy",
+        provenance_correction: dict | None = None,
+        dual_stream_rgbwarp_enabled: bool = False,
+        rgbwarp_correction: dict | None = None,
     ) -> None:
         super().__init__()
         self.da3 = da3
+        self.dual_stream_rgbwarp_enabled=bool(dual_stream_rgbwarp_enabled)
+        self.correction_mode = str(correction_mode)
+        if self.correction_mode not in {'legacy', 'pure', 'support_aware', 'uncertain'}:
+            raise ValueError('Unknown correction_mode')
         self.parallel_action_position_mode = str(parallel_action_position_mode)
         if self.parallel_action_position_mode not in {"legacy", "decoder_only"}:
             raise ValueError("parallel_action_position_mode must be legacy or decoder_only")
@@ -736,7 +745,9 @@ class UAVFlowPredictorIDM(nn.Module):
             gradient_checkpointing=bool(gradient_checkpointing),
             num_action_slots=(self.action_chunk_size if self.parallel_vla_gfm_enabled else 1),
             action_slot_position_encoding=self.parallel_action_position_mode == "legacy",
-        )
+        ) if not self.dual_stream_rgbwarp_enabled else nn.Identity()
+        if self.dual_stream_rgbwarp_enabled:
+            self.predictor.language_len=int(language_len)  # trainer compatibility, NO Predictor parameters
         if self.vlm_action_seed_enabled:
             # Select one already multimodally contextualized Qwen token, then
             # initialize only GAM's current action slot. Language is therefore
@@ -946,16 +957,16 @@ class UAVFlowPredictorIDM(nn.Module):
         # action-history input projection remains trainable: when enabled it
         # receives only actions already executed before each observed image.
         # Otherwise its all-zero input acts as a learned query slot.
-        unused_modules = [
+        unused_modules = [] if self.dual_stream_rgbwarp_enabled else [
             self.predictor.future_proprio_proj,
             self.predictor.out_proprio_norm,
         ]
-        if not self.direct_action_enabled:
+        if not self.direct_action_enabled and not self.dual_stream_rgbwarp_enabled:
             unused_modules.extend([
                 self.predictor.action_proj,
                 self.predictor.out_action_norm,
             ])
-        if not self.use_pose_history:
+        if not self.use_pose_history and not self.dual_stream_rgbwarp_enabled:
             unused_modules.append(self.predictor.proprio_token_proj)
         for module in unused_modules:
             for parameter in module.parameters():
@@ -1025,6 +1036,61 @@ class UAVFlowPredictorIDM(nn.Module):
                 parameter.requires_grad = False
             if self.use_pose_history or self.use_action_history:
                 raise ValueError("direct_current control does not accept numeric pose/action history")
+        self.transport_policy = None
+        if support_aware_transport and bool(support_aware_transport.get("enabled", False)):
+            if (not self.parallel_vla_gfm_enabled
+                    or self.parallel_vla_gfm_mode not in {"qwen_tokens", "external_query"}
+                    or self.parallel_action_decode_mode != "geometry_residual"
+                    or self.parallel_action_position_mode != "decoder_only"
+                    or self.action_dim != 4
+                    or self.predictor.condition_mode != "cross_attn"):
+                raise ValueError("Candidate B requires parallel Qwen/query VLA, geometry_residual, decoder_only, cross_attn and 4-DoF actions")
+            if self.stop_head_enabled or self.relative_pose_head_enabled or self.depth_scale_head_enabled:
+                raise ValueError("Candidate B first version uses no Stop/pose head and fixed-metric depth")
+            from .support_aware_transport import SupportAwareTransport
+            self.transport_policy = SupportAwareTransport(
+                visual_dim=int(da3.embed_dim), predictor_dim=int(d_model),
+                proposal_input_dim=(int(language_dim) if self.parallel_vla_gfm_mode == "qwen_tokens" else int(d_model)),
+                chunk_size=self.action_chunk_size, config=support_aware_transport,
+            )
+            # Candidate B reads the three final banks itself. The legacy
+            # per-layer Current CA is unused and must not enter the optimizer.
+            if self.current_geometry_read is not None:
+                for parameter in self.current_geometry_read.parameters():
+                    parameter.requires_grad = False
+
+        self.provenance_correction = None
+        if self.correction_mode != 'legacy':
+            if (self.transport_policy is not None or not self.parallel_vla_gfm_enabled
+                    or self.parallel_vla_gfm_mode != 'qwen_tokens'
+                    or self.parallel_action_decode_mode != 'geometry_residual'
+                    or self.geometry_architecture != 'dual_vla_gfm'):
+                raise ValueError('Explicit correction requires Qwen slots, single future trunk and residual decode')
+            from .provenance_correction import ProvenanceCorrection
+            self.provenance_correction = ProvenanceCorrection(
+                mode=self.correction_mode, language_dim=language_dim,
+                visual_dim=self.da3.embed_dim, config=provenance_correction)
+        self.rgbwarp_correction=None
+        if self.dual_stream_rgbwarp_enabled:
+            if (self.correction_mode!='legacy' or self.transport_policy is not None
+                    or not self.parallel_vla_gfm_enabled or self.parallel_vla_gfm_mode!='qwen_tokens'
+                    or self.parallel_action_decode_mode!='geometry_residual'
+                    or self.parallel_current_geometry_read_enabled or self.stop_head_enabled
+                    or self.use_action_history or self.use_pose_history or self.use_fixed_first_frame):
+                raise ValueError('RGB-warp requires native Qwen slots, residual head, no old banks/Predictor/stop/history/F0')
+            from .rgbwarp_correction import RGBWarpCorrection
+            self.semantic_geometry_action=nn.Identity()  # empty checkpoint-compatible placeholder, never called
+            # This mode has its own bounded additive residual, not GAM's
+            # sigmoid interpolation gate. An unused trainable gate breaks DDP.
+            self.residual_gate_logit.requires_grad_(False)
+            for parameter in self.da3.dpt_head.parameters():parameter.requires_grad_(False)
+            self.rgbwarp_correction=RGBWarpCorrection(language_dim,int(self.da3.embed_dim),self.da3.PATCH_SIZE,
+                                                     self.da3.out_layers,rgbwarp_correction)
+            if self.rgbwarp_correction.correspondence is not None:
+                layers=self.rgbwarp_correction.layers
+                trans=self.da3.backbone.pretrained
+                if not layers or len(set(layers))!=len(layers) or min(layers)<trans.alt_start or max(layers)>=len(trans.blocks):
+                    raise ValueError('Correspondence layers must be distinct existing deep blocks')
 
     @property
     def residual_gate(self) -> torch.Tensor:
@@ -1060,6 +1126,8 @@ class UAVFlowPredictorIDM(nn.Module):
         force_action_history_missing: bool = False,
         force_pose_history_missing: bool = False,
         prediction_role: torch.Tensor | None = None,
+        geometry_context: torch.Tensor | None = None,
+        geometry_context_keep_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Predict future shallow tokens; normal training uses exactly one step.
 
@@ -1241,6 +1309,9 @@ class UAVFlowPredictorIDM(nn.Module):
                     None if (self.vlm_action_seed_enabled or self.parallel_vla_gfm_enabled)
                     else lang_padding_mask
                 ),
+                **({"geometry_context": geometry_context,
+                    "geometry_context_keep_mask": geometry_context_keep_mask}
+                   if geometry_context is not None else {}),
             )
             if self.dense_context_supervision:
                 # The synthetic fixed-F0 reference is conditioning only.  Drop
@@ -1341,7 +1412,13 @@ class UAVFlowPredictorIDM(nn.Module):
         conditioning_generator: torch.Generator | None = None,
         force_action_history_missing: bool = False,
         force_pose_history_missing: bool = False,
+        action_denormalizer=None,
+        current_depth_meters: torch.Tensor | None = None,
+        current_depth_valid: torch.Tensor | None = None,
+        camera_intrinsics: torch.Tensor | None = None,
     ) -> dict[str, object]:
+        if self.dual_stream_rgbwarp_enabled:
+            return self.rgbwarp_correction(self,observed_shallow,lang_feats,action_denormalizer,camera_intrinsics)
         if self.current_geometry_action_enabled and observed_shallow.shape[1] != 1:
             raise ValueError("Current geometry action ablation supports H=1 only (avoid temporal leakage)")
         if self.geometry_architecture != "legacy" and observed_shallow.shape[1:3] != (1, 1):
@@ -1388,6 +1465,18 @@ class UAVFlowPredictorIDM(nn.Module):
             force_action_history_missing=force_action_history_missing,
             force_pose_history_missing=force_pose_history_missing,
         )
+        if self.transport_policy is not None:
+            return self.transport_policy.forward_policy(
+                self, observed_shallow, reference_shallow, action_slot_seed, rollout_kwargs,
+                action_denormalizer=action_denormalizer,
+                action_targets_norm=action_targets_norm,
+                current_depth_meters=current_depth_meters,
+                current_depth_valid=current_depth_valid,
+                intrinsics=camera_intrinsics,
+            )
+        vlm_proposal = (None if self.provenance_correction is None
+                        else self.provenance_correction.proposal(self, lang_feats))
+        provenance_info = None
         predicted_current = None
         current_action_tokens = None
         if self.direct_current_seed is not None:
@@ -1434,10 +1523,17 @@ class UAVFlowPredictorIDM(nn.Module):
             deep_visuals = future
             deep_actions = direct_action_tokens
             deep_kwargs = {}
+            if self.correction_mode in {'support_aware', 'uncertain'}:
+                provenance_info, current_depth_output, current_geometry_features = self.provenance_correction.support(
+                    self, observed_shallow, vlm_proposal, action_denormalizer,
+                    metric=current_depth_meters, valid=current_depth_valid, intrinsics=camera_intrinsics)
+                deep_kwargs.update(provenance_rho=provenance_info['rho'],
+                                   reliability_head=self.provenance_correction.reliability,
+                                   apply_reliability=True)
             if self.parallel_vla_gfm_enabled and (
                 self.parallel_current_depth_enabled
                 or self.parallel_current_geometry_read_enabled
-            ):
+            ) and current_geometry_features is None:
                 # Bank 2: current observation takes a pure action-free DA3
                 # deep pass.  Each corresponding deep layer becomes geometry
                 # memory for the K action tokens that already passed through
@@ -1453,13 +1549,13 @@ class UAVFlowPredictorIDM(nn.Module):
                         ),
                         layer_patch_mode=self.current_geometry_patch_mode,
                     )
-                if self.parallel_current_geometry_read_enabled:
-                    if self.current_geometry_read is None:
-                        raise RuntimeError("Parallel Current Geometry read has no CA module")
-                    deep_kwargs.update(
-                        current_geometry_by_layer=current_geometry_features["layer_patches"],
-                        current_geometry_read=self.current_geometry_read,
-                    )
+            if self.parallel_vla_gfm_enabled and self.parallel_current_geometry_read_enabled:
+                if self.current_geometry_read is None:
+                    raise RuntimeError("Parallel Current Geometry read has no CA module")
+                deep_kwargs.update(
+                    current_geometry_by_layer=current_geometry_features["layer_patches"],
+                    current_geometry_read=self.current_geometry_read,
+                )
             if (not self.parallel_vla_gfm_enabled and self.current_geometry_read is not None
                     and self.current_geometry_read_mode == "per_layer"):
                 current_geometry_features = self.da3.propagate_shallow_visual_slots_grad(
@@ -1538,6 +1634,7 @@ class UAVFlowPredictorIDM(nn.Module):
                 direct_actions_norm = (
                     oft_direct_prediction
                     if self.parallel_vla_gfm_mode == "oft_direct"
+                    else vlm_proposal if vlm_proposal is not None
                     else self.parallel_action_head(direct_action_tokens)
                 )
         elif self.direct_action_enabled and not self.causal_action_decoder_enabled:
@@ -1552,9 +1649,21 @@ class UAVFlowPredictorIDM(nn.Module):
                 if self.parallel_action_decode_mode == "geometry_residual":
                     if self.parallel_action_correction_head is None:
                         raise RuntimeError("Geometry-residual decode has no correction head")
-                    geometry_action_residual = self.parallel_action_correction_head(
-                        refined_action_tokens
-                    )
+                    if provenance_info is None:
+                        geometry_action_residual = self.parallel_action_correction_head(refined_action_tokens)
+                    else:
+                        unsupported_tokens = deep_joint_features['unsupported_action_tokens'].reshape_as(refined_action_tokens)
+                        geometry_action_residual, ds, du, stats = self.provenance_correction.residual(
+                            self, refined_action_tokens, unsupported_tokens, provenance_info['rho'])
+                        provenance_info.update(delta_sup=ds, delta_unsup=du,
+                            reliability_records=deep_joint_features['reliability_records'],
+                            stats={**stats, **deep_joint_features['provenance_stats']})
+                        for kind in ('supported_read', 'unsupported_read'):
+                            reads = [v for k,v in deep_joint_features['provenance_stats'].items() if k.startswith(kind+'_L')]
+                            provenance_info['stats'][kind] = torch.stack(reads).mean()
+                            for key in list(provenance_info['stats']):
+                                if key.startswith(kind+'_L'):
+                                    provenance_info['stats'].pop(key)
                     refine_actions_norm = direct_actions_norm + geometry_action_residual
                 else:
                     geometry_action_residual = None
@@ -1710,6 +1819,7 @@ class UAVFlowPredictorIDM(nn.Module):
             "idm_features": idm_features,
             "actions_norm": actions_norm,
             "direct_actions_norm": direct_actions_norm,
+            "provenance_correction": provenance_info,
             "refine_actions_norm": refine_actions_norm,
             "geometry_action_residual_norm": geometry_action_residual,
             "dual_refine_actions_norm": dual_refine_actions_norm,

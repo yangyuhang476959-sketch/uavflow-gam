@@ -1,7 +1,7 @@
 # NVIDIA remote training handoff
 
-This release runs the ten-cell VLA--GAM matrix. Every experiment is one Python
-command intended for one complete 8x64GB GPU node.
+This release maintains three metric-depth experiments. Every experiment is
+independent and can use one complete eight-device node via the existing DDP trainer.
 
 For Huawei Ascend nodes, use [NPU_SETUP.md](../NPU_SETUP.md). Do not
 install this CUDA environment on top of a vendor torch_npu image.
@@ -53,7 +53,7 @@ export UAVFLOW_DEPTH_ROOT=$PWD/data_remote/UAV-Flow-Sim-Depth
 export DA3_CHECKPOINT=$PWD/checkpoints/track4world_da3.pth
 export QWEN_MODEL=$PWD/checkpoints/qwen3.5-2b
 export T5_MODEL=$PWD/checkpoints/t5-base
-export OUTPUT_ROOT=$PWD/results/vla_gam_matrix_v2
+export OUTPUT_ROOT=$PWD/results/metric_release
 export NPROC=8
 export GLOBAL_BATCH_SIZE=32
 
@@ -71,37 +71,26 @@ episodes, seven instruction corrections and working pinned imports.
 ## 4. Submit one command per node
 
 ```bash
-python experiments/uavflow_remote_ablation/jobs_v2/01_g0.py
-python experiments/uavflow_remote_ablation/jobs_v2/02_g1.py
-python experiments/uavflow_remote_ablation/jobs_v2/03_c0.py
-python experiments/uavflow_remote_ablation/jobs_v2/04_c1.py
-python experiments/uavflow_remote_ablation/jobs_v2/05_q0.py
-python experiments/uavflow_remote_ablation/jobs_v2/06_s0.py
-python experiments/uavflow_remote_ablation/jobs_v2/07_s1.py
-python experiments/uavflow_remote_ablation/jobs_v2/08_s2.py
-python experiments/uavflow_remote_ablation/jobs_v2/09_r1.py
-python experiments/uavflow_remote_ablation/jobs_v2/10_dv.py
+python -m torch.distributed.run --standalone --nproc_per_node=8 experiments/metric_jobs/01_gam.py
+python -m torch.distributed.run --standalone --nproc_per_node=8 experiments/metric_jobs/02_current_bank.py
+python -m torch.distributed.run --standalone --nproc_per_node=8 experiments/metric_jobs/03_rgbwarp.py
 ```
 
-Do not submit all ten commands into one node. The cluster should enqueue each
-line as an independent 8-GPU job. Every entrypoint performs:
-
-1. runtime and full depth-layout audit;
-2. locked creation/reuse of one shared split;
-3. Stage 1: 10 epochs action + feature + depth, constant LR;
-4. selection of `best_action.pt` by minimum H=1 validation Action loss;
-5. Stage 2: 10 epochs joint policy + ordered concat-MLP Stop, cosine LR;
-6. exact same-stage optimizer/scheduler/data-cursor resume after interruption.
-
-Completed stages have `_SUCCESS` and are skipped on re-submission. Results are
-stored as `results/vla_gam_matrix_v2/<ID>/{stage1,stage2_stop}`.
+Submit each line as an independent node job, not all three on one node.
+Run the data/runtime audit above first. Default per-device batch4 gives global32
+on eight devices; actual memory feasibility remains to be measured. Defaults
+are five epochs constant LR, no Stop. Resume explicitly with `--resume` and the
+same world size/data/batch. Outputs are `$OUTPUT_ROOT/{gam,current_bank,rgbwarp}`.
+Exact loss/pose/readout differences are documented in
+[METRIC_EXPERIMENTS.md](METRIC_EXPERIMENTS.md).
 
 ## 5. Minimal smoke job
 
 ```bash
-STAGE1_EPOCHS=1 NPROC=2 GLOBAL_BATCH_SIZE=4 CUDA_DEVICES=0,1 \
-python experiments/uavflow_remote_ablation/jobs_v2/09_r1.py \
-  --stage stage1 --max-trajectories 20
+CUDA_VISIBLE_DEVICES=0,1 OUTPUT_ROOT="$OUTPUT_ROOT/smoke" \
+python -m torch.distributed.run --standalone --nproc_per_node=2 \
+  experiments/metric_jobs/02_current_bank.py --max-trajectories 20 \
+  --set training.max_epochs=1 --set training.batch_size=1
 ```
 
 This checks construction and one tiny training run; it is not a scientific

@@ -187,7 +187,7 @@ export OUTPUT_ROOT="/path/to/training-output"
 python -m pip install -c "$PLATFORM_CONSTRAINTS" -c constraints-ascend.txt modelscope==1.38.1
 export DATA_ROOT="${DATA_ROOT:-$PROJECT_ROOT/data_remote}"
 export MODEL_ROOT="${MODEL_ROOT:-$PROJECT_ROOT/checkpoints}"
-export OUTPUT_ROOT="${OUTPUT_ROOT:-$PROJECT_ROOT/results/vla_gam_matrix_v2}"
+export OUTPUT_ROOT="${OUTPUT_ROOT:-$PROJECT_ROOT/results/metric_release}"
 python scripts/download_uavflow_assets.py \
   --data-root "$DATA_ROOT" --model-root "$MODEL_ROOT" \
   --hf-endpoint https://hf-mirror.com \
@@ -269,48 +269,48 @@ python scripts/verify_uavflow_remote.py --accelerator npu \
   --sim-root "$UAVFLOW_SIM_ROOT" --depth-root "$UAVFLOW_DEPTH_ROOT" \
   --da3-checkpoint "$DA3_CHECKPOINT" --qwen-model "$QWEN_MODEL" --t5-model "$T5_MODEL"
 
-OUTPUT_ROOT="$PROJECT_ROOT/results/npu_smoke" NPROC=1 GLOBAL_BATCH_SIZE=4 \
-DEVICE_IDS=0 STAGE1_EPOCHS=1 \
-python experiments/uavflow_remote_ablation/jobs_v2/09_r1.py \
-  --stage stage1 --max-trajectories 20
+OUTPUT_ROOT="$OUTPUT_ROOT/npu_smoke" ASCEND_RT_VISIBLE_DEVICES=0 \
+python experiments/metric_jobs/02_current_bank.py \
+  --max-trajectories 20 --set training.max_epochs=1 --set training.batch_size=1
 ```
 
 The audit verifies package versions/data counts and randomly loads replay/hybrid
-episodes. The final command tests the real R1 forward/backward on 20 trajectories;
+episodes. The final command exercises the maintained Current Bank model on 20 trajectories;
 imports alone are insufficient. This is a smoke run, not a scientific result.
-The existing NPU runner uses BF16; support and actual memory/performance on another
+The existing trainer uses BF16; support and actual memory/performance on another
 platform must be verified before production. Keep smoke outputs separate.
+The previously validated R1 measurements refer to the historical model, not a
+new validation claim for these metric-depth/LoRA variants.
 
 ## 4. Run, resume and validate
 
-One matrix experiment per eight-NPU node; choose the corresponding Python entry
-from [the ten-cell list](experiments/uavflow_remote_ablation/README.md). Example R1:
+Choose one of [the three metric-depth experiments](docs/METRIC_EXPERIMENTS.md),
+one experiment per eight-NPU node. Example Current Bank correction:
 
 ```bash
-export NPROC=8 GLOBAL_BATCH_SIZE=32 DEVICE_IDS=0,1,2,3,4,5,6,7
-export STAGE1_EPOCHS=10 STAGE2_EPOCHS=10
-python experiments/uavflow_remote_ablation/jobs_v2/09_r1.py
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+python -m torch.distributed.run --standalone --nproc_per_node=8 \
+  experiments/metric_jobs/02_current_bank.py --set training.batch_size=4
 ```
 
-Stage 1: 10 epochs, constant LR; Stage 2: 10 epochs, cosine LR with Stop.
-Re-run the **same command and paths/split/batch configuration** to resume:
-the runner restores same-stage checkpoint state and skips `_SUCCESS` stages.
-Stage 2 initializes from Stage 1's best validation Action-loss checkpoint.
-Outputs are `$OUTPUT_ROOT/<ID>/{stage1,stage2_stop}`. Validation normally runs
-every 2,000 steps with 100 batches; epoch checkpoint archives are enabled.
+Defaults: 5 epochs constant LR, no Stop phase. Outputs are
+`$OUTPUT_ROOT/{gam,current_bank,rgbwarp}`. To resume, use the same entry/world
+size/data/batch with `--resume /path/to/checkpoint.pt`; optimizer/scaler/RNG/data
+cursor restoration stays in the shared trainer. Validation normally runs every
+2,000 steps with 100 batches; epoch checkpoint archives are enabled.
 
 Standalone full validation, using the saved configuration:
 
 ```bash
-RUN_DIR="$OUTPUT_ROOT/R1/stage1"
+RUN_DIR="$OUTPUT_ROOT/current_bank"
 ASCEND_RT_VISIBLE_DEVICES=0 python experiments/uavflow_predictor_idm/train.py \
   --config "$RUN_DIR/resolved_config.yaml" --resume "$RUN_DIR/best_action.pt" \
   --eval-only --eval-domain mixed \
-  --set "training.results_dir=$OUTPUT_ROOT/R1/validation" \
+  --set "training.results_dir=$OUTPUT_ROOT/current_bank/validation" \
   --set training.eval_max_batches=0
 ```
 
-Change the ID/stage/checkpoint for other runs; `eval_max_batches=100` restores
+Change the variant/checkpoint for other runs; `eval_max_batches=100` restores
 bounded validation. Results are `eval_ckpt_<step>.json`. Transferred training
 configs/checkpoints retain saved paths, so cross-machine resume needs manual path
 review. Closed-loop UE evaluation is **not validated on Ascend in this release**;

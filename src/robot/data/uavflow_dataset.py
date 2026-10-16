@@ -134,6 +134,21 @@ def _rpy(R):
     return roll,yaw,pitch
 
 
+def episode_yaw4d_state(first_raw,current_raw):
+    """Shared train/service state: first-heading xyz cm + wrapped yaw degrees.
+
+    Both inputs use simulator raw [x_cm,y_cm,z_cm,roll_deg,yaw_deg,pitch_deg].
+    This explicit 4DoF contract does not silently mix full-first-rotation
+    preprocessed logs with a yaw-only online evaluator.
+    """
+    if np.asarray(first_raw).shape!=(6,) or np.asarray(current_raw).shape!=(6,):
+        raise ValueError('State conversion expects simulator raw six-component poses')
+    if not np.isfinite(first_raw).all() or not np.isfinite(current_raw).all():
+        raise ValueError('State poses must be finite')
+    delta=_delta(first_raw,current_raw,'yaw4d',action_delta_mode='openvla_yaw_only')
+    return np.array([*delta[:3],math.degrees(float(delta[3]))],dtype=np.float32)
+
+
 def _delta(a, b, convention, action_delta_mode="full_se3_legacy"):
     pa,pb=np.asarray(a[:3],np.float64),np.asarray(b[:3],np.float64)
     if convention == "yaw4d" and action_delta_mode == "openvla_yaw_only":
@@ -1064,14 +1079,7 @@ class UAVFlowParquetDataset(Dataset):
             # coordinates in native simulator centimetres plus yaw in degrees.
             prompt_rows=[]
             for idx in anchor_indices:
-                delta=_delta(
-                    raw[0],raw[idx],"yaw4d",
-                    action_delta_mode="openvla_yaw_only",
-                )
-                prompt_rows.append([
-                    float(delta[0]),float(delta[1]),float(delta[2]),
-                    math.degrees(float(delta[3])),
-                ])
+                prompt_rows.append(episode_yaw4d_state(raw[0],raw[idx]).tolist())
             openvla_prompt_pose=torch.tensor(prompt_rows,dtype=torch.float32)
         elif tid in self.openvla_prompt_poses:
             openvla_prompt_pose=torch.from_numpy(
