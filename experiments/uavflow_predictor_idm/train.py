@@ -458,6 +458,7 @@ def main() -> None:
             cfg.model.get("parallel_action_decode_mode", "full")
         ),
         parallel_action_position_mode=str(cfg.model.get("parallel_action_position_mode", "legacy")),
+        action_residual_gate_init=cfg.model.get('action_residual_gate_init'),
         support_aware_transport=transport_cfg,
         correction_mode=correction_mode,
         provenance_correction=OmegaConf.to_container(correction_cfg, resolve=True) if OmegaConf.is_config(correction_cfg) else dict(correction_cfg),
@@ -626,6 +627,8 @@ def main() -> None:
         direct_head_ids.update(id(p) for p in raw_model.provenance_correction.proposal_projection.parameters() if p.requires_grad)
     if raw_model.rgbwarp_correction is not None:
         direct_head_ids.update(id(p) for p in raw_model.rgbwarp_correction.parameters() if p.requires_grad)
+    if raw_model.action_residual_gate_logit is not None:
+        direct_head_ids.add(id(raw_model.action_residual_gate_logit))
     separate_stop_lr = cfg.training.get("stop_head_lr") is not None
     stop_head_ids = {
         id(parameter) for parameter in raw_model.stop_head.parameters()
@@ -810,6 +813,7 @@ def main() -> None:
             "model.parallel_vla_gfm_mode",
             "model.parallel_action_post_bidir_layers",
             "model.parallel_action_position_mode",
+            "model.action_residual_gate_init",
             "model.support_aware_transport",
             "model.correction_mode",
             "model.provenance_correction",
@@ -1162,10 +1166,9 @@ def main() -> None:
             dist.destroy_process_group()
         return
 
-    if rgbwarp_enabled:
-        physical_bounds=raw_model.rgbwarp_correction.physical_residual_bounds(normalizer)
-        if rank==0:
-            print(f'RGB-warp residual maximum per step [m,m,m,rad]: {physical_bounds}',flush=True)
+    if raw_model.action_residual_gate_logit is not None and rank==0:
+        print('Action gated residual: proposal + sigmoid(g)*delta; no tanh/bound; '
+              f'gate={raw_model.action_residual_gate_logit.sigmoid().item():.6f}',flush=True)
     configured_epochs = int(cfg.training.get("max_epochs", 0))
     samples_per_rank = (
         int(math.ceil(len(train_set) / float(world))) if is_dist else len(train_set)

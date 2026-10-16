@@ -170,8 +170,6 @@ def load_policy(checkpoint_path, *, device="cuda:0", da3_checkpoint=None, qwen_m
     if "action_normalizer" not in checkpoint:
         raise KeyError("Candidate B checkpoint must carry its action_normalizer")
     normalizer = ActionNormalizer.from_state_dict(checkpoint["action_normalizer"])
-    if model.dual_stream_rgbwarp_enabled:
-        model.rgbwarp_correction.physical_residual_bounds(normalizer)
     policy_type=RGBWarpPolicy if model.dual_stream_rgbwarp_enabled else SupportAwarePolicy
     return policy_type(model, conditioner, normalizer, amp=bool(cfg.training.amp),
                               pose_state_mode=str(cfg.dataset.get('openvla_prompt_pose_mode','preprocessed')),

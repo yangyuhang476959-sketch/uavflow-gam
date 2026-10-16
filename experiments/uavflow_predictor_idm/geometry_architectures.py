@@ -113,6 +113,8 @@ def architecture_state(model):
             model, "parallel_action_decode_mode", "full"
         ),
         "parallel_action_position_mode": getattr(model, "parallel_action_position_mode", "legacy"),
+        "action_residual_gate_logit": (None if model.action_residual_gate_logit is None
+                                       else model.action_residual_gate_logit.detach().cpu()),
     }
     transport = getattr(model, "transport_policy", None)
     rgbwarp=getattr(model,'rgbwarp_correction',None)
@@ -135,6 +137,12 @@ def load_architecture_state(model, checkpoint, *, allow_new_transport=False):
         return
     if state["mode"] != model.geometry_architecture:
         raise ValueError("Geometry architecture changed; checkpoint is not compatible")
+    saved_action_gate=state.get('action_residual_gate_logit')
+    if (model.action_residual_gate_logit is None)!=(saved_action_gate is None):
+        raise ValueError('Action residual gating changed; checkpoint is not an exact resume')
+    if saved_action_gate is not None:
+        with torch.no_grad():
+            model.action_residual_gate_logit.copy_(saved_action_gate.to(model.action_residual_gate_logit))
     rgbwarp=getattr(model,'rgbwarp_correction',None)
     saved_rgb=state.get('rgbwarp_correction')
     if (rgbwarp is None)!=(saved_rgb is None):

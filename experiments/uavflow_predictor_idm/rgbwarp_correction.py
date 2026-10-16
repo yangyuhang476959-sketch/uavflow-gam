@@ -5,7 +5,6 @@ The controller does NOT own/register a second DA3 instance.
 """
 import torch
 from torch import nn
-from torch.nn import functional as F
 
 from .current_geometry import CurrentGeometryRead
 from .patch_transport import nominal_intrinsics
@@ -36,7 +35,7 @@ class RGBWarpCorrection(nn.Module):
         super().__init__();self.config=dict(config or {})
         allowed={'use_pixel_binary_mask','use_correspondence_attention','correspondence_layers',
                  'correspondence_width','correspondence_heads','depth_scale_meters','fov_degrees',
-                 'heading_from_camera','residual_bound_enabled','residual_max_abs','residual_range_fraction'}
+                 'heading_from_camera'}
         if set(self.config)-allowed:raise ValueError(f'Unknown RGB warp settings: {set(self.config)-allowed}')
         self.layers=tuple(int(i) for i in self.config.get('correspondence_layers',layers))
         self.proposal_projection=nn.Sequential(nn.LayerNorm(language_dim),nn.Linear(language_dim,visual_dim))
@@ -48,26 +47,7 @@ class RGBWarpCorrection(nn.Module):
         self.correspondence=(CorrespondenceRead(visual_dim,self.layers,
             width=int(self.config.get('correspondence_width',256)),heads=int(self.config.get('correspondence_heads',8)))
             if self.config.get('use_correspondence_attention',True) else None)
-        # q01..q99 normalized action range has width2. Bound is a configurable
-        # fraction of that measured range, not arbitrary per-axis physical units.
-        fraction=float(self.config.get('residual_range_fraction',.5))
-        bound=self.config.get('residual_max_abs',[2*fraction]*4)
-        bound=torch.as_tensor(bound,dtype=torch.float32)
-        if bound.shape!=(4,) or not torch.isfinite(bound).all() or (bound<=0).any():
-            raise ValueError('residual_max_abs requires four positive NORMALIZED bounds')
-        self.register_buffer('residual_max_abs',bound)
         if float(self.config.get('depth_scale_meters',100.))<=0:raise ValueError('Positive depth scale required')
-
-    def physical_residual_bounds(self,normalizer):
-        """Validate the stats-derived default and report per-step m/m/m/rad."""
-        automatic='residual_max_abs' not in self.config
-        if automatic and (normalizer.norm_mode!='q01_q99'
-                or any(not bool(s['mask'].all()) for s in normalizer.stats_by_key.values())):
-            raise ValueError('Automatic residual range requires four active q01_q99 dimensions; supply explicit normalized bounds otherwise')
-        bounds=self.residual_max_abs.detach().cpu().reshape(1,1,4)
-        return {key:(normalizer.denormalize(bounds,stats_keys=[key])-
-                     normalizer.denormalize(torch.zeros_like(bounds),stats_keys=[key])).reshape(4).tolist()
-                for key in normalizer.stats_by_key}
 
     def forward(self,model,current_rgb,language,denormalize,intrinsics=None):
         if current_rgb.ndim!=4 or language.shape[:2]!=(current_rgb.shape[0],5) or denormalize is None:
@@ -98,12 +78,14 @@ class RGBWarpCorrection(nn.Module):
             correspondence_mask=warp['correspondence'])
         tokens=deep['action_tokens'].reshape(b,1,1,5,da3.embed_dim)
         z=model.parallel_action_correction_head(tokens)
-        delta=(self.residual_max_abs*z.tanh() if self.config.get('residual_bound_enabled',True) else z)
+        delta=model.gate_action_residual(z)
         diagnostics={'rgbwarp_valid_ratio':warp['valid'].float().mean().detach(),
                      'rgbwarp_correspondence_ratio':warp['correspondence'].float().mean().detach()}
         for i,axis in enumerate(('x','y','z','yaw')):
             diagnostics['rgbwarp_residual_abs_'+axis]=delta[...,i].abs().mean().detach()
-            diagnostics['rgbwarp_saturation_'+axis]=(z[...,i].tanh().abs()>.95).float().mean().detach()
+            diagnostics['rgbwarp_residual_raw_abs_'+axis]=z[...,i].abs().mean().detach()
+        if model.action_residual_gate_logit is not None:
+            diagnostics['action_residual_gate']=model.action_residual_gate_logit.sigmoid().detach()
         return dict(actions_norm=proposal+delta,direct_actions_norm=proposal,refine_actions_norm=proposal+delta,
                     current_depth_output=decoded,deep_joint_features=deep,warp=warp,
                     proposal_physical=raw,residual=delta,diagnostics=diagnostics)

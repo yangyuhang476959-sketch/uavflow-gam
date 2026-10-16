@@ -36,7 +36,7 @@ quality remain to be measured. CPU regression tests do not constitute NPU valida
    subsequent native SA; the last-block CA directly affects depth, not an already
    computed last-layer action hidden.
 7. Frozen DPT reads future patches; the existing correction head reads five
-   refined action tokens. Final normalized actions are `proposal + bound*tanh(z)`.
+   refined action tokens. Final normalized actions are `proposal + sigmoid(g)*z`.
    Correction head starts at zero, hence initial final actions equal proposal.
 
 There is **one DA3 object, one shared full-backbone LoRA adapter and one DPT**,
@@ -47,11 +47,13 @@ parameters and DPT stay frozen. DA3 LoRA covers all Linear modules in blocks
 The mask projection, correspondence read, state encoder, projections and action
 heads train. Both stream losses update the same DA3 LoRA.
 
-Default residual bound is 0.5 times the q01–q99 action range: one normalized unit
-per axis. Its physical per-step bound is printed from the saved normalizer.
-This is a configurable statistics-derived starting bound, **not** a calibrated
-proposal-error quantile. Explicit normalized bounds can be supplied with
-`model.rgbwarp_correction.residual_max_abs=[x,y,z,yaw]`.
+The correction has no tanh, clipping or fixed per-axis bound. A single learned
+scalar `sigmoid(g)` starts at 0.1 and scales all five steps/four dimensions.
+Configure its initial value with `model.action_residual_gate_init=0.1`.
+This is a residual-strength parameter, not sample-dependent uncertainty; since
+the head output is unbounded, a sigmoid gate does not impose an action bound.
+It is independent of the unused legacy Predictor feature-residual gate and
+of the Current Bank CA gates. The action head and residual head stay independent.
 
 ## Loss and the fixed future target
 
@@ -177,11 +179,11 @@ real Qwen+DA3 forward/backward on the target accelerator is still required.
 
 ## Verification performed
 
-On the local CPU test path after release cleanup: 204 tests and 20 subtests passed, including the
+On the local CPU test path after gated-residual update: 205 tests and 20 subtests passed, including the
 existing architecture/runtime suites. The 16 RGB-warp tests cover identity and
 known-motion projection, validity/correspondence, empty CA rows, shared LoRA and
 frozen DPT gradients, warp-only future-loss gradients to proposal/current depth,
-mask zero initialization, bounded residuals, architecture/optimizer round-trip,
+mask zero initialization, unbounded gated residuals, architecture/optimizer round-trip,
 numeric state injection, observation-only service parity and evaluator metrics.
 An additional read-only audit of 10 real dataset windows found zero difference
 between Dataset state and the inference conversion helper (cm/degrees).

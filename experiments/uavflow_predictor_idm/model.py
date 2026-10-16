@@ -559,6 +559,7 @@ class UAVFlowPredictorIDM(nn.Module):
         stop_future_gate_init: float = 0.1,
         residual_prediction: bool = True,
         residual_gate_init: float = 0.10,
+        action_residual_gate_init: float | None = None,
         gradient_checkpointing: bool = True,
         current_geometry_action_enabled: bool = False,
         current_geometry_read_mode: str = "terminal",
@@ -976,6 +977,16 @@ class UAVFlowPredictorIDM(nn.Module):
             torch.tensor(float(torch.logit(torch.tensor(gate)).item())),
             requires_grad=self.residual_prediction,
         )
+        # Action correction gate is separate from the existing shallow-feature
+        # residual gate above. Never change Predictor semantics to gate actions.
+        self.register_parameter('action_residual_gate_logit',None)
+        if action_residual_gate_init is not None:
+            initial=float(action_residual_gate_init)
+            if not 0.<initial<1.:
+                raise ValueError('action_residual_gate_init must be strictly between 0 and 1')
+            if not self.parallel_vla_gfm_enabled or self.parallel_action_decode_mode!='geometry_residual':
+                raise ValueError('Action residual gate requires a parallel geometry-residual decoder')
+            self.action_residual_gate_logit=nn.Parameter(torch.logit(torch.tensor(initial)))
         # Construct last: disabled ablations retain their previous RNG sequence.
         parallel_geometry_layers = None
         self.current_geometry_patch_mode = "concat"
@@ -1080,8 +1091,8 @@ class UAVFlowPredictorIDM(nn.Module):
                 raise ValueError('RGB-warp requires native Qwen slots, residual head, no old banks/Predictor/stop/history/F0')
             from .rgbwarp_correction import RGBWarpCorrection
             self.semantic_geometry_action=nn.Identity()  # empty checkpoint-compatible placeholder, never called
-            # This mode has its own bounded additive residual, not GAM's
-            # sigmoid interpolation gate. An unused trainable gate breaks DDP.
+            # The old shallow-feature residual gate is unused without Predictor.
+            # Action correction uses the independent action gate above.
             self.residual_gate_logit.requires_grad_(False)
             for parameter in self.da3.dpt_head.parameters():parameter.requires_grad_(False)
             self.rgbwarp_correction=RGBWarpCorrection(language_dim,int(self.da3.embed_dim),self.da3.PATCH_SIZE,
@@ -1095,6 +1106,11 @@ class UAVFlowPredictorIDM(nn.Module):
     @property
     def residual_gate(self) -> torch.Tensor:
         return self.residual_gate_logit.sigmoid()
+
+    def gate_action_residual(self, residual: torch.Tensor) -> torch.Tensor:
+        if self.action_residual_gate_logit is None:
+            return residual
+        return self.action_residual_gate_logit.sigmoid().to(residual.dtype)*residual
 
     def train(self, mode: bool = True) -> "UAVFlowPredictorIDM":
         super().train(mode)
@@ -1664,6 +1680,7 @@ class UAVFlowPredictorIDM(nn.Module):
                             for key in list(provenance_info['stats']):
                                 if key.startswith(kind+'_L'):
                                     provenance_info['stats'].pop(key)
+                    geometry_action_residual=self.gate_action_residual(geometry_action_residual)
                     refine_actions_norm = direct_actions_norm + geometry_action_residual
                 else:
                     geometry_action_residual = None
@@ -1847,4 +1864,6 @@ class UAVFlowPredictorIDM(nn.Module):
                 else future.new_zeros(())
             ),
             "residual_gate": self.residual_gate,
+            "action_residual_gate": (None if self.action_residual_gate_logit is None
+                                     else self.action_residual_gate_logit.sigmoid()),
         }

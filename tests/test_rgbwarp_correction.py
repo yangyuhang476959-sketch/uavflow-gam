@@ -118,6 +118,7 @@ def make_model(corr=True,mask=True):
         geometry_architecture='dual_vla_gfm',parallel_vla_gfm_enabled=True,
         parallel_vla_gfm_mode='qwen_tokens',parallel_action_decode_mode='geometry_residual',
         parallel_action_position_mode='decoder_only',parallel_vla_gfm_width=32,parallel_vla_gfm_heads=4,
+        action_residual_gate_init=.1,
         parallel_current_geometry_read_enabled=False,parallel_current_depth_enabled=True,
         depth_decode_enabled=True,gradient_checkpointing=True,train_deep_backbone=True,deep_train_start_block=0,
         dual_stream_rgbwarp_enabled=True,rgbwarp_correction={'correspondence_layers':[3,5,7,9],
@@ -235,7 +236,7 @@ def test_fixed_target_objective_and_eval_proposal_final_metrics(monkeypatch):
     assert metrics['H1_refine_action']==pytest.approx(values['refine_action'].item())
 
 
-def test_bound_checkpoint_and_optimizer_roundtrip():
+def test_gate_checkpoint_and_optimizer_roundtrip():
     from experiments.uavflow_predictor_idm.geometry_architectures import architecture_state,load_architecture_state
     net=make_model(corr=False)
     optimizer=torch.optim.AdamW([p for p in net.parameters() if p.requires_grad],lr=1e-4)
@@ -248,13 +249,14 @@ def test_bound_checkpoint_and_optimizer_roundtrip():
     load_architecture_state(restored,saved)
     for a,b in zip(net.rgbwarp_correction.parameters(),restored.rgbwarp_correction.parameters()):
         torch.testing.assert_close(a,b)
+    torch.testing.assert_close(net.action_residual_gate_logit,restored.action_residual_gate_logit)
     clone=torch.optim.AdamW([p for p in restored.parameters() if p.requires_grad],lr=1e-4)
     clone.load_state_dict(optimizer.state_dict())
     assert len(clone.state)==len(optimizer.state)
-    with torch.no_grad():
-        for p in net.parallel_action_correction_head.parameters():p.fill_(100.)
-    output,_=run(net)
-    assert torch.all(output['residual'].abs()<=net.rgbwarp_correction.residual_max_abs)
+    incompatible=copy.deepcopy(saved)
+    incompatible['geometry_architecture_state'].pop('action_residual_gate_logit')
+    with pytest.raises(ValueError,match='gating changed'):
+        load_architecture_state(restored,incompatible)
 
 
 def test_entrypoint_explicit_defaults():
@@ -308,14 +310,18 @@ def test_numeric_state_hook_and_observation_only_service(monkeypatch):
         policy.predict(images,['Turn'],first_sim_pose=[],current_sim_pose=[[0.]*6])
 
 
-def test_default_bounds_require_valid_normalizer_and_report_physical_units():
-    from robot.data.dataset import ActionNormalizer
+def test_gated_residual_has_no_tanh_or_fixed_bound_and_trains_gate():
     net=make_model(corr=False)
-    norm=ActionNormalizer({'sim':dict(q01=[-.1]*4,q99=[.3]*4,mask=[True]*4)},default_key='sim')
-    assert net.rgbwarp_correction.physical_residual_bounds(norm)['sim']==pytest.approx([.2]*4)
-    norm.stats_by_key['sim']['mask'][0]=False
-    with pytest.raises(ValueError,match='four active'):
-        net.rgbwarp_correction.physical_residual_bounds(norm)
+    assert net.action_residual_gate_logit.sigmoid().item()==pytest.approx(.1)
+    with torch.no_grad():net.parallel_action_correction_head.decoder.output.bias.fill_(20.)
+    output,_=run(net)
+    torch.testing.assert_close(output['residual'],torch.full_like(output['residual'],2.))
+    torch.testing.assert_close(output['actions_norm'],output['direct_actions_norm']+output['residual'])
+    output['residual'].sum().backward()
+    assert net.action_residual_gate_logit.grad.abs()>0
+    assert net.parallel_action_correction_head.decoder.output.bias.grad.abs().sum()>0
+    assert not any('residual_max_abs' in k for k in net.rgbwarp_correction.state_dict())
+    assert not net.residual_gate_logit.requires_grad  # old feature gate stays unused
 
 
 def test_invalid_nan_target_has_no_gradient_and_gam_axis_mean_sum():

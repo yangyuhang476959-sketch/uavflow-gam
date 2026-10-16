@@ -44,6 +44,7 @@ def build_config(variant,extra=()):
             # Original VLA proposal -> GAM future Predictor -> DA3 correction.
             # Proposal is decoded from native Qwen slots, not predicted GAM slots.
             cfg.model.correction_mode='pure'
+            cfg.model.action_residual_gate_init=.1
             cfg.stage1.qwen_numeric_pose_token=True
             cfg.model.parallel_current_depth_enabled=True
             cfg.model.parallel_current_geometry_read_enabled=True

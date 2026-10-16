@@ -11,7 +11,7 @@ is removed or changed by this release cleanup.
 |---|---|---|---|
 | `01_gam.py` | Local GAM/T5 + numeric pose baseline; F0/Ft context; future Predictor; one future deep view | None: preserve baseline | blocks 13–39, rank64/alpha128 |
 | `02_current_bank.py` | Native Qwen five-slot proposal + GAM future Predictor + residual correction | Future Action slots read Current patches by per-output-layer CA | blocks 13–39, rank64/alpha128 |
-| `03_rgbwarp.py` | Qwen proposal + predicted Current depth -> RGB warp -> shared Future DA3 + bounded residual | Future patches read geometrically corresponding Current patches after blocks 19/27/33/39 | **all blocks 0–39**, rank64/alpha128 |
+| `03_rgbwarp.py` | Qwen proposal + predicted Current depth -> RGB warp -> shared Future DA3 + gated residual | Future patches read geometrically corresponding Current patches after blocks 19/27/33/39 | **all blocks 0–39**, rank64/alpha128 |
 
 All original DA3 weights and DPT stay frozen. Both correction variants have
 Current-depth supervision and enabled Current Bank reads, but these reads are
@@ -19,6 +19,13 @@ not identical operations: old Action->Current CA is not the new patch
 correspondence CA. The GAM baseline is not silently given another Current branch.
 Qwen uses all-linear LoRA rank32/alpha16/dropout0, native causal attention,
 last-layer five slot hidden states and decoder-only learned step embeddings.
+
+Both correction entries use independent Proposal/Correction heads and
+`final = proposal + sigmoid(g) * delta`. Gate is one learned global scalar,
+initialized to0.1, not a confidence predictor. No tanh or fixed residual upper
+bound is applied. It is separate from Predictor feature-residual/CA gates.
+Old ungated or bounded checkpoints cannot silently resume as this new topology;
+the gate is saved in architecture state and optimized with the action-head group.
 
 All three use H1, visual stride5, five local-yaw action increments, target t+5.
 Depth is **fixed metric**: GT metres / 100; prediction *100 is metres, with no

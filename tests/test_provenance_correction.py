@@ -161,7 +161,7 @@ class TinyDA3(DA3GiantEncoder):
         return {'depth': F.interpolate(depth, size=(224,224), mode='nearest')}
 
 
-def model(mode, bank=False):
+def model(mode, bank=False, action_gate=None):
     return UAVFlowPredictorIDM(da3=TinyDA3(), idm=None, action_dim=4, action_chunk_size=5,
         d_model=256, depth=1, num_heads=4, language_dim=16, language_len=8,
         direct_action_enabled=True, deep_action_enabled=True, compute_idm_branch=False,
@@ -171,6 +171,7 @@ def model(mode, bank=False):
         parallel_vla_gfm_heads=4, parallel_current_geometry_read_enabled=bank,
         parallel_current_depth_enabled=True, depth_decode_enabled=True,
         gradient_checkpointing=True, correction_mode=mode,
+        action_residual_gate_init=action_gate,
         provenance_correction={'uncertainty_layers':[5,9], 'cleanup_kernel':1,'min_hole_area':0})
 
 
@@ -191,6 +192,17 @@ def test_proposal_is_native_vlm_not_predictor():
     torch.testing.assert_close(first, second)
     assert first.shape == (2,1,5,4)
     assert not torch.allclose(second, forward(net, language+torch.randn_like(language))['direct_actions_norm'])
+
+
+def test_old_current_bank_correction_uses_independent_action_gate():
+    net=model('pure',bank=True,action_gate=.1)
+    with torch.no_grad():net.parallel_action_correction_head.decoder.output.bias.fill_(20.)
+    output=forward(net)
+    torch.testing.assert_close(output['actions_norm']-output['direct_actions_norm'],
+                               torch.full_like(output['actions_norm'],2.))
+    output['actions_norm'].sum().backward()
+    assert net.action_residual_gate_logit.grad.abs()>0
+    assert net.parallel_action_correction_head.decoder.output.bias.grad.abs().sum()>0
 
 
 def test_full_stream_shapes_backward_checkpoint_migration():

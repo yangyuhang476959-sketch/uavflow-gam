@@ -16,8 +16,8 @@ def build_config(extra=()):
     cfg.model.rgbwarp_correction={
         'use_pixel_binary_mask':True,'use_correspondence_attention':True,
         'correspondence_layers':[19,27,33,39],'correspondence_width':256,'correspondence_heads':8,
-        'depth_scale_meters':100.,'fov_degrees':90.,
-        'residual_bound_enabled':True,'residual_range_fraction':.5}
+        'depth_scale_meters':100.,'fov_degrees':90.}
+    cfg.model.action_residual_gate_init=.1
     cfg.model.train_deep_backbone=False
     cfg.model.deep_lora.enabled=False
     cfg.model.da3_lora={'enabled':True,'rank':64,'alpha':128.,'dropout':0.,'target_modules':['all-linear']}

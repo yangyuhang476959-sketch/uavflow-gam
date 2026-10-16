@@ -1482,6 +1482,8 @@ def forward_batch(
         "feature": feature_values["total"],
         "action_direct": action_direct,
         "action_refine": action_refine,
+        "action_residual_gate": (output['action_residual_gate'].detach()
+            if isinstance(output.get('action_residual_gate'),torch.Tensor) else zero),
         "action_dual_current": dual_action_current,
         "action_dual_future": dual_action_future,
         "action_dual_future_gate": (
@@ -1618,6 +1620,8 @@ def evaluate(
         branch_sums = {h:torch.zeros(len(branch_keys),device=device) for h in contexts}
     transport_keys = ("transport_geometry", "transport_support_raw",
                       "transport_support_coarse", "transport_matched_fraction")
+    if model_ref.action_residual_gate_logit is not None:
+        transport_keys+=('action_residual_gate',)
     if getattr(model_ref, 'correction_mode', 'legacy') in {'support_aware', 'uncertain'}:
         transport_keys += ('provenance_support', 'provenance_unsupported', 'support_residual_norm',
                            'unsupported_residual_norm', 'unsupported_residual_ratio', 'alpha_sup', 'alpha_unsup', 'residual_norm',
@@ -1630,7 +1634,7 @@ def evaluate(
     if getattr(model_ref,'dual_stream_rgbwarp_enabled',False):
         transport_keys+=('rgbwarp_valid_ratio','rgbwarp_correspondence_ratio',
                          'rgbwarp_proposal_loss','rgbwarp_refine_loss')
-        transport_keys+=tuple('rgbwarp_'+name+'_'+axis for name in ('residual_abs','saturation') for axis in ('x','y','z','yaw'))
+        transport_keys+=tuple('rgbwarp_'+name+'_'+axis for name in ('residual_abs','residual_raw_abs') for axis in ('x','y','z','yaw'))
     if getattr(model_ref, "transport_policy", None) is not None and model_ref.transport_policy.error_head is not None:
         transport_keys += ("completion_uncertainty_loss", "completion_predicted_error", "completion_confidence", "completion_matched_mass",
                            "completion_target_error_matched", "completion_error_mae_matched")
@@ -1821,7 +1825,8 @@ def evaluate(
     for context, value in sums.items():
         count = value[36].clamp_min(1.0)
         if (getattr(model_ref, "transport_policy", None) is not None or getattr(model_ref, 'correction_mode', 'legacy') in {'support_aware', 'uncertain'}
-                or getattr(model_ref,'dual_stream_rgbwarp_enabled',False)):
+                or getattr(model_ref,'dual_stream_rgbwarp_enabled',False)
+                or model_ref.action_residual_gate_logit is not None):
             for index, key in enumerate(transport_keys):
                 result[f"H{context}_{key}"] = float(transport_sums[context][index]/count)
         for metric, vector in action_statistics(moment_sums[context]).items():
