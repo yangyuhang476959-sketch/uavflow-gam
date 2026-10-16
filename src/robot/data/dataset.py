@@ -2914,6 +2914,7 @@ def build_robot_dataset(dataset_cfg: Dict[str, Any], is_eval: bool = False) -> D
             openvla_prompt_pose_mode=str(
                 dataset_cfg.get("openvla_prompt_pose_mode", "preprocessed")
             ),
+            pose_progress_enabled=bool(dataset_cfg.get("pose_progress_enabled", False)),
             terminal_zero_action=bool(dataset_cfg.get("terminal_zero_action", False)),
             endpoint_repeat_count=dataset_cfg.get("endpoint_repeat_count", None),
             endpoint_self_pair_count=int(dataset_cfg.get("endpoint_self_pair_count", 0)),
@@ -2992,6 +2993,7 @@ def build_robot_dataset(dataset_cfg: Dict[str, Any], is_eval: bool = False) -> D
             openvla_prompt_pose_mode=str(
                 dataset_cfg.get("openvla_prompt_pose_mode", "preprocessed")
             ),
+            pose_progress_enabled=bool(dataset_cfg.get("pose_progress_enabled", False)),
             terminal_zero_action=bool(dataset_cfg.get("terminal_zero_action", False)),
             endpoint_repeat_count=dataset_cfg.get("endpoint_repeat_count", None),
             endpoint_self_pair_count=int(dataset_cfg.get("endpoint_self_pair_count", 0)),

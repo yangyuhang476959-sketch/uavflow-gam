@@ -30,6 +30,41 @@ def canonical_yaw4d_state(current_images,instructions,current_prompt_pose,
     return state
 
 
+def canonical_progress_state(current_images, instructions, current_prompt_pose,
+                             observed_pose_history, first_sim_pose=None, current_sim_pose=None):
+    """7D state from actual observed history, never from unexecuted actions.
+
+    History may be ragged (one [T,6] array per batch item) and must begin at
+    the episode start. Alternatively callers can maintain and provide the 7D
+    canonical state themselves. Two endpoints cannot recover motion progress.
+    """
+    from robot.data.uavflow_dataset import episode_pose_progress
+    import numpy as np
+    if observed_pose_history is not None:
+        if current_prompt_pose is not None:
+            raise ValueError('Provide history OR canonical progress state, not both')
+        if len(observed_pose_history)!=len(instructions):
+            raise ValueError('Expected one observed pose history per batch item')
+        histories=[torch.as_tensor(h).detach().cpu().numpy() for h in observed_pose_history]
+        states=[episode_pose_progress(h)[-1] for h in histories]
+        for endpoints, index in ((first_sim_pose,0),(current_sim_pose,-1)):
+            if endpoints is not None:
+                values=torch.as_tensor(endpoints).detach().cpu().numpy()
+                if values.shape!=(len(histories),6) or not np.allclose(values,np.stack([h[index] for h in histories])):
+                    raise ValueError('History endpoints disagree with raw simulator poses')
+        current_prompt_pose=np.stack(states)
+    elif first_sim_pose is not None or current_sim_pose is not None:
+        raise ValueError('Progress needs actual observed pose history, not only two endpoints')
+    if current_prompt_pose is None:
+        raise ValueError('Provide observed_pose_history or canonical [B,7] progress state')
+    state=torch.as_tensor(current_prompt_pose,device=current_images.device,dtype=torch.float32)
+    if state.shape!=(len(instructions),7) or not torch.isfinite(state).all():
+        raise ValueError('Expected finite [B,7] xyz(m), sin/cos, accumulated yaw(rad), path(m)')
+    if (state[:,-1]<0).any():
+        raise ValueError('Travelled path must be nonnegative')
+    return state
+
+
 class SupportAwarePolicy:
     def __init__(self, model, conditioner, normalizer, *, amp=True, amp_dtype="auto",
                  pose_state_mode='preprocessed'):
@@ -40,7 +75,7 @@ class SupportAwarePolicy:
     @torch.inference_mode()
     def predict(self, current_images, instructions, *, reference_images,
                 current_prompt_pose=None, stats_keys=None, camera_intrinsics=None,
-                first_sim_pose=None,current_sim_pose=None):
+                first_sim_pose=None,current_sim_pose=None,observed_pose_history=None):
         """Images [B,1,3,224,224], same preprocessing as the training dataset.
 
         New metric current_bank checkpoints use first-yaw-frame cm/deg state.
@@ -52,7 +87,12 @@ class SupportAwarePolicy:
                 or current_images.shape[1:3] != (1, 3)):
             raise ValueError("Current/reference must have matching one-camera image batches")
         b = current_images.shape[0]
-        if self.pose_state_mode=='evaluator_yaw4d':
+        if getattr(self.conditioner,'pose_progress_enabled',False):
+            current_prompt_pose=canonical_progress_state(current_images,instructions,current_prompt_pose,
+                observed_pose_history,first_sim_pose,current_sim_pose)
+        elif observed_pose_history is not None:
+            raise ValueError('Observed progress history requires a progress-enabled checkpoint')
+        elif self.pose_state_mode=='evaluator_yaw4d':
             current_prompt_pose=canonical_yaw4d_state(current_images,instructions,current_prompt_pose,
                                                      first_sim_pose,current_sim_pose)
         elif first_sim_pose is not None or current_sim_pose is not None:
@@ -77,15 +117,22 @@ class SupportAwarePolicy:
 class RGBWarpPolicy(SupportAwarePolicy):
     @torch.inference_mode()
     def predict(self,current_images,instructions,*,reference_images=None,current_prompt_pose=None,
-                first_sim_pose=None,current_sim_pose=None,stats_keys=None,camera_intrinsics=None):
+                first_sim_pose=None,current_sim_pose=None,stats_keys=None,camera_intrinsics=None,
+                observed_pose_history=None):
         """Observation only. Canonical state is first-YAW-frame cm/degrees.
 
         Prefer raw simulator poses, converted by EXACT Dataset helper. An
         existing service may provide already canonical current_prompt_pose.
         Never pass simulator world xyz directly as a relative state.
         """
-        current_prompt_pose=canonical_yaw4d_state(current_images,instructions,current_prompt_pose,
-                                                 first_sim_pose,current_sim_pose)
+        if getattr(self.conditioner,'pose_progress_enabled',False):
+            current_prompt_pose=canonical_progress_state(current_images,instructions,current_prompt_pose,
+                observed_pose_history,first_sim_pose,current_sim_pose)
+        else:
+            if observed_pose_history is not None:
+                raise ValueError('Observed progress history requires a progress-enabled checkpoint')
+            current_prompt_pose=canonical_yaw4d_state(current_images,instructions,current_prompt_pose,
+                                                     first_sim_pose,current_sim_pose)
         from experiments.uavflow_predictor_idm.vlm_conditioning import encode_stage2_condition
         if (current_images.ndim!=5 or current_images.shape[1:3]!=(1,3)
                 or current_images.shape[0]!=len(instructions)):

@@ -134,6 +134,26 @@ def _rpy(R):
     return roll,yaw,pitch
 
 
+def episode_pose_progress(raw):
+    """Observed raw pose history -> [xyz(m), sin, cos, signed yaw(rad), path(m)].
+
+    XYZ uses the first yaw frame. Unwrap only adjacent yaw increments: a full
+    revolution remains visible in accumulated yaw even at the starting pose.
+    Sampling must be fine enough that each observed yaw change is <180 degrees.
+    """
+    raw=np.asarray(raw,dtype=np.float64)
+    if raw.ndim!=2 or raw.shape[1]!=6 or not len(raw) or not np.isfinite(raw).all():
+        raise ValueError('Progress requires finite nonempty observed raw poses [T,6]')
+    yaw=np.deg2rad(raw[:,4]-raw[0,4])
+    delta=np.deg2rad(np.diff(raw[:,4]))
+    accumulated=np.concatenate(([0.],np.cumsum((delta+np.pi)%(2*np.pi)-np.pi)))
+    path=np.concatenate(([0.],np.cumsum(np.linalg.norm(np.diff(raw[:,:3],axis=0),axis=1)*.01)))
+    xyz=raw[:,:3]-raw[0,:3]
+    c,s=np.cos(np.deg2rad(raw[0,4])),np.sin(np.deg2rad(raw[0,4]))
+    xyz=xyz@np.array([[c,-s,0.],[s,c,0.],[0.,0.,1.]])*.01
+    return np.column_stack((xyz,np.sin(yaw),np.cos(yaw),accumulated,path)).astype(np.float32)
+
+
 def episode_yaw4d_state(first_raw,current_raw):
     """Shared train/service state: first-heading xyz cm + wrapped yaw degrees.
 
@@ -304,7 +324,7 @@ class UAVFlowParquetDataset(Dataset):
                  dataset_name="uavflow", max_trajectories=None, source_fps=1.0,
                  expected_shards=None, action_stats_key=None, translation_scale=1.0,
                  openvla_uav_compatible=False, terminal_zero_action=False,
-                 openvla_prompt_pose_mode="preprocessed",
+                 openvla_prompt_pose_mode="preprocessed", pose_progress_enabled=False,
                  endpoint_repeat_count=None, endpoint_self_pair_count=0,
                  endpoint_self_pair_start_count=None, endpoint_self_pair_end_count=None,
                  endpoint_terminal_window_repeat_count=0,
@@ -402,6 +422,8 @@ class UAVFlowParquetDataset(Dataset):
         self.translation_scale=float(translation_scale)
         self.fps=float(source_fps)
         self.openvla_uav_compatible=bool(openvla_uav_compatible)
+        self.pose_progress_enabled=bool(pose_progress_enabled)
+        self.pose_progress_states={}
         self.openvla_prompt_pose_mode=str(openvla_prompt_pose_mode).strip().lower()
         if self.openvla_prompt_pose_mode not in {"preprocessed", "evaluator_yaw4d"}:
             raise ValueError(
@@ -583,6 +605,8 @@ class UAVFlowParquetDataset(Dataset):
                 raw, repaired_count = _repair_rotation_interpolation_outliers(raw, self.yaw_repair_deg)
                 repaired_yaw_points += repaired_count
             self.logs[tid] = (raw, text)
+            if self.pose_progress_enabled:
+                self.pose_progress_states[tid]=episode_pose_progress(raw)
             if tid in openvla_prompt_poses:
                 self.openvla_prompt_poses[tid]=openvla_prompt_poses[tid]
         self.samples=[]; self.stat_samples=[]
@@ -1142,6 +1166,8 @@ class UAVFlowParquetDataset(Dataset):
                 "past_action_history_mask":past_mask,"dataset_name":self.dataset_name,
                 "action_stats_key":self.action_stats_key,"episode_id":tid,"has_action":True,
                 "is_self_pair": mode == "self_pair", "stop_target":stop_target}
+        if self.pose_progress_enabled:
+            result['episode_pose_progress']=torch.from_numpy(self.pose_progress_states[tid][anchor_indices].copy())
         if self.gt_depth_roots:
             depth_and_masks=[self._depth(tid,idx) for idx in anchor_indices]
             result["gt_depth_meters"]=torch.stack([item[0] for item in depth_and_masks])[:,None]

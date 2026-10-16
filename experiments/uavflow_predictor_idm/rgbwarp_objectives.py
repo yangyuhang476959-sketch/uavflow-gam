@@ -20,7 +20,7 @@ def depth_loss(prediction,target,valid,scale):
     mse=((prediction-target).square()*weight).sum()/denom
     l1=((prediction-target).abs()*weight).sum()/denom
     grad=_finite_difference_gradient_l1(prediction,target,valid,torch.ones_like(prediction))
-    return dict(total=mse+grad,mse=mse,l1=l1,grad=grad,valid_ratio=weight.mean())
+    return dict(total=l1+grad,mse=mse,l1=l1,grad=grad,valid_ratio=weight.mean())
 
 
 def forward_rgbwarp_batch(*,model,da3,text,normalizer,batch,context_len,rollout_steps,amp,amp_dtype):
@@ -28,7 +28,7 @@ def forward_rgbwarp_batch(*,model,da3,text,normalizer,batch,context_len,rollout_
     images=batch['all_view_images']
     if context_len!=1 or rollout_steps!=1 or images.shape[1:3]!=(2,1):
         raise ValueError('RGB-warp currently requires exactly Ft,F(t+5), H=1,V=1')
-    pose=batch.get('openvla_prompt_pose')
+    pose=batch.get('episode_pose_progress' if getattr(text,'pose_progress_enabled',False) else 'openvla_prompt_pose')
     if pose is None:raise KeyError('RGB-warp requires canonical current pose [cm,deg]')
     keys=list(batch['action_stats_key'])
     with autocast_context(images.device,enabled=bool(amp),dtype_name=amp_dtype):
@@ -71,11 +71,11 @@ def forward_rgbwarp_batch(*,model,da3,text,normalizer,batch,context_len,rollout_
     pred=raw.detach().reshape(-1,4);truth=target_raw.detach().reshape(-1,4);weight=mask.float().reshape(-1,4)
     moments=torch.stack((weight.sum(0),(pred*weight).sum(0),(pred.square()*weight).sum(0),
                          (truth*weight).sum(0),(truth.square()*weight).sum(0),((pred-truth).abs()*weight).sum(0)))
-    total_depth=curr_loss['total']+fut_loss['total']
-    values.update(action=proposal_loss+refine_loss,direct_action=proposal_loss,refine_action=refine_loss,
+    total_depth=(curr_loss['total']+fut_loss['total'])/2
+    values.update(action=(proposal_loss+refine_loss)/2,direct_action=proposal_loss,refine_action=refine_loss,
         action_direct=proposal_loss,action_refine=refine_loss,depth=total_depth,depth_global=total_depth,
-        depth_l1=curr_loss['l1']+fut_loss['l1'],depth_linear_l1=curr_loss['l1']+fut_loss['l1'],
-        depth_grad=curr_loss['grad']+fut_loss['grad'],depth_valid_ratio=(curr_loss['valid_ratio']+fut_loss['valid_ratio'])/2,
+        depth_l1=(curr_loss['l1']+fut_loss['l1'])/2,depth_linear_l1=(curr_loss['l1']+fut_loss['l1'])/2,
+        depth_grad=(curr_loss['grad']+fut_loss['grad'])/2,depth_valid_ratio=(curr_loss['valid_ratio']+fut_loss['valid_ratio'])/2,
         depth_scene_scale_mean=zero.new_tensor(scale),
         raw_l1=masked_action_l1(raw,target_raw,mask),action_raw_moments=moments,
         action_per_sample_step=action_per_step.detach(),raw_per_sample_step=raw_per_step.detach(),
@@ -87,8 +87,7 @@ def forward_rgbwarp_batch(*,model,da3,text,normalizer,batch,context_len,rollout_
     values['rgbwarp_refine_loss']=refine_loss.detach()
     for branch,loss in [('current',curr_loss),('future',fut_loss)]:
         for key,value in loss.items():values[f'depth_{branch}_{key}']=value.detach()
-        # Standard evaluator branch keys retain their meaning; reconstruction
-        # is logged explicitly as MSE, never relabelled as linear L1.
+        # MSE is diagnostic only; reconstruction loss is GAM linear L1.
         values[f'depth_{branch}_linear_l1']=loss['l1'].detach()
         for key in ('log_l1','semantic_ratio'):values[f'depth_{branch}_{key}']=zero
     return values

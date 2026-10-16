@@ -35,6 +35,12 @@ quality remain to be measured. CPU regression tests do not constitute NPU valida
    output projection preserves the initial stream. Actions see updates through
    subsequent native SA; the last-block CA directly affects depth, not an already
    computed last-layer action hidden.
+   Bilinear splat weights affect warped RGB and visible pixel contributions,
+   but are **not** used as soft CA priors: the patch matrix is binary (at least
+   one retained source-pixel contribution). Among allowed Current patches the
+   read uses ordinary learned QK softmax. There is no extra XYZ-relative bias or
+   `log(warp_mass)` term. The detached mask provides geometric correspondence,
+   not calibrated confidence or differentiable correspondence weights.
 7. Frozen DPT reads future patches; the existing correction head reads five
    refined action tokens. Final normalized actions are `proposal + sigmoid(g)*z`.
    Correction head starts at zero, hence initial final actions equal proposal.
@@ -58,15 +64,17 @@ of the Current Bank CA gates. The action head and residual head stay independent
 ## Loss and the fixed future target
 
 ```
-L = 3 * (L1(proposal, GT actions) + L1(final, GT actions))
-    + MSE(current depth, GT current depth) + GAM_grad(current, GT current)
-    + MSE(future depth, GT future depth) + GAM_grad(future, GT future)
+L = 3 * (L1(proposal, GT actions) + L1(final, GT actions)) / 2
+    + 3 * (D_current + D_future) / 2
+D_branch = linear_L1(predicted_depth, GT_depth / 100) + GAM_grad
 ```
 
 Action L1 uses the existing valid-action mask. Depth uses GT-valid pixels;
 gradient uses valid endpoint pairs and the repository's **x-mean + y-mean L1
 finite difference**, not tolerant/log gradient. Current/future depth losses are
-summed, not averaged. No feature, log-depth, dynamic reweighting, pose or stop loss.
+averaged before the outer depth weight3. Proposal/final action losses also
+split the outer action weight3 equally. No feature, log-depth, dynamic reweighting,
+pose or stop loss. MSE metrics are diagnostic only, not part of the objective.
 
 **GT future is the real t+5 frame and remains fixed.** It is NOT reprojected to
 the proposal camera; warp holes are NOT removed from its supervision. This
@@ -89,6 +97,11 @@ can vanish. LoRA reduces trainable degrees of freedom but does not mathematicall
 prevent learned geometry shortcuts; that must be checked experimentally.
 
 ## Geometry and pose contract
+
+New entrypoints use the seven-channel observed pose/progress token documented
+in [METRIC_EXPERIMENTS.md](METRIC_EXPERIMENTS.md#pose-token-traintest-fix).
+Its accumulated yaw and travelled path condition Qwen, not correspondence CA.
+Legacy four-channel pose-token checkpoints remain supported with progress off.
 
 - z-depth, metres; horizontal FOV defaults to 90 degrees at 224x224, centered K.
   Supply actual `camera_intrinsics` in a batch/service when known.
@@ -136,7 +149,7 @@ and GradScaler policy are inherited unchanged. Natural absorbing windows, no
 extra start/end repetition, same stratified split/seed as the handoff matrix.
 Validation every 2000 updates, maximum 100 batches; checkpoints each epoch;
 `best_action.pt` uses **final/refined validation action L1**, while logs
-separately report proposal, refined and summed action loss. No stop phase.
+separately report proposal, refined and averaged action loss. No stop phase.
 
 ```bash
 # Exact resume: same topology, data, world size and batch/cursor configuration.
@@ -179,7 +192,7 @@ real Qwen+DA3 forward/backward on the target accelerator is still required.
 
 ## Verification performed
 
-On the local CPU test path after gated-residual update: 205 tests and 20 subtests passed, including the
+On the local CPU test path after aligned-loss update: 206 tests and 20 subtests passed, including the
 existing architecture/runtime suites. The 16 RGB-warp tests cover identity and
 known-motion projection, validity/correspondence, empty CA rows, shared LoRA and
 frozen DPT gradients, warp-only future-loss gradients to proposal/current depth,

@@ -32,17 +32,18 @@ Depth is **fixed metric**: GT metres / 100; prediction *100 is metres, with no
 per-frame/first-frame scale normalization. Current/Future losses in the two
 correction models use the same fixed physical scale.
 
-Losses are deliberately not relabelled as identical:
+Aligned loss weights: Action3, Depth3; only GAM adds Feature1.
 
 - GAM: `3*final_action_L1 + 1*shallow_feature_MSE + 3*future_depth`.
-- Old Current Bank correction: existing action mixture
-  `3*(proposal_L1/3 + 2*final_L1/3) + 1*feature_MSE + 3*depth`;
-  depth is the existing average of Current and Future branch losses.
-- RGB warp: `3*(proposal_L1 + final_L1) + current_depth + future_depth`;
-  no feature loss.
-- GAM/old correction retain linear depth L1 + unmodified GAM finite-difference
-  L1 gradient. RGB warp uses depth MSE + that same gradient. No log loss,
-  semantic/dynamic reweighting, uncertainty or Stop loss is enabled.
+- Both correction variants:
+  `3*(proposal_L1 + final_L1)/2 + 3*(current_depth + future_depth)/2`.
+  Proposal/final each receive1.5; Current/Future depth each receive1.5.
+  Neither correction has a feature loss, including the old Predictor model.
+- Every depth branch uses linear L1 + unmodified GAM finite-difference L1
+  gradient, both with internal weight1. RGB MSE metrics are diagnostic only.
+  No log loss, semantic/dynamic reweighting, uncertainty or Stop loss is enabled.
+- Gated residual merge is unchanged. Changed loss definitions/weights are not
+  silently accepted as an exact resume of a previous loss configuration.
 
 Default **5 epochs**, constant LR, no warmup; batch4 per process, AdamW with
 weight_decay0, grad_clip1. Predictor/Qwen/state LR=1e-5; DA3 LoRA=5e-5;
@@ -54,10 +55,23 @@ old R1 benchmark measurements do not certify these new variants.
 
 New correction runs select `dataset.openvla_prompt_pose_mode=evaluator_yaw4d`.
 They inject an MLP-encoded numeric state at `<|uav_state|>` before the five
-action slots; numbers are not also printed into the prompt. State is xyz in
-centimetres relative to first-frame yaw-only heading, plus wrapped yaw degrees.
-Training Dataset and inference use the same `episode_yaw4d_state` helper.
+action slots; numbers are not also printed into the prompt. New maintained
+entries enable a seven-dimensional state:
+`[x_m,y_m,z_m,sin(relative_yaw),cos(relative_yaw),signed_accumulated_yaw_rad,path_m]`.
+XYZ is relative to first-frame yaw-only heading. Accumulated yaw sums wrapped
+**adjacent observed** yaw increments without wrapping the final sum. Path is
+the sum of observed three-dimensional displacement magnitudes, not endpoint
+distance. Qwen's state MLP receives these channels divided by
+`[10,10,10,1,1,2*pi,10]`; no clipping is applied. This is still one numeric state
+token, not seven extra action slots or text fields.
+Training Dataset and inference use the same `episode_pose_progress` helper.
 Raw pose order is `[x_cm,y_cm,z_cm,roll_deg,yaw_deg,pitch_deg]`.
+Progress uses the entire observed prefix, never future/GT actions or planned
+proposal chunks. Repeated stationary absorbing frames add no motion. Online
+services must pass `observed_pose_history` (one episode-start-to-now raw history
+per batch item), or maintain and pass a canonical seven-dimensional state;
+reset history at each new episode. Two endpoint poses alone are insufficient.
+Yaw changes between consecutive observations must be less than 180 degrees.
 
 Historical Pure-Qwen Pose Token runs used `preprocessed` full-first-rotation
 state. Changing a launcher does **not** repair their already learned weights.
@@ -66,8 +80,15 @@ resume into the new yaw4d convention; train a new run, or explicitly transfer
 weights as initialization with the changed convention acknowledged. Inference
 rejects raw yaw4d conversion for a legacy preprocessed checkpoint.
 
-GAM's existing direct numeric-pose history is a different input from the Qwen
-Pose Token. Its baseline path is retained, not replaced by a Qwen state input.
+GAM's direct numeric-pose path remains a Predictor input, not a Qwen token.
+It now appends accumulated yaw/(2*pi) and path/10m to its existing five-channel
+q01/q99-normalized xyz and unchanged sin/cos. The F0 progress channels are zero.
+The five-dimensional pose normalizer and auxiliary pose targets are unchanged.
+Legacy configurations default progress off and retain their old 4D Qwen/5D GAM
+state inputs. New entries enable `dataset.pose_progress_enabled`,
+`model.pose_progress_enabled`, and (correction only)
+`stage1.qwen_pose_progress_enabled`. Changed dimensions require a new run, not
+an exact resume of an old checkpoint; strict resume checks these settings.
 
 ## Data split and augmentation
 

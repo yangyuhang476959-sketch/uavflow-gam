@@ -143,9 +143,11 @@ def main() -> None:
         if str(cfg.stage1.get('qwen_token_selection'))!='action_placeholders' or not cfg.stage1.get('qwen_numeric_pose_token',False):
             raise ValueError('RGB-warp requires native five Qwen slots and numeric pose token')
         if (float(cfg.loss.feature_weight)!=0 or float(cfg.loss.get('deep_feature_weight',0))!=0
-                or float(cfg.loss.action_weight)!=3 or float(cfg.loss.depth_weight)!=1
+                or float(cfg.loss.action_weight)!=3 or float(cfg.loss.depth_weight)!=3
+                or float(cfg.loss.get('action_direct_weight',0))!=.5
+                or float(cfg.loss.get('action_refine_weight',0))!=.5
                 or str(cfg.loss.get('depth_scale_mode'))!='fixed_metric' or str(cfg.loss.get('depth_target_mode'))!='both'):
-            raise ValueError('RGB-warp loss is exactly 3(proposal+refine)+Current/Future metric MSE+GAM gradient; no feature loss')
+            raise ValueError('RGB-warp loss is 3*mean(proposal,final)+3*mean(Current,Future GAM depth); no feature loss')
         if not bool(cfg.model.get('da3_lora',{}).get('enabled',False)):
             raise ValueError('RGB-warp requires full-backbone shared LoRA, not full-rank tuning')
         if list(cfg.model.da3_lora.get('target_modules',[]))!=['all-linear']:
@@ -155,12 +157,14 @@ def main() -> None:
             if float(cfg.loss.get(name,0))!=0:
                 raise ValueError(f'RGB-warp does not enable loss.{name}')
         if 'depth_global_weight' in cfg.loss or 'depth_dynamic_weight' in cfg.loss:
-            raise ValueError('RGB-warp uses depth_weight=1, not separate global/dynamic outer weights')
+            raise ValueError('RGB-warp uses depth_weight=3, not separate global/dynamic outer weights')
         if (str(cfg.loss.get('depth_target_source'))!='ue_gt'
                 or str(cfg.loss.get('depth_gradient_mode'))!='gam_l1'
+                or str(cfg.loss.get('depth_reconstruction'))!='l1'
+                or float(cfg.loss.get('depth_linear_weight',1))!=1
                 or float(cfg.loss.get('depth_grad_weight',1))!=1
                 or float(cfg.loss.get('depth_log_weight',0))!=0):
-            raise ValueError('RGB-warp depth is GT metric MSE + unmodified GAM L1 gradient')
+            raise ValueError('RGB-warp depth is GT metric linear L1 + unmodified GAM L1 gradient')
         if float(cfg.model.get('rgbwarp_correction',{}).get('depth_scale_meters',100.))!=float(cfg.loss.get('depth_fixed_scale_meters',100.)):
             raise ValueError('Warp metric conversion must match supervised depth scale')
     if provenance_enabled:
@@ -397,6 +401,7 @@ def main() -> None:
         condition_mode=str(cfg.model.condition_mode),
         use_action_history=bool(cfg.model.get("use_action_history", False)),
         use_pose_history=bool(cfg.model.get("use_pose_history", False)),
+        pose_progress_enabled=bool(cfg.model.get("pose_progress_enabled", False)),
         action_history_keep_prob=float(cfg.model.get("action_history_keep_prob", 1.0)),
         pose_history_keep_prob=float(cfg.model.get("pose_history_keep_prob", 1.0)),
         pose_history_xyz_noise_meters=float(
@@ -762,6 +767,9 @@ def main() -> None:
             "stage1.qwen_lora_dropout",
             "stage1.qwen_action_placeholder_count",
             "dataset.openvla_prompt_pose_mode",
+            "dataset.pose_progress_enabled",
+            "model.pose_progress_enabled",
+            "stage1.qwen_pose_progress_enabled",
             "dataset.split_file",
             "dataset.real_root",
             "dataset.sim_root",
@@ -844,6 +852,15 @@ def main() -> None:
             "loss.depth_target_mode",
             "loss.depth_fixed_scale_meters",
             "loss.depth_scale_loss_weight",
+            "loss.action_weight",
+            "loss.action_direct_weight",
+            "loss.action_refine_weight",
+            "loss.feature_weight",
+            "loss.depth_weight",
+            "loss.depth_reconstruction",
+            "loss.depth_linear_weight",
+            "loss.depth_log_weight",
+            "loss.depth_grad_weight",
             "training.batch_size",
             "training.amp_dtype",
             "training.direct_action_head_lr_mult",

@@ -50,11 +50,17 @@ def build_config(variant,extra=()):
             cfg.model.parallel_current_geometry_read_enabled=True
             cfg.model.current_geometry_bank_mode='output_current'
             cfg.model.current_geometry_read_mode='per_layer'
+            cfg.loss.feature_weight=0.
+            cfg.loss.action_direct_weight=.5
+            cfg.loss.action_refine_weight=.5
         cfg.loss.depth_scale_mode='fixed_metric'
         cfg.loss.depth_fixed_scale_meters=100.
         cfg.training.max_epochs=5
     # All new pose-token runs use the online yaw4d convention explicitly.
     cfg.dataset.openvla_prompt_pose_mode='evaluator_yaw4d'
+    cfg.dataset.pose_progress_enabled=True
+    cfg.model.pose_progress_enabled=True
+    cfg.stage1.qwen_pose_progress_enabled=variant!='gam'
     root=Path(os.environ.get('MODEL_ROOT',Path(__file__).resolve().parents[2]/'checkpoints'))
     cfg.stage1.t5_model=os.environ.get('T5_MODEL',str(root/'t5-base'))
     cfg.training.results_dir=str(Path(os.environ.get('OUTPUT_ROOT','results/metric_release'))/variant)

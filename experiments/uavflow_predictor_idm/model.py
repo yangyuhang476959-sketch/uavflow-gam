@@ -534,6 +534,7 @@ class UAVFlowPredictorIDM(nn.Module):
         condition_mode: str = "cross_attn",
         use_action_history: bool = False,
         use_pose_history: bool = False,
+        pose_progress_enabled: bool = False,
         action_history_keep_prob: float = 1.0,
         pose_history_keep_prob: float = 1.0,
         pose_history_xyz_noise_meters: float = 0.0,
@@ -608,6 +609,8 @@ class UAVFlowPredictorIDM(nn.Module):
         self.deep_gradient_checkpointing = bool(gradient_checkpointing)
         self.use_action_history = bool(use_action_history)
         self.use_pose_history = bool(use_pose_history)
+        self.pose_progress_enabled = bool(pose_progress_enabled)
+        self.pose_input_dim = 7 if self.pose_progress_enabled else 5
         self.action_history_keep_prob = float(action_history_keep_prob)
         self.pose_history_keep_prob = float(pose_history_keep_prob)
         self.pose_history_xyz_noise_meters = float(pose_history_xyz_noise_meters)
@@ -736,8 +739,8 @@ class UAVFlowPredictorIDM(nn.Module):
             language_len=int(language_len),
             variable_language_tokens=bool(variable_language_tokens),
             # Keep the historical unused 6D projector shape for old
-            # checkpoints; pose-conditioned runs use the new 5D state.
-            proprio_dim=5 if self.use_pose_history else 6,
+            # checkpoints; pose-conditioned runs use 5D or opt-in 7D state.
+            proprio_dim=self.pose_input_dim if self.use_pose_history else 6,
             action_dim=int(action_dim),
             action_chunk_size=1,
             use_proprio_input=self.use_pose_history,
@@ -1167,21 +1170,21 @@ class UAVFlowPredictorIDM(nn.Module):
         sequence = observed_shallow
         b, observed_h = observed_shallow.shape[:2]
         if self.use_pose_history:
-            if observed_pose_history is None or observed_pose_history.shape != (b, observed_h, 5):
+            if observed_pose_history is None or observed_pose_history.shape != (b, observed_h, self.pose_input_dim):
                 raise ValueError(
                     "use_pose_history=true requires normalized pose shaped "
-                    f"(B,H,5)={(b, observed_h, 5)}, got "
+                    f"(B,H,D)={(b, observed_h, self.pose_input_dim)}, got "
                     f"{None if observed_pose_history is None else tuple(observed_pose_history.shape)}."
                 )
             # Training noise is applied in raw metres/degrees before
             # normalization by prepare_observed_pose_history().
             pose_history = observed_pose_history
             if self.use_fixed_first_frame and (
-                reference_pose is None or reference_pose.shape != (b, 1, 5)
+                reference_pose is None or reference_pose.shape != (b, 1, self.pose_input_dim)
             ):
                 raise ValueError(
                     "use_pose_history=true requires normalized F0 pose shaped "
-                    f"(B,1,5), got {None if reference_pose is None else tuple(reference_pose.shape)}."
+                    f"(B,1,{self.pose_input_dim}), got {None if reference_pose is None else tuple(reference_pose.shape)}."
                 )
         else:
             pose_history = None

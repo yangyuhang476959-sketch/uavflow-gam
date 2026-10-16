@@ -14,14 +14,21 @@ def test_three_metric_release_contracts(variant,tmp_path,monkeypatch):
     assert cfg.loss.depth_scale_mode=='fixed_metric'
     assert cfg.loss.depth_fixed_scale_meters==100
     assert cfg.dataset.openvla_prompt_pose_mode=='evaluator_yaw4d'
+    assert cfg.dataset.pose_progress_enabled and cfg.model.pose_progress_enabled
+    assert cfg.stage1.qwen_pose_progress_enabled==(variant!='gam')
     assert cfg.dataset.visual_anchor_stride==5 and cfg.model.action_chunk_size==5
     assert not cfg.model.train_deep_backbone
     assert not cfg.model.stop_head_enabled and cfg.loss.stop_weight==0
     assert cfg.training.max_epochs==5 and cfg.training.lr_schedule=='constant'
+    assert cfg.loss.action_weight==3 and cfg.loss.depth_weight==3
+    assert cfg.loss.depth_linear_weight==cfg.loss.depth_grad_weight==1
+    assert cfg.loss.depth_log_weight==0
     assert cfg.stage1.t5_model==str(tmp_path/'models/t5-base')
     assert cfg.stage1.da3_checkpoint==str(tmp_path/'models/track4world_da3.pth')
     assert cfg.stage1.qwen_model==str(tmp_path/'models/qwen3.5-2b')
     if variant=='gam':
+        assert cfg.loss.feature_weight==1
+        assert cfg.loss.action_direct_weight==0 and cfg.loss.action_refine_weight==1
         assert cfg.model.get('action_residual_gate_init') is None
         assert cfg.model.use_pose_history and cfg.model.use_fixed_first_frame
         assert not cfg.model.parallel_vla_gfm_enabled
@@ -29,6 +36,8 @@ def test_three_metric_release_contracts(variant,tmp_path,monkeypatch):
         assert cfg.model.deep_lora.enabled and cfg.model.deep_lora.start_block==13
         assert cfg.loss.depth_target_mode=='future'
     elif variant=='current_bank':
+        assert cfg.loss.feature_weight==0
+        assert cfg.loss.action_direct_weight==cfg.loss.action_refine_weight==.5
         assert cfg.model.action_residual_gate_init==.1
         assert cfg.model.correction_mode=='pure'
         assert cfg.model.parallel_current_geometry_read_enabled
@@ -38,6 +47,8 @@ def test_three_metric_release_contracts(variant,tmp_path,monkeypatch):
         assert cfg.model.deep_lora.enabled and cfg.model.deep_lora.start_block==13
         assert cfg.loss.depth_target_mode=='both'
     else:
+        assert cfg.loss.feature_weight==0
+        assert cfg.loss.action_direct_weight==cfg.loss.action_refine_weight==.5
         assert cfg.model.action_residual_gate_init==.1
         assert cfg.model.dual_stream_rgbwarp_enabled
         assert cfg.model.da3_lora.enabled and cfg.model.da3_lora.target_modules==['all-linear']

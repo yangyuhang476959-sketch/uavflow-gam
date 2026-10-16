@@ -24,16 +24,19 @@ def build_config(extra=()):
     cfg.model.use_fixed_first_frame=False
     cfg.model.use_reference_type_embedding=False
     cfg.stage1.qwen_numeric_pose_token=True
+    cfg.stage1.qwen_pose_progress_enabled=True
+    cfg.dataset.pose_progress_enabled=True
+    cfg.model.pose_progress_enabled=True
     cfg.dataset.openvla_prompt_pose_mode='evaluator_yaw4d'
     cfg.loss.feature_weight=0.
     cfg.loss.deep_feature_weight=0.
     cfg.loss.action_weight=3.
-    cfg.loss.action_direct_weight=1.
-    cfg.loss.action_refine_weight=1.
-    cfg.loss.depth_weight=1.
-    # The reconstruction changes to MSE; gradient uses existing GAM finite
-    # differences. The specialized objective logs both MSE and actual L1.
-    cfg.loss.depth_reconstruction='mse'
+    cfg.loss.action_direct_weight=.5
+    cfg.loss.action_refine_weight=.5
+    cfg.loss.depth_weight=3.
+    # Match GAM linear L1 + finite-difference L1 gradient. Action/depth
+    # branches share each outer weight equally instead of doubling it.
+    cfg.loss.depth_reconstruction='l1'
     cfg.loss.depth_linear_weight=1.
     cfg.loss.depth_log_weight=0.
     cfg.loss.depth_semantic_weight=1.

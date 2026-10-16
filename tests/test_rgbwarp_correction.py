@@ -215,8 +215,10 @@ def test_fixed_target_objective_and_eval_proposal_final_metrics(monkeypatch):
     args=dict(model=net,da3=net.da3,text=None,normalizer=normalizer,batch=batch,
               context_len=1,rollout_steps=1,amp=False,amp_dtype='fp32')
     values=obj.forward_rgbwarp_batch(**args)
-    torch.testing.assert_close(values['action'],values['direct_action']+values['refine_action'])
-    torch.testing.assert_close(values['depth'],values['depth_current_total']+values['depth_future_total'])
+    torch.testing.assert_close(values['action'],(values['direct_action']+values['refine_action'])/2)
+    torch.testing.assert_close(values['depth'],(values['depth_current_total']+values['depth_future_total'])/2)
+    torch.testing.assert_close(3*values['action']+3*values['depth'],
+        1.5*(values['direct_action']+values['refine_action']+values['depth_current_total']+values['depth_future_total']))
     # Future observation and GT actions are not inputs to the forward policy.
     output=net(batch['all_view_images'][:,0,0],reference_shallow=None,lang_feats=slots,
                lang_padding_mask=None,action_denormalizer=lambda x:normalizer.denormalize(x,stats_keys=['sim']))
@@ -266,7 +268,9 @@ def test_entrypoint_explicit_defaults():
     assert not cfg.model.use_fixed_first_frame and not cfg.model.stop_head_enabled
     assert cfg.stage1.qwen_numeric_pose_token
     assert cfg.model.da3_lora.target_modules==['all-linear']
-    assert cfg.loss.action_weight==3 and cfg.loss.depth_weight==1 and cfg.loss.feature_weight==0
+    assert cfg.loss.action_weight==3 and cfg.loss.depth_weight==3 and cfg.loss.feature_weight==0
+    assert cfg.loss.action_direct_weight==cfg.loss.action_refine_weight==.5
+    assert cfg.loss.depth_reconstruction=='l1'
     assert cfg.training.max_epochs==5
 
 
@@ -335,3 +339,13 @@ def test_invalid_nan_target_has_no_gradient_and_gam_axis_mean_sum():
     loss=depth_loss(pred,target,valid,100.)['total']
     assert torch.isfinite(loss) and loss.item()==0
     loss.backward();assert pred.grad.count_nonzero()==0
+
+
+def test_depth_reconstruction_is_linear_l1_not_mse():
+    from experiments.uavflow_predictor_idm.rgbwarp_objectives import depth_loss
+    pred=torch.full((1,2,2),3.,requires_grad=True)
+    values=depth_loss(pred,torch.full_like(pred,100.),torch.ones_like(pred,dtype=torch.bool),100.)
+    assert values['mse'].item()==4.  # diagnostic only
+    assert values['l1'].item()==values['total'].item()==2.
+    values['total'].backward()
+    torch.testing.assert_close(pred.grad,torch.full_like(pred,.25))

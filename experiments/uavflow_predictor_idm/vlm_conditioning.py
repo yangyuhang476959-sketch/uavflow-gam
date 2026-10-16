@@ -45,6 +45,7 @@ class FrozenQwen35Conditioner(nn.Module):
         action_placeholder_count: int = 0,
         action_attention_mode: str = "causal",
         numeric_pose_token: bool = False,
+        pose_progress_enabled: bool = False,
     ) -> None:
         super().__init__()
         self.encoder = FrozenQwen35SemanticEncoder(
@@ -64,6 +65,9 @@ class FrozenQwen35Conditioner(nn.Module):
         self.use_reference_image = bool(use_reference_image)
         self.hidden_size = int(self.encoder.hidden_size)
         self.numeric_pose_token=bool(numeric_pose_token)
+        self.pose_progress_enabled=bool(pose_progress_enabled)
+        if self.pose_progress_enabled and not self.numeric_pose_token:
+            raise ValueError('Pose progress requires numeric_pose_token')
         if self.numeric_pose_token:
             tokenizer=self.encoder.processor.tokenizer
             tokenizer.add_special_tokens({'additional_special_tokens':self.encoder.action_placeholder_tokens+['<|uav_state|>']})
@@ -71,8 +75,10 @@ class FrozenQwen35Conditioner(nn.Module):
             self.encoder.qwen.get_input_embeddings().requires_grad_(False)
             self.encoder.qwen.get_output_embeddings().requires_grad_(False)
             self.state_token_id=tokenizer.convert_tokens_to_ids('<|uav_state|>')
-            self.register_buffer('state_scale',torch.tensor([1000.,1000.,1000.,180.]))
-            self.state_encoder=nn.Sequential(nn.Linear(4,256),nn.GELU(),nn.Linear(256,self.hidden_size))
+            scale=([10.,10.,10.,1.,1.,2*torch.pi,10.] if self.pose_progress_enabled
+                   else [1000.,1000.,1000.,180.])
+            self.register_buffer('state_scale',torch.tensor(scale))
+            self.state_encoder=nn.Sequential(nn.Linear(len(scale),256),nn.GELU(),nn.Linear(256,self.hidden_size))
 
     def encode_tokens(
         self,
@@ -88,7 +94,7 @@ class FrozenQwen35Conditioner(nn.Module):
                 "[B,2,V,3,H,W]."
             )
         current_states = None
-        if self.encoder.prompt_mode in {
+        if not self.numeric_pose_token and self.encoder.prompt_mode in {
             "current_image_action_question",
             "current_image_openvla",
         }:
@@ -112,8 +118,9 @@ class FrozenQwen35Conditioner(nn.Module):
                 )
             current_states = pose.cpu().tolist()
         if self.numeric_pose_token:
-            if current_pose is None or current_pose.shape!=(len(texts),4) or not torch.isfinite(current_pose).all():
-                raise ValueError('Numeric pose token requires finite [B,4] first-yaw-frame cm/deg state')
+            dimension=self.state_scale.numel()
+            if current_pose is None or current_pose.shape!=(len(texts),dimension) or not torch.isfinite(current_pose).all():
+                raise ValueError(f'Numeric pose token requires finite [B,{dimension}] canonical state')
             state=current_pose.to(self.state_scale.device,dtype=torch.float32)
             embedding=self.state_encoder(state/self.state_scale)
             def inject(_module,inputs,output):
@@ -177,6 +184,7 @@ def build_stage2_conditioner(stage1_cfg, model_cfg) -> nn.Module:
                 stage1_cfg.get("qwen_action_attention_mode", "causal")
             ),
             numeric_pose_token=bool(stage1_cfg.get('qwen_numeric_pose_token',False)),
+            pose_progress_enabled=bool(stage1_cfg.get('qwen_pose_progress_enabled',False)),
         )
     return TextConditioner(
         encoder_type=encoder_type,

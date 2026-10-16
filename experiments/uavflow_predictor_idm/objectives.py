@@ -810,7 +810,11 @@ def prepare_observed_pose_history(
             pose = torch.cat([
                 xyz, yaw.sin().unsqueeze(-1), yaw.cos().unsqueeze(-1)
             ], dim=-1)
-    return pose_normalizer.normalize(pose)
+    normalized=pose_normalizer.normalize(pose)
+    if bool(getattr(model_ref,'pose_progress_enabled',False)):
+        progress=batch['episode_pose_progress'][:,:context_len,5:].float()
+        normalized=torch.cat((normalized,progress/progress.new_tensor([2*torch.pi,10.])),dim=-1)
+    return normalized
 
 
 def forward_batch(
@@ -902,8 +906,10 @@ def forward_batch(
                 current_images=images[:, context_len - 1],
                 pad_to=int(getattr(model_ref.predictor, "language_len", 77)),
                 current_pose=(
-                    batch["openvla_prompt_pose"][:, context_len - 1]
-                    if "openvla_prompt_pose" in batch else None
+                    batch['episode_pose_progress' if getattr(text,'pose_progress_enabled',False)
+                          else 'openvla_prompt_pose'][:, context_len - 1]
+                    if ('episode_pose_progress' if getattr(text,'pose_progress_enabled',False)
+                        else 'openvla_prompt_pose') in batch else None
                 ),
             )
     reference_shallow = encoded_shallow[:, :1] if use_reference else None
@@ -950,6 +956,8 @@ def forward_batch(
         reference_pose = pose_normalizer.normalize(raw_start_pose).view(1, 1, 5).expand(
             batch_size, 1, 5
         )
+        if bool(getattr(model_ref,'pose_progress_enabled',False)):
+            reference_pose=torch.cat((reference_pose,reference_pose.new_zeros(batch_size,1,2)),dim=-1)
 
     # Sliding mode (rollout=1) exposes one current transition. The legacy
     # rollout=3 compatibility path exposes the three original open-loop actions.
