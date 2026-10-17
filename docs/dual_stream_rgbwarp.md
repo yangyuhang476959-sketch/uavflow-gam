@@ -23,10 +23,16 @@ quality remain to be measured. CPU regression tests do not constitute NPU valida
    motions, convert body motion to camera motion by the configured extrinsic,
    and forward-splat current RGB using predicted current z-depth. Projection and
    accumulation are FP32; no GT action/depth drives the warp at train or test time.
+   The default rasterizer is finite-disk **alpha-over**, radius 1.5 target pixels,
+   nearest 8 points per pixel, gamma=1, black background. RGB is NOT divided by
+   accumulated mass; weak coverage stays weak. This is SynSin-inspired PyTorch
+   code, not a claimed exact reproduction of the author's renderer.
 5. Feed warped RGB through the **same** DA3 again. A zero-initialized Conv14/14
-   embeds the pixel invalid mask and adds it to patch embeddings before block 0.
-   Five action tokens are projected Qwen hidden states **plus a linear encoding
-   of proposal values**. Existing GAM packing inserts them at the deep boundary:
+   embeds detached `1-opacity` (continuous missing coverage) and adds it to patch
+   embeddings before block 0. Coverage is geometric opacity, not learned confidence.
+   Five action tokens are **only projected Qwen hidden states** (LN + Linear);
+   no proposal-value embedding is added. Numeric proposal values drive the RGB
+   warp, not the action-token initialization. Existing GAM packing inserts them at the deep boundary:
    `[camera, A1..A5, registers, patches]`; native spatial RoPE is retained.
 6. Optional correspondence CA after blocks 19/27/33/39 updates **future patches
    only**, querying same-layer current patches (1536-D, not DPT's 3072-D concat).
@@ -35,7 +41,7 @@ quality remain to be measured. CPU regression tests do not constitute NPU valida
    output projection preserves the initial stream. Actions see updates through
    subsequent native SA; the last-block CA directly affects depth, not an already
    computed last-layer action hidden.
-   Bilinear splat weights affect warped RGB and visible pixel contributions,
+   Effective front-to-back alpha weights affect warped RGB and visible pixel contributions,
    but are **not** used as soft CA priors: the patch matrix is binary (at least
    one retained source-pixel contribution). Among allowed Current patches the
    read uses ordinary learned QK softmax. There is no extra XYZ-relative bias or
@@ -89,8 +95,8 @@ Early depth-scale errors can therefore make early warps inaccurate. No GT-based
 per-sample scale fit is used to hide this train/test issue.
 
 Future loss gradients reach **proposal and predicted current depth** via RGB
-bilinear weights. Frozen DPT remains in autograd. Pixel indexing, visibility,
-binary mask and correspondence topology are detached: the warp is piecewise
+disk opacity and alpha-over weights. Frozen DPT remains in autograd. Pixel
+indexing, depth ordering, mask input and correspondence topology are detached: the warp is piecewise
 differentiable, not differentiable through appearance/disappearance decisions.
 At identity motion, constant RGB regions or full occlusion, useful warp gradients
 can vanish. LoRA reduces trainable degrees of freedom but does not mathematically
@@ -108,15 +114,18 @@ Legacy four-channel pose-token checkpoints remain supported with progress off.
 - Default camera-to-body extrinsic is axis conversion only (CV right/down/forward
   to body forward/right/up), zero mounting offset. Override
   `heading_from_camera` when a calibrated offset is available; none is invented.
-- Splat floating coordinates to four neighbors, with independent per-pixel
-  z-buffer competition. Holes stay black; no triangle, dilation or hole filling.
+- Project each source point into a radius-1.5-pixel disk, retain the nearest
+  8 points by target z, then use front-to-back alpha-over. Tied depths use stable
+  source-index ordering. Holes stay black; no triangle, dilation or hole filling.
+  No coverage normalization or numeric action-value embedding is used.
 - Warp validity uses predicted current depth/motion only. Binary patch
-  correspondence records any retained source-to-target splat; no GT future mask
+  correspondence records positive effective alpha contributions, excluding fully
+  occluded farther points; no GT future mask
   is used for attention or observation preprocessing.
-- Numeric state is relative to the episode first **yaw-only** frame: xyz in cm,
-  wrapped yaw in degrees. Dataset mode is explicitly `evaluator_yaw4d`, not the
-  historical full-roll/pitch preprocessed state. The service calls the exact
-  same `episode_yaw4d_state` helper. Raw simulator pose order is
+- Numeric state is the seven-channel relative pose/progress documented above,
+  from the shared `episode_pose_progress` helper. The legacy four-channel
+  cm/degree state is retained only for progress-disabled checkpoints.
+  Raw simulator pose order is
   `[x_cm,y_cm,z_cm,roll_deg,yaw_deg,pitch_deg]`.
 - H=1; one current view; five actions; visual stride 5, hence target t+5.
   No F0 RGB, historical action or historical pose enters DA3.
@@ -180,7 +189,7 @@ Observation-only Python inference:
 from experiments.uavflow_support_aware.inference import load_policy
 policy = load_policy("/path/to/checkpoint.pt", device="cuda:0")
 out = policy.predict(current_rgb, instructions,
-    first_sim_pose=first_raw_pose_batch, current_sim_pose=current_raw_pose_batch)
+    observed_pose_history=raw_histories_from_episode_start_to_now)
 actions = out["actions_meters_radians"]  # [B,5,4]
 ```
 
@@ -190,16 +199,25 @@ and testing it against the legacy UE service/preview is separate work, not
 claimed complete. CPU tests exercise native wrapper packing with a tiny backbone;
 real Qwen+DA3 forward/backward on the target accelerator is still required.
 
-## Verification performed
+## Compatibility and verification
 
-On the local CPU test path after aligned-loss update: 206 tests and 20 subtests passed, including the
-existing architecture/runtime suites. The 16 RGB-warp tests cover identity and
-known-motion projection, validity/correspondence, empty CA rows, shared LoRA and
-frozen DPT gradients, warp-only future-loss gradients to proposal/current depth,
-mask zero initialization, unbounded gated residuals, architecture/optimizer round-trip,
-numeric state injection, observation-only service parity and evaluator metrics.
-An additional read-only audit of 10 real dataset windows found zero difference
-between Dataset state and the inference conversion helper (cm/degrees).
-`git diff --check`, entry-point help and resolved-config printing also passed.
-No full pretrained accelerator forward, distributed run or UE rollout was
-performed; the existing NVML initialization warning is not evidence of GPU validation.
+Entry configs explicitly save `warp_mode=alpha`, `alpha_radius=1.5` and
+`alpha_points_per_pixel=8`. Architecture loading rejects old bilinear settings;
+old checkpoints containing removed `action_values` weights are not exact resumes.
+The prior bilinear function remains available for diagnostic comparisons, not
+as the new public job default. Optimizer/scaler/RNG/data cursor behavior is unchanged.
+
+CPU tests cover actual shared-backbone tiny-model forward/backward through
+future depth to proposal/current depth, exact training/probe alpha parity,
+partial/empty coverage, batch isolation, alpha-derived correspondence, fully
+occluded contributions, continuous mask input, FP32 AMP geometry and strict
+checkpoint rejection. Original bilinear tests remain as reference diagnostics.
+
+A CUDA warp-only sweep on three actual stride5 frame pairs used 223 distinct
+action chunks (GT scales, offsets, reversals, pure lateral/yaw and random noise).
+Alpha r=1.5/K=8 had much smaller random-VJP outliers than normalized bilinear
+in those samples, but changes brightness/blur/coverage. Lower gradient magnitude
+is NOT proof of better control or useful future-depth supervision.
+These probes do not validate full Qwen+DA3 training memory or closed-loop quality.
+No new Ascend validation was performed; sort/scatter/cumprod and a real R1-style
+forward/backward smoke still need verification on the target NPU stack.

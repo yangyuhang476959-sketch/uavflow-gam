@@ -53,6 +53,9 @@ def test_three_metric_release_contracts(variant,tmp_path,monkeypatch):
         assert cfg.model.dual_stream_rgbwarp_enabled
         assert cfg.model.da3_lora.enabled and cfg.model.da3_lora.target_modules==['all-linear']
         assert cfg.model.rgbwarp_correction.use_correspondence_attention
+        assert cfg.model.rgbwarp_correction.warp_mode=='alpha'
+        assert cfg.model.rgbwarp_correction.alpha_radius==1.5
+        assert cfg.model.rgbwarp_correction.alpha_points_per_pixel==8
         assert not cfg.model.deep_lora.enabled
 
 

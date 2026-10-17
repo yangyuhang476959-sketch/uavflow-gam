@@ -184,11 +184,17 @@ def test_pose_helper_same_units_wrap_and_roll_pitch_contract():
     np.testing.assert_array_equal(episode_yaw4d_state(first,first),np.zeros(4))
 
 
-def test_future_depth_gradient_through_warp_not_action_value_shortcut():
+def test_future_depth_gradient_through_warp_not_action_value_shortcut(monkeypatch):
     net=make_model(corr=False)
-    with torch.no_grad():
-        net.rgbwarp_correction.action_values.weight.zero_()
-    result,_=run(net)
+    assert not hasattr(net.rgbwarp_correction,'action_values')
+    captured={}
+    original=net.da3.propagate_shallow_with_actions_grad
+    def capture(visual,actions,**kwargs):
+        captured['actions']=actions
+        return original(visual,actions,**kwargs)
+    monkeypatch.setattr(net.da3,'propagate_shallow_with_actions_grad',capture)
+    result,slots=run(net)
+    torch.testing.assert_close(captured['actions'],net.rgbwarp_correction.proposal_projection(slots)[:,None,None])
     proposal=result['direct_actions_norm']
     current=result['current_depth_output']['depth']
     loss=result['deep_joint_features']['depth'].square().mean()
@@ -259,6 +265,24 @@ def test_gate_checkpoint_and_optimizer_roundtrip():
     incompatible['geometry_architecture_state'].pop('action_residual_gate_logit')
     with pytest.raises(ValueError,match='gating changed'):
         load_architecture_state(restored,incompatible)
+    incompatible=copy.deepcopy(saved)
+    for key in ('warp_mode','alpha_radius','alpha_points_per_pixel'):
+        incompatible['geometry_architecture_state']['rgbwarp_correction']['config'].pop(key,None)
+    with pytest.raises(ValueError,match='settings changed'):
+        load_architecture_state(restored,incompatible)
+
+
+def test_alpha_coverage_drives_continuous_mask_embedding(monkeypatch):
+    net=make_model(corr=False);calls=[]
+    original=net.da3.encode_shallow_rgb_grad
+    def capture(images,**kwargs):
+        calls.append(kwargs.get('invalid_mask'))
+        return original(images,**kwargs)
+    monkeypatch.setattr(net.da3,'encode_shallow_rgb_grad',capture)
+    result,_=run(net)
+    assert calls[0] is None and not calls[1].requires_grad
+    torch.testing.assert_close(calls[1],1-result['warp']['opacity'].detach())
+    assert ((calls[1]>0)&(calls[1]<1)).any()
 
 
 def test_entrypoint_explicit_defaults():
@@ -267,6 +291,7 @@ def test_entrypoint_explicit_defaults():
     assert cfg.model.dual_stream_rgbwarp_enabled and not cfg.model.support_aware_transport
     assert not cfg.model.use_fixed_first_frame and not cfg.model.stop_head_enabled
     assert cfg.stage1.qwen_numeric_pose_token
+    assert cfg.model.rgbwarp_correction.warp_mode=='alpha'
     assert cfg.model.da3_lora.target_modules==['all-linear']
     assert cfg.loss.action_weight==3 and cfg.loss.depth_weight==3 and cfg.loss.feature_weight==0
     assert cfg.loss.action_direct_weight==cfg.loss.action_refine_weight==.5

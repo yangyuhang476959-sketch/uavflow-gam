@@ -7,6 +7,32 @@ piecewise differentiable, not a differentiable topology change.
 import torch
 
 
+def forward_alpha_splat(rgb,depth,transform,intrinsics,*,valid=None,patch_size=14,
+                        radius=1.5,points_per_pixel=8):
+    """Metric projection + finite-disk alpha-over; RGB has no mass division."""
+    from .alpha_warp import composite_alpha_points
+    if rgb.ndim!=4 or depth.shape!=(rgb.shape[0],*rgb.shape[-2:]):
+        raise ValueError('Expected RGB [B,C,H,W], z-depth [B,H,W]')
+    b,_,h,w=rgb.shape;device=rgb.device
+    with torch.autocast(device_type=device.type,enabled=False):
+        rgb,depth,t=rgb.float(),depth.float(),transform.float()
+        k=torch.as_tensor(intrinsics,device=device,dtype=torch.float32)
+        if k.ndim==2:k=k.expand(b,-1,-1)
+        if k.shape!=(b,3,3) or t.shape!=(b,4,4):raise ValueError('Camera matrices must match batch')
+        yy,xx=torch.meshgrid(torch.arange(h,device=device),torch.arange(w,device=device),indexing='ij')
+        pixels=torch.stack((xx,yy,torch.ones_like(xx)),-1).reshape(-1,3).float()
+        good=torch.isfinite(depth)&(depth>0)
+        if valid is not None:good=good&valid.bool()
+        points=(pixels[None]@torch.linalg.inv(k).transpose(-1,-2))*torch.where(good,depth,0).flatten(1)[...,None]
+        target=points@t[:,:3,:3].transpose(-1,-2)+t[:,None,:3,3]
+        projected=target@k.transpose(-1,-2)
+        uv=projected[...,:2]/projected[...,2:].clamp_min(1e-6)
+        front=good.flatten(1)&torch.isfinite(target).all(-1)&(target[...,2]>1e-6)
+        flow=torch.where(front[...,None],uv-pixels[None,:,:2],-float(h+w+10))
+        return composite_alpha_points(rgb,flow.reshape(b,h,w,2).permute(0,3,1,2),
+            target[...,2].reshape(b,1,h,w),radius=radius,points_per_pixel=points_per_pixel,patch_size=patch_size)
+
+
 def action_camera_transform(actions, heading_from_camera=None):
     if actions.ndim!=3 or actions.shape[-1]!=4:
         raise ValueError('Expected [B,K,4] local metre/radian increments')
@@ -26,7 +52,8 @@ def action_camera_transform(actions, heading_from_camera=None):
 
 
 def forward_splat(rgb, depth, transform, intrinsics, *, valid=None, patch_size=14,
-                  z_absolute_tolerance=.01,z_relative_tolerance=.01):
+                  z_absolute_tolerance=.01,z_relative_tolerance=.01,
+                  return_diagnostics=False):
     if rgb.ndim!=4 or depth.shape!=(rgb.shape[0],*rgb.shape[-2:]):
         raise ValueError('Expected RGB [B,C,H,W], z-depth [B,H,W]')
     b,c,h,w=rgb.shape;device=rgb.device
@@ -77,5 +104,23 @@ def forward_splat(rgb, depth, transform, intrinsics, *, valid=None, patch_size=1
         matrix=depth.new_zeros(b*n*n)
         matrix.scatter_add_(0,bi*n*n+dst_patch*n+src_patch,torch.ones_like(weight))
         correspondence=(matrix.reshape(b,n,n)>0).detach()
-        return dict(rgb=result,valid=coverage,correspondence=correspondence,
+        output=dict(rgb=result,valid=coverage,correspondence=correspondence,
                     depth=zd.reshape(b,h,w),mass=mass.reshape(b,h,w))
+        if return_diagnostics:
+            # Optional offline audit only; default forward and autograd are
+            # unchanged. Frobenius norm of each target RGB's Jacobian w.r.t.
+            # its contributing source projected coordinates (u_i,v_i).
+            with torch.no_grad():
+                count=depth.new_zeros(b*h*w).scatter_add_(0,destination,torch.ones_like(weight))
+                du=torch.stack((-(1-dy),1-dy,-dy,dy),-1)[keep][visible]
+                dv=torch.stack((-(1-dx),-dx,1-dx,dx),-1)[keep][visible]
+                target_rgb=result.permute(0,2,3,1).reshape(-1,c)
+                contrast=(colors-target_rgb[destination]).square().sum(-1)
+                squared=(du.square()+dv.square())*contrast/mass[destination].clamp_min(1e-6).square()
+                local_jacobian=depth.new_zeros(b*h*w).scatter_add_(0,destination,squared).sqrt()
+                # Exact normalized single-contributor derivative is zero;
+                # exclude FP32 numerator/denominator cancellation residue.
+                local_jacobian[count<=1]=0
+                output['diagnostics']=dict(contributors=count.reshape(b,h,w),
+                    coordinate_jacobian_norm=local_jacobian.reshape(b,h,w))
+        return output

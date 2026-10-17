@@ -27,6 +27,14 @@ bound is applied. It is separate from Predictor feature-residual/CA gates.
 Old ungated or bounded checkpoints cannot silently resume as this new topology;
 the gate is saved in architecture state and optimized with the action-head group.
 
+RGB-warp now uses radius-1.5-pixel, nearest-K8 depth-sorted alpha-over, without
+RGB mass normalization. Its missing-coverage embedding receives detached
+`1-opacity`; patch correspondence follows positive alpha-over contributors.
+DA3 action tokens are only projected VLM hidden states, with no proposal-value
+embedding. Candidate 2 already lacked that numeric embedding and is unchanged.
+See [dual_stream_rgbwarp.md](dual_stream_rgbwarp.md) for checkpoint compatibility
+and the distinction between gradient stability and navigation quality.
+
 All three use H1, visual stride5, five local-yaw action increments, target t+5.
 Depth is **fixed metric**: GT metres / 100; prediction *100 is metres, with no
 per-frame/first-frame scale normalization. Current/Future losses in the two
@@ -159,7 +167,7 @@ from experiments.uavflow_support_aware.inference import load_policy
 policy = load_policy("/path/to/checkpoint.pt", device="cuda:0")
 output = policy.predict(current_rgb, instructions,
     reference_images=first_rgb,  # old Current Bank model needs F0; RGB warp ignores it
-    first_sim_pose=first_raw_pose_batch, current_sim_pose=current_raw_pose_batch)
+    observed_pose_history=raw_histories_from_episode_start_to_now)
 actions = output["actions_meters_radians"]  # [B,5,4]
 ```
 

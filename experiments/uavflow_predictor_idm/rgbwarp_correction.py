@@ -8,7 +8,7 @@ from torch import nn
 
 from .current_geometry import CurrentGeometryRead
 from .patch_transport import nominal_intrinsics
-from .rgbwarp_geometry import action_camera_transform,forward_splat
+from .rgbwarp_geometry import action_camera_transform,forward_splat,forward_alpha_splat
 from .support_aware_transport import decode_levels
 
 
@@ -35,11 +35,18 @@ class RGBWarpCorrection(nn.Module):
         super().__init__();self.config=dict(config or {})
         allowed={'use_pixel_binary_mask','use_correspondence_attention','correspondence_layers',
                  'correspondence_width','correspondence_heads','depth_scale_meters','fov_degrees',
-                 'heading_from_camera'}
+                 'heading_from_camera','warp_mode','alpha_radius','alpha_points_per_pixel'}
         if set(self.config)-allowed:raise ValueError(f'Unknown RGB warp settings: {set(self.config)-allowed}')
+        self.warp_mode=str(self.config.get('warp_mode','alpha'))
+        if self.warp_mode not in {'alpha','bilinear'}:raise ValueError('Choose alpha or bilinear RGB warp')
+        # Persist effective defaults so old bilinear checkpoints cannot load
+        # as alpha just because their saved config omitted a rasterizer tag.
+        self.config['warp_mode']=self.warp_mode
+        if self.warp_mode=='alpha':
+            self.config.setdefault('alpha_radius',1.5)
+            self.config.setdefault('alpha_points_per_pixel',8)
         self.layers=tuple(int(i) for i in self.config.get('correspondence_layers',layers))
         self.proposal_projection=nn.Sequential(nn.LayerNorm(language_dim),nn.Linear(language_dim,visual_dim))
-        self.action_values=nn.Linear(4,visual_dim)
         self.mask_projection=None
         if self.config.get('use_pixel_binary_mask',True):
             self.mask_projection=nn.Conv2d(1,visual_dim,patch_size,stride=patch_size)
@@ -66,12 +73,17 @@ class RGBWarpCorrection(nn.Module):
         transform=action_camera_transform(raw,self.config.get('heading_from_camera'))
         k=intrinsics if intrinsics is not None else nominal_intrinsics(h,w,
             fov_degrees=float(self.config.get('fov_degrees',90.)),device=current_rgb.device)
-        warp=forward_splat(current_rgb,meters,transform,k,patch_size=da3.PATCH_SIZE)
+        warp=(forward_alpha_splat(current_rgb,meters,transform,k,patch_size=da3.PATCH_SIZE,
+            radius=float(self.config.get('alpha_radius',1.5)),
+            points_per_pixel=int(self.config.get('alpha_points_per_pixel',8)))
+            if self.warp_mode=='alpha' else forward_splat(current_rgb,meters,transform,k,patch_size=da3.PATCH_SIZE))
         future_shallow=da3.encode_shallow_rgb_grad(warp['rgb'],
-            invalid_mask=(~warp['valid']).float() if self.mask_projection is not None else None,
+            invalid_mask=(1-warp['opacity'].detach() if self.warp_mode=='alpha' else (~warp['valid']).float())
+                if self.mask_projection is not None else None,
             mask_projection=self.mask_projection,gradient_checkpointing=model.deep_gradient_checkpointing)
-        actions=seed+self.action_values(proposal[:,0])
-        deep=da3.propagate_shallow_with_actions_grad(future_shallow,actions[:,None,None],
+        # Preserve the VLM hidden-state path; numeric proposal values drive
+        # only the warp, not a second embedding added to DA3 action tokens.
+        deep=da3.propagate_shallow_with_actions_grad(future_shallow,seed[:,None,None],
             gradient_checkpointing=model.deep_gradient_checkpointing,decode_visuals=True,return_multi_level=True,
             correspondence_read=self.correspondence,
             correspondence_by_layer=observed.get('layer_patches',{}),

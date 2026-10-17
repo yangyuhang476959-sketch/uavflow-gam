@@ -14,6 +14,7 @@ def build_config(extra=()):
     cfg.model.provenance_correction={}
     cfg.model.dual_stream_rgbwarp_enabled=True
     cfg.model.rgbwarp_correction={
+        'warp_mode':'alpha','alpha_radius':1.5,'alpha_points_per_pixel':8,
         'use_pixel_binary_mask':True,'use_correspondence_attention':True,
         'correspondence_layers':[19,27,33,39],'correspondence_width':256,'correspondence_heads':8,
         'depth_scale_meters':100.,'fov_degrees':90.}
