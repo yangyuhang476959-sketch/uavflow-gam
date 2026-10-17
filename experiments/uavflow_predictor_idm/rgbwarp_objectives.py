@@ -9,7 +9,7 @@ from .runtime import autocast_context
 from .vlm_conditioning import encode_stage2_condition
 
 
-def depth_loss(prediction,target,valid,scale):
+def depth_loss(prediction,target,valid,scale,*,log_weight=0.,log_epsilon_normalized=1e-6):
     prediction=prediction.float();target=target.float()/float(scale)
     if prediction.shape!=target.shape or valid.shape!=target.shape:
         raise ValueError('Depth targets and predictions must share pixel grid')
@@ -20,10 +20,17 @@ def depth_loss(prediction,target,valid,scale):
     mse=((prediction-target).square()*weight).sum()/denom
     l1=((prediction-target).abs()*weight).sum()/denom
     grad=_finite_difference_gradient_l1(prediction,target,valid,torch.ones_like(prediction))
-    return dict(total=l1+grad,mse=mse,l1=l1,grad=grad,valid_ratio=weight.mean())
+    if float(log_epsilon_normalized)<=0:
+        raise ValueError('log_epsilon_normalized must be positive')
+    safe_target=torch.where(valid,target,torch.ones_like(target))
+    log_l1=((prediction.clamp_min(float(log_epsilon_normalized)).log()
+             -safe_target.clamp_min(float(log_epsilon_normalized)).log()).abs()*weight).sum()/denom
+    return dict(total=l1+float(log_weight)*log_l1+grad,mse=mse,l1=l1,
+                log_l1=log_l1,grad=grad,valid_ratio=weight.mean())
 
 
-def forward_rgbwarp_batch(*,model,da3,text,normalizer,batch,context_len,rollout_steps,amp,amp_dtype):
+def forward_rgbwarp_batch(*,model,da3,text,normalizer,batch,context_len,rollout_steps,amp,amp_dtype,
+                         depth_log_weight=0.,depth_log_epsilon_normalized=1e-6):
     ref=model.module if hasattr(model,'module') else model
     images=batch['all_view_images']
     if context_len!=1 or rollout_steps!=1 or images.shape[1:3]!=(2,1):
@@ -49,8 +56,9 @@ def forward_rgbwarp_batch(*,model,da3,text,normalizer,batch,context_len,rollout_
         future=output['deep_joint_features']['depth'].reshape_as(gt[:,1,0])
         # DO NOT warp/detach the target following proposal, and DO NOT exclude
         # predicted warp holes: target is the fixed real t+5 GT-valid region.
-        curr_loss=depth_loss(current,gt[:,0,0],valid[:,0,0],scale)
-        fut_loss=depth_loss(future,gt[:,1,0],valid[:,1,0],scale)
+        depth_options=dict(log_weight=depth_log_weight,log_epsilon_normalized=depth_log_epsilon_normalized)
+        curr_loss=depth_loss(current,gt[:,0,0],valid[:,0,0],scale,**depth_options)
+        fut_loss=depth_loss(future,gt[:,1,0],valid[:,1,0],scale,**depth_options)
     prediction=output['actions_norm'];raw=normalizer.denormalize(prediction.float(),stats_keys=keys)
     zero=prediction.new_zeros(())
     # Compatibility-only zero diagnostics for the existing trainer/evaluator.
@@ -75,6 +83,7 @@ def forward_rgbwarp_batch(*,model,da3,text,normalizer,batch,context_len,rollout_
     values.update(action=(proposal_loss+refine_loss)/2,direct_action=proposal_loss,refine_action=refine_loss,
         action_direct=proposal_loss,action_refine=refine_loss,depth=total_depth,depth_global=total_depth,
         depth_l1=(curr_loss['l1']+fut_loss['l1'])/2,depth_linear_l1=(curr_loss['l1']+fut_loss['l1'])/2,
+        depth_log_l1=(curr_loss['log_l1']+fut_loss['log_l1'])/2,
         depth_grad=(curr_loss['grad']+fut_loss['grad'])/2,depth_valid_ratio=(curr_loss['valid_ratio']+fut_loss['valid_ratio'])/2,
         depth_scene_scale_mean=zero.new_tensor(scale),
         raw_l1=masked_action_l1(raw,target_raw,mask),action_raw_moments=moments,
@@ -87,7 +96,7 @@ def forward_rgbwarp_batch(*,model,da3,text,normalizer,batch,context_len,rollout_
     values['rgbwarp_refine_loss']=refine_loss.detach()
     for branch,loss in [('current',curr_loss),('future',fut_loss)]:
         for key,value in loss.items():values[f'depth_{branch}_{key}']=value.detach()
-        # MSE is diagnostic only; reconstruction loss is GAM linear L1.
+        # MSE is diagnostic only; reconstruction uses linear/log L1.
         values[f'depth_{branch}_linear_l1']=loss['l1'].detach()
-        for key in ('log_l1','semantic_ratio'):values[f'depth_{branch}_{key}']=zero
+        values[f'depth_{branch}_semantic_ratio']=zero
     return values

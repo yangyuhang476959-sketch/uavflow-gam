@@ -47,9 +47,15 @@ Aligned loss weights: Action3, Depth3; only GAM adds Feature1.
   `3*(proposal_L1 + final_L1)/2 + 3*(current_depth + future_depth)/2`.
   Proposal/final each receive1.5; Current/Future depth each receive1.5.
   Neither correction has a feature loss, including the old Predictor model.
-- Every depth branch uses linear L1 + unmodified GAM finite-difference L1
-  gradient, both with internal weight1. RGB MSE metrics are diagnostic only.
-  No log loss, semantic/dynamic reweighting, uncertainty or Stop loss is enabled.
+- Every depth branch uses `linear L1 + log-depth L1 + unmodified GAM
+  finite-difference L1 gradient`, with internal weights **1:1:1** (sum, not
+  divided by3). The outer Depth weight stays3. Gradient is still computed on
+  linear normalized depth, not log depth. Log uses natural logarithms of
+  prediction and GT metres/100, clamped below at the existing normalized
+  epsilon `1e-6`. Current/Future both use this same recipe; each term is logged.
+  RGB MSE metrics are diagnostic only. No semantic/dynamic reweighting,
+  uncertainty or Stop loss is enabled. The separate local CPU warp comparison
+  explicitly keeps log weight0 and is not changed to this new recipe.
 - Gated residual merge is unchanged. Changed loss definitions/weights are not
   silently accepted as an exact resume of a previous loss configuration.
 

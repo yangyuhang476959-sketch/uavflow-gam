@@ -72,14 +72,18 @@ of the Current Bank CA gates. The action head and residual head stay independent
 ```
 L = 3 * (L1(proposal, GT actions) + L1(final, GT actions)) / 2
     + 3 * (D_current + D_future) / 2
-D_branch = linear_L1(predicted_depth, GT_depth / 100) + GAM_grad
+D_branch = linear_L1(predicted_depth, GT_depth / 100)
+           + log_L1(predicted_depth, GT_depth / 100) + GAM_grad
 ```
 
 Action L1 uses the existing valid-action mask. Depth uses GT-valid pixels;
 gradient uses valid endpoint pairs and the repository's **x-mean + y-mean L1
 finite difference**, not tolerant/log gradient. Current/future depth losses are
 averaged before the outer depth weight3. Proposal/final action losses also
-split the outer action weight3 equally. No feature, log-depth, dynamic reweighting,
+split the outer action weight3 equally. Linear/log/gradient have equal internal
+weights1 (sum, not averaged); log uses natural logarithms with the existing
+normalized lower clamp `1e-6`. Current/Future log losses are logged separately.
+The local CPU comparison keeps its explicit log weight0. No feature, dynamic reweighting,
 pose or stop loss. MSE metrics are diagnostic only, not part of the objective.
 
 **GT future is the real t+5 frame and remains fixed.** It is NOT reprojected to
