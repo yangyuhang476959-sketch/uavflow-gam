@@ -35,11 +35,12 @@ def build_config(extra=()):
     cfg.loss.action_direct_weight=.5
     cfg.loss.action_refine_weight=.5
     cfg.loss.depth_weight=3.
-    # Equal linear L1 + log L1 + GAM finite-difference L1 gradient. Action/depth
+    # Average linear L1 + log L1 + GAM finite-difference L1 gradient. Action/depth
     # branches share each outer weight equally instead of doubling it.
     cfg.loss.depth_reconstruction='l1'
-    cfg.loss.depth_linear_weight=1.
-    cfg.loss.depth_log_weight=1.
+    cfg.loss.depth_linear_weight=1./3.
+    cfg.loss.depth_log_weight=1./3.
+    cfg.loss.depth_grad_weight=1./3.
     cfg.loss.depth_semantic_weight=1.
     cfg.loss.depth_semantic_separate_weight=0.
     cfg.training.results_dir=str(Path(os.environ.get('OUTPUT_ROOT','results'))/'dual_stream_rgbwarp')

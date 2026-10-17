@@ -21,8 +21,7 @@ def test_three_metric_release_contracts(variant,tmp_path,monkeypatch):
     assert not cfg.model.stop_head_enabled and cfg.loss.stop_weight==0
     assert cfg.training.max_epochs==5 and cfg.training.lr_schedule=='constant'
     assert cfg.loss.action_weight==3 and cfg.loss.depth_weight==3
-    assert cfg.loss.depth_linear_weight==cfg.loss.depth_grad_weight==1
-    assert cfg.loss.depth_log_weight==1
+    assert cfg.loss.depth_linear_weight==cfg.loss.depth_log_weight==cfg.loss.depth_grad_weight==pytest.approx(1./3.)
     assert cfg.stage1.t5_model==str(tmp_path/'models/t5-base')
     assert cfg.stage1.da3_checkpoint==str(tmp_path/'models/track4world_da3.pth')
     assert cfg.stage1.qwen_model==str(tmp_path/'models/qwen3.5-2b')

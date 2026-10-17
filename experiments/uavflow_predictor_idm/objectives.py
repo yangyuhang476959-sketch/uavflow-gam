@@ -864,7 +864,8 @@ def forward_batch(
         from .rgbwarp_objectives import forward_rgbwarp_batch
         return forward_rgbwarp_batch(model=model,da3=da3,text=text,normalizer=normalizer,batch=batch,
             context_len=context_len,rollout_steps=rollout_steps,amp=amp,amp_dtype=amp_dtype,
-            depth_log_weight=depth_log_weight,depth_log_epsilon_normalized=depth_log_epsilon_normalized)
+            depth_linear_weight=depth_linear_weight,depth_log_weight=depth_log_weight,
+            depth_grad_weight=depth_grad_weight,depth_log_epsilon_normalized=depth_log_epsilon_normalized)
     images = batch["all_view_images"]
     model_ref = model.module if hasattr(model, "module") else model
     use_reference = bool(getattr(model_ref, "use_fixed_first_frame", False))

@@ -16,6 +16,8 @@ def test_log_recipe_matches_existing_gam_and_keeps_legacy_no_log():
     new=rgb.depth_loss(pred,target,valid,100.,log_weight=1.)
     torch.testing.assert_close(old['total'],old['l1']+old['grad'])
     torch.testing.assert_close(new['total'],new['l1']+new['log_l1']+new['grad'])
+    averaged=rgb.depth_loss(pred,target,valid,100.,linear_weight=1./3.,log_weight=1./3.,grad_weight=1./3.)
+    torch.testing.assert_close(3*averaged['total'],new['l1']+new['log_l1']+new['grad'])
     torch.testing.assert_close(new['log_l1'],(pred.log()-(target/100).log()).abs().mean())
     gam=gam_window_pointnorm_depth_loss(pred,target,valid,target,valid,
         linear_weight=1.,log_weight=1.,grad_weight=1.,gradient_mode='gam_l1',
@@ -46,8 +48,10 @@ def test_trainer_dispatch_preserves_explicit_log_weight(monkeypatch):
             feature_horizon_weights=[1.],feature_patch_weight=1.,feature_cls_weight=0.,
             feature_register_weight=0.,deep_feature_enabled=False,deep_feature_patch_weight=1.,
             deep_feature_cls_weight=0.,stop_pos_weight=1.,amp=False,
-            depth_log_weight=weight,depth_log_epsilon_normalized=1e-5)
+            depth_linear_weight=1./3.,depth_log_weight=weight,depth_grad_weight=1./3.,
+            depth_log_epsilon_normalized=1e-5)
         assert result['depth_log_weight']==weight
+        assert result['depth_linear_weight']==result['depth_grad_weight']==1./3.
         assert result['depth_log_epsilon_normalized']==1e-5
 
 
@@ -73,3 +77,7 @@ def test_current_future_log_terms_are_both_used_and_logged(monkeypatch):
             new[f'depth_{branch}_linear_l1']+new[f'depth_{branch}_log_l1']+new[f'depth_{branch}_grad'])
     torch.testing.assert_close(new['depth']-old['depth'],new['depth_log_l1'])
     torch.testing.assert_close(3*new['depth'],1.5*(new['depth_current_total']+new['depth_future_total']))
+    avg=rgb.forward_rgbwarp_batch(**args,depth_linear_weight=1./3.,
+                                  depth_log_weight=1./3.,depth_grad_weight=1./3.)
+    for branch in ['current','future']:
+        torch.testing.assert_close(3*avg[f'depth_{branch}_total'],new[f'depth_{branch}_total'])

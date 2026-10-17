@@ -48,8 +48,10 @@ Aligned loss weights: Action3, Depth3; only GAM adds Feature1.
   Proposal/final each receive1.5; Current/Future depth each receive1.5.
   Neither correction has a feature loss, including the old Predictor model.
 - Every depth branch uses `linear L1 + log-depth L1 + unmodified GAM
-  finite-difference L1 gradient`, with internal weights **1:1:1** (sum, not
-  divided by3). The outer Depth weight stays3. Gradient is still computed on
+  finite-difference L1 gradient`, averaged with internal weights **1/3 each**.
+  The outer Depth weight stays3: `3*(linear + log + gradient)/3`, like splitting
+  the action budget between proposal/final. This is equal coefficient weighting,
+  not an adaptive guarantee of equal observed loss values. Gradient is still computed on
   linear normalized depth, not log depth. Log uses natural logarithms of
   prediction and GT metres/100, clamped below at the existing normalized
   epsilon `1e-6`. Current/Future both use this same recipe; each term is logged.

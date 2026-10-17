@@ -56,11 +56,13 @@ def build_config(variant,extra=()):
         cfg.loss.depth_scale_mode='fixed_metric'
         cfg.loss.depth_fixed_scale_meters=100.
         cfg.training.max_epochs=5
-    # All maintained depth branches: equal linear/log/linear-gradient terms.
-    cfg.loss.depth_linear_weight=1.
-    cfg.loss.depth_log_weight=1.
-    cfg.loss.depth_grad_weight=1.
-    cfg.loss.depth_semantic_log_weight=1.
+    # Split the outer depth budget3 equally, like proposal/final action.
+    cfg.loss.depth_linear_weight=1./3.
+    cfg.loss.depth_log_weight=1./3.
+    cfg.loss.depth_grad_weight=1./3.
+    cfg.loss.depth_semantic_linear_weight=1./3.
+    cfg.loss.depth_semantic_log_weight=1./3.
+    cfg.loss.depth_semantic_grad_weight=1./3.
     # All new pose-token runs use the online yaw4d convention explicitly.
     cfg.dataset.openvla_prompt_pose_mode='evaluator_yaw4d'
     cfg.dataset.pose_progress_enabled=True
