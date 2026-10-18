@@ -1,0 +1,18 @@
+# Snapshot of the separate local Python 3.11 UnrealCV client environment.
+# Do NOT install into the DA3/Qwen training environment (which uses NumPy <2).
+setuptools==69.5.1
+gym==0.10.9
+UnrealCV==1.1.7
+numpy==2.4.6
+scipy==1.17.1
+opencv-python==5.0.0.93
+matplotlib==3.11.0
+pillow==12.3.0
+requests==2.34.2
+docker==7.1.0
+modelscope==1.38.1
+simple-pid==2.0.1
+pynput==1.8.2
+wget==3.2
+pyglet==2.1.15
+six==1.17.0

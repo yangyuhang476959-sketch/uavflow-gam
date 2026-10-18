@@ -33,6 +33,10 @@ and its application order.
 
 ## Remote experiment quick start
 
+**NVIDIA UE simulation handoff: [simulation/README.md](simulation/README.md).**
+This is the copied closed-loop simulator client and its separate environment,
+not a change to training or Ascend setup.
+
 **Ascend handoff: [NPU_SETUP.md](NPU_SETUP.md).**
 
 The code was previously validated on Ascend 910B2 / aarch64, Driver 25.2.1,

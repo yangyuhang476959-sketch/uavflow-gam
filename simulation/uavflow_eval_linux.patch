@@ -1,0 +1,44 @@
+diff --git a/UAV-Flow-Eval/gym_unrealcv/envs/base_env.py b/UAV-Flow-Eval/gym_unrealcv/envs/base_env.py
+index 4722adb..7858c07 100644
+--- a/UAV-Flow-Eval/gym_unrealcv/envs/base_env.py
++++ b/UAV-Flow-Eval/gym_unrealcv/envs/base_env.py
+@@ -632,7 +632,8 @@ class UnrealCv_base(gym.Env):
+         # launch the UE4 binary
+         env_ip, env_port = self.ue_binary.start(docker=self.docker, resolution=self.resolution, display=self.display,
+                                                opengl=self.use_opengl, offscreen=self.offscreen_rendering,
+-                                               nullrhi=self.nullrhi,sleep_time=10)
++                                               nullrhi=self.nullrhi, gpu_id=self.gpu_id,
++                                               sleep_time=self.sleep_time)
+ 
+ 
+         # connect to UnrealCV Server
+@@ -788,4 +789,4 @@ class UnrealCv_base(gym.Env):
+             self.agents[obj]['cam_id'] = nearest_cam_id
+             # 更新cam_list中对应的相机ID
+             agent_idx = self.player_list.index(obj)
+-            self.cam_list[agent_idx] = nearest_cam_id
+\ No newline at end of file
++            self.cam_list[agent_idx] = nearest_cam_id
+diff --git a/UAV-Flow-Eval/gym_unrealcv/envs/track.py b/UAV-Flow-Eval/gym_unrealcv/envs/track.py
+index f6124d5..347c7fb 100644
+--- a/UAV-Flow-Eval/gym_unrealcv/envs/track.py
++++ b/UAV-Flow-Eval/gym_unrealcv/envs/track.py
+@@ -189,9 +189,9 @@ class Track(UnrealCv_base):
+ 
+     def get_tracker_init_point(self, target_pos, distance, direction=None):
+         if direction is None:
+-            direction = 2 * np.pi * np.random.sample(1)
++            direction = float(2 * np.pi * np.random.random())
+         else:
+-            direction = direction % (2 * np.pi)
++            direction = float(np.asarray(direction).reshape(-1)[0] % (2 * np.pi))
+ 
+         dx = float(distance * np.cos(direction))
+         dy = float(distance * np.sin(direction))
+@@ -246,4 +246,4 @@ class Track(UnrealCv_base):
+     #     if layout:
+     #         self.unrealcv.clean_obstacles()
+     #         self.unrealcv.random_obstacles(self.objects_list, self.textures_list,
+-    #                                        20, self.reset_area, self.start_area, layout_texture)
+\ No newline at end of file
++    #                                        20, self.reset_area, self.start_area, layout_texture)

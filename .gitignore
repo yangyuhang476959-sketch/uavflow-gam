@@ -12,6 +12,7 @@ wandb/
 .env
 server.env
 platform-constraints.txt
+third_party/
 .venv/
 .venv-ascend/
 .ascend/
