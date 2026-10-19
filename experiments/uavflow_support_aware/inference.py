@@ -170,10 +170,14 @@ def load_policy(checkpoint_path, *, device="cuda:0", da3_checkpoint=None, qwen_m
     da3 = DA3GiantEncoder(ckpt_path=str(cfg.stage1.da3_checkpoint), encoder_input_size=224,
                          freeze_backbone=True, n_action_steps=0, views_per_timestep=1,
                          use_temporal_embed=False).to(device).eval()
+    # Match training: freeze every base parameter before enabling LoRA.
+    # freeze_backbone alone leaves the unused action_input_proj trainable.
+    da3.requires_grad_(False)
     lora = cfg.model.get("deep_lora", {}) or {}
     if cfg.model.get('dual_stream_rgbwarp_enabled',False):
         lora=dict(cfg.model.da3_lora)
-        lora.update(start_block=0,target_modules=['all-linear'])
+        lora.setdefault('start_block', 0)
+        lora.update(target_modules=['all-linear'])
     if lora.get("enabled", False):
         da3.configure_deep_lora(block_idx=int(lora.get("start_block", 13)), rank=int(lora.get("rank", 64)),
                                alpha=float(lora.get("alpha", 128.)), dropout=float(lora.get("dropout", 0.)),

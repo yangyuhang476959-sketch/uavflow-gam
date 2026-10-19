@@ -67,3 +67,27 @@ def test_online_pose_uses_exact_dataset_conversion():
         canonical_yaw4d_state(torch.zeros(1,1,3,2,2),['Turn'],torch.zeros(1,4),first,now)
     with pytest.raises(ValueError,match='finite'):
         canonical_yaw4d_state(torch.zeros(1,1,3,2,2),['Turn'],[[float('nan')]*4],None,None)
+
+
+@pytest.mark.parametrize('weights', [(1./3., 1./3., 1./3.), (1., 0., 1.)])
+def test_rgbwarp_startup_accepts_current_and_legacy_depth_recipes(weights, tmp_path, monkeypatch):
+    import sys
+    from omegaconf import OmegaConf
+    from experiments.uavflow_predictor_idm import train
+
+    cfg = build_config('rgbwarp')
+    cfg.loss.depth_linear_weight, cfg.loss.depth_log_weight, cfg.loss.depth_grad_weight = weights
+    path = tmp_path / 'config.yaml'
+    OmegaConf.save(cfg, path)
+    monkeypatch.setattr(sys, 'argv', ['train', '--config', str(path)])
+    monkeypatch.setattr(train, 'distributed_info', lambda: (False, 0, 0, 1))
+
+    class PassedValidation(Exception):
+        pass
+
+    def reached_accelerator(**kwargs):
+        raise PassedValidation
+
+    monkeypatch.setattr(train, 'configure_accelerator', reached_accelerator)
+    with pytest.raises(PassedValidation):
+        train.main()

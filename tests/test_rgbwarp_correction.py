@@ -406,3 +406,16 @@ def test_depth_reconstruction_is_linear_l1_not_mse():
     assert values['l1'].item()==values['total'].item()==2.
     values['total'].backward()
     torch.testing.assert_close(pred.grad,torch.full_like(pred,.25))
+
+
+def test_camera_motion_composition_stays_fp32_under_bf16_amp():
+    actions = torch.randn(2, 5, 4) * 0.03
+    actions.requires_grad_(True)
+    reference = action_camera_transform(actions)
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        actual = action_camera_transform(actions)
+    assert actual.dtype == torch.float32
+    torch.testing.assert_close(actual, reference)
+    actual.square().sum().backward()
+    assert actions.grad is not None and torch.isfinite(actions.grad).all()
+    assert actions.grad.abs().sum() > 0

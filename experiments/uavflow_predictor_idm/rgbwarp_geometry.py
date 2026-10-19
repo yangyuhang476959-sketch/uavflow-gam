@@ -36,19 +36,23 @@ def forward_alpha_splat(rgb,depth,transform,intrinsics,*,valid=None,patch_size=1
 def action_camera_transform(actions, heading_from_camera=None):
     if actions.ndim!=3 or actions.shape[-1]!=4:
         raise ValueError('Expected [B,K,4] local metre/radian increments')
-    actions=actions.float();b=actions.shape[0]
-    pose=torch.eye(4,device=actions.device).expand(b,-1,-1)
-    for step in actions.unbind(1):
-        c,s=step[:,3].cos(),step[:,3].sin();z=torch.zeros_like(c);o=torch.ones_like(c)
-        rotation=torch.stack((c,-s,z,s,c,z,z,z,o),-1).reshape(b,3,3)
-        upper=torch.cat((rotation,step[:,:3,None]),-1)
-        bottom=step.new_tensor([0.,0.,0.,1.]).expand(b,1,4)
-        pose=pose @ torch.cat((upper,bottom),-2)
-    e=(actions.new_tensor([[0.,0.,1.,0.],[1.,0.,0.,0.],[0.,-1.,0.,0.],[0.,0.,0.,1.]])
-       if heading_from_camera is None else torch.as_tensor(heading_from_camera,device=actions.device,dtype=torch.float32))
-    if e.shape[-2:]!=(4,4) or not torch.isfinite(e).all():
-        raise ValueError('Expected finite camera-to-body extrinsic')
-    return torch.linalg.inv(e) @ torch.linalg.inv(pose) @ e
+    # Outer BF16 AMP would downcast pose matmuls even after actions.float().
+    # Compose and invert camera geometry in FP32, keeping action gradients.
+    with torch.autocast(device_type=actions.device.type, enabled=False):
+        actions=actions.float();b=actions.shape[0]
+        pose=torch.eye(4,device=actions.device).expand(b,-1,-1)
+        for step in actions.unbind(1):
+            c,s=step[:,3].cos(),step[:,3].sin();z=torch.zeros_like(c);o=torch.ones_like(c)
+            rotation=torch.stack((c,-s,z,s,c,z,z,z,o),-1).reshape(b,3,3)
+            upper=torch.cat((rotation,step[:,:3,None]),-1)
+            bottom=step.new_tensor([0.,0.,0.,1.]).expand(b,1,4)
+            pose=pose @ torch.cat((upper,bottom),-2)
+        e=(actions.new_tensor([[0.,0.,1.,0.],[1.,0.,0.,0.],[0.,-1.,0.,0.],[0.,0.,0.,1.]])
+           if heading_from_camera is None else torch.as_tensor(heading_from_camera,device=actions.device,dtype=torch.float32))
+        if e.shape[-2:]!=(4,4) or not torch.isfinite(e).all():
+            raise ValueError('Expected finite camera-to-body extrinsic')
+        return torch.linalg.inv(e) @ torch.linalg.inv(pose) @ e
+
 
 
 def forward_splat(rgb, depth, transform, intrinsics, *, valid=None, patch_size=14,

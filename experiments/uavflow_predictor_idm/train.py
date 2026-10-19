@@ -149,7 +149,7 @@ def main() -> None:
                 or str(cfg.loss.get('depth_scale_mode'))!='fixed_metric' or str(cfg.loss.get('depth_target_mode'))!='both'):
             raise ValueError('RGB-warp loss is 3*mean(proposal,final)+3*mean(Current,Future GAM depth); no feature loss')
         if not bool(cfg.model.get('da3_lora',{}).get('enabled',False)):
-            raise ValueError('RGB-warp requires full-backbone shared LoRA, not full-rank tuning')
+            raise ValueError('RGB-warp requires shared DA3 LoRA, not full-rank tuning')
         if list(cfg.model.da3_lora.get('target_modules',[]))!=['all-linear']:
             raise ValueError('RGB-warp requires explicit all-linear DA3 LoRA')
         for name in ('relative_pose_weight','action_rollout_pose_weight','pose_consistency_weight',
@@ -161,10 +161,11 @@ def main() -> None:
         if (str(cfg.loss.get('depth_target_source'))!='ue_gt'
                 or str(cfg.loss.get('depth_gradient_mode'))!='gam_l1'
                 or str(cfg.loss.get('depth_reconstruction'))!='l1'
-                or float(cfg.loss.get('depth_linear_weight',1))!=1
-                or float(cfg.loss.get('depth_grad_weight',1))!=1
-                or float(cfg.loss.get('depth_log_weight',0))!=0):
-            raise ValueError('RGB-warp depth is GT metric linear L1 + unmodified GAM L1 gradient')
+                or any(float(cfg.loss.get(key, 0)) < 0 for key in
+                       ('depth_linear_weight', 'depth_grad_weight', 'depth_log_weight'))
+                or sum(float(cfg.loss.get(key, 0)) for key in
+                       ('depth_linear_weight', 'depth_grad_weight', 'depth_log_weight')) <= 0):
+            raise ValueError('RGB-warp depth requires nonnegative GT metric linear/log/GAM-gradient weights')
         if float(cfg.model.get('rgbwarp_correction',{}).get('depth_scale_meters',100.))!=float(cfg.loss.get('depth_fixed_scale_meters',100.)):
             raise ValueError('Warp metric conversion must match supervised depth scale')
     if provenance_enabled:
@@ -317,7 +318,7 @@ def main() -> None:
         if train_deep_backbone or bool(deep_lora_cfg.get('enabled',False)):
             raise ValueError('Use only model.da3_lora for RGB-warp')
         deep_lora_cfg=dict(cfg.model.da3_lora)
-        deep_lora_cfg['start_block']=0
+        deep_lora_cfg.setdefault('start_block', 0)
         deep_lora_cfg['target_modules']=['all-linear']
     deep_lora_enabled = bool(deep_lora_cfg.get("enabled", False))
     if train_deep_backbone and deep_lora_enabled:
@@ -990,7 +991,8 @@ def main() -> None:
     if is_dist:
         model = torch.nn.parallel.DistributedDataParallel(
             model, device_ids=[local_rank], output_device=local_rank,
-            find_unused_parameters=False, gradient_as_bucket_view=True,
+            find_unused_parameters=bool(cfg.training.get("find_unused_parameters", False)),
+            gradient_as_bucket_view=True,
         )
 
     train_sampler = (
@@ -1076,7 +1078,7 @@ def main() -> None:
             f"use_pose_history={raw_model.use_pose_history}"
             f" use_fixed_first_frame={raw_model.use_fixed_first_frame}"
             f" reference_type={raw_model.use_reference_type_embedding}"
-            f" variable_language_tokens={raw_model.predictor.variable_language_tokens}"
+            f" variable_language_tokens={getattr(raw_model.predictor, 'variable_language_tokens', True)}"
             f" dense_context={raw_model.dense_context_supervision}"
             f" direct_action={raw_model.direct_action_enabled}"
             f" vlm_action_seed={raw_model.vlm_action_seed_enabled}"
@@ -1723,6 +1725,13 @@ def main() -> None:
                     output / "last.pt",
                 )
             pbar.update(1)
+            if step >= max_steps:
+                if rank == 0 and step != last_saved_step and not env_truthy("UAVFLOW_SKIP_FINAL_CHECKPOINT"):
+                    save_numbered_checkpoint(step, epoch, logical_batch_idx + 1)
+                    last_saved_step = step
+                break
+        if step >= max_steps:
+            break
         epoch += 1; start_batch = 0
         save_every_epochs = int(cfg.training.get("save_every_epochs", 0))
         if (
