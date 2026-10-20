@@ -348,7 +348,8 @@ passes through the GAM Future Predictor and DA3 correction, with per-layer
 Action CA reading the Current Geometry Bank. Prioritize the two RGB-warp
 experiments (Candidates 3/4); their existing names/filenames remain unchanged.
 
-The Pure-Qwen run uses its Pose Token/action-slot trainer and saves to
+The Pure-Qwen run uses the same7D pose-progress token and state LR1e-5 as
+Candidates3/4/5, through its Pose Token/action-slot trainer, and saves to
 `$OUTPUT_ROOT/01_pure_qwen_yaw4d`; the other runs save under their configured
 variant output directories. All maintained runners now default to
 10 epochs constant LR; the launch commands retain explicit 10-epoch overrides. There is no

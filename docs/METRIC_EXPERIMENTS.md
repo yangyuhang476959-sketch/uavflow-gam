@@ -23,9 +23,10 @@ Candidates 3 and 4, then run the remaining comparisons. Original DA3 weights
 and DPT remain frozen; only listed
 LoRA adapters train. The Qwen Pure model uses all-linear LoRA rank32/alpha16,
 native causal attention, final-layer five action-placeholder hidden states and
-decoder-only learned action-step embeddings. Its numeric Pose Token contains
-the evaluator's episode-first-frame-relative yaw-only XYZ in centimetres and
-wrapped yaw in degrees; the pose is not also written as text.
+decoder-only learned action-step embeddings. New Pure-Qwen runs use the same **seven-dimensional pose-progress token** as
+Candidates3/4/5: first-heading-frame XYZ in metres, sin/cos yaw, accumulated
+yaw in radians, and travelled path in metres. All use the same fixed scale
+`[10,10,10,1,1,2*pi,10]` and state-MLP LR1e-5; pose is not also written as text.
 
 Candidate 4 still lets the Proposal affect Future geometry through the
 differentiable RGB warp. It removes the Proposal Action Tokens from the Future
@@ -98,7 +99,7 @@ old R1 benchmark measurements do not certify these new variants.
 
 ## Pose Token train/test fix
 
-New correction runs select `dataset.openvla_prompt_pose_mode=evaluator_yaw4d`.
+New Pure-Qwen and correction runs select `dataset.openvla_prompt_pose_mode=evaluator_yaw4d`.
 They inject an MLP-encoded numeric state at `<|uav_state|>` before the five
 action slots; numbers are not also printed into the prompt. New maintained
 entries enable a seven-dimensional state:
@@ -132,7 +133,11 @@ The five-dimensional pose normalizer and auxiliary pose targets are unchanged.
 Legacy configurations default progress off and retain their old 4D Qwen/5D GAM
 state inputs. New entries enable `dataset.pose_progress_enabled`,
 `model.pose_progress_enabled`, and (correction only)
-`stage1.qwen_pose_progress_enabled`. Changed dimensions require a new run, not
+`stage1.qwen_pose_progress_enabled`. Pure training also enables this seven-state
+input and saves its dimension/layout in checkpoint metadata. Its legacy4D
+mode remains available with `dataset.pose_progress_enabled=false` and
+`model.pose_progress_enabled=false`; legacy optimizer grouping is preserved.
+A 4D checkpoint cannot exactly resume into the new7D default. Changed dimensions require a new run, not
 an exact resume of an old checkpoint; strict resume checks these settings.
 
 ## Data split and augmentation
@@ -290,3 +295,12 @@ checks persistent empty warp or almost-all-zero current depth; it does not
 classify every temporary scale error as collapse. It is off unless enabled.
 No machine-specific shutdown, paths, batch tuning, or CUDA package changes are
 part of these portable fixes.
+
+
+Pure-Qwen optimizer groups are Qwen LoRA1e-5, projection/action head5e-4, and
+state encoder1e-5 in the new7D mode (`training.state_lr`). Legacy4D mode keeps
+the original two-group optimizer layout and head-group state LR for checkpoint
+compatibility. Candidate2 remains the GAM/T5 baseline: its seven-dimensional
+pose/progress is encoded as a Predictor numeric input, with the existing
+q01/q99-normalized xyz/sin/cos plus accumulated-yaw/path scales, not as a Qwen
+Pose Token. Its baseline normalization and architecture are unchanged.

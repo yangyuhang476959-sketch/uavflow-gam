@@ -33,7 +33,7 @@ def _cfg(max_trajectories=None):
     cfg.dataset.dataset_name='uavflow_sim'
     cfg.dataset.action_stats_key='uavflow_sim'
     cfg.dataset.openvla_prompt_pose_mode='evaluator_yaw4d'
-    cfg.dataset.pose_progress_enabled=False
+    cfg.dataset.pose_progress_enabled=True
     cfg.dataset.future_steps=1
     cfg.dataset.visual_anchor_stride=5
     cfg.dataset.chunk_size=5
@@ -47,6 +47,9 @@ def _cfg(max_trajectories=None):
     model_root=Path(os.environ.get('MODEL_ROOT','checkpoints'))
     cfg.stage1.qwen_model=os.environ.get('QWEN_MODEL',str(model_root/'qwen3.5-2b'))
     cfg.model.pose_mode='numeric_token'
+    cfg.model.pose_progress_enabled=True
+    cfg.stage1.qwen_numeric_pose_token=True
+    cfg.stage1.qwen_pose_progress_enabled=True
     cfg.training.batch_size=4
     cfg.training.gradient_accumulation_steps=1
     cfg.training.max_epochs=10
@@ -54,6 +57,7 @@ def _cfg(max_trajectories=None):
     cfg.training.warmup_steps=0
     cfg.training.lora_lr=1e-5
     cfg.training.head_lr=5e-4
+    cfg.training.state_lr=1e-5
     cfg.training.num_workers=4
     cfg.training.log_every=25
     cfg.training.save_every=1000
@@ -70,7 +74,9 @@ def _forward(model,batch,normalizer,device,amp_enabled,amp_type):
     batch=_move_sample(batch,device)
     images=batch['all_view_images'][:,:1,:1]
     instructions=list(batch['task_description'])
-    states=batch['openvla_prompt_pose'][:,0]
+    reference=model.module if hasattr(model,'module') else model
+    state_key='episode_pose_progress' if getattr(reference,'pose_progress_enabled',False) else 'openvla_prompt_pose'
+    states=batch[state_key][:,0]
     raw=batch['actions'].float()
     keys=list(batch['action_stats_key'])
     target=normalizer.normalize(raw,stats_keys=keys)[:,0]
@@ -128,13 +134,18 @@ def main():
     normalizer=ActionNormalizer.from_stats_dir(str(cfg.stage1.action_stats_dir),[norm_key])
     model_root=Path(os.environ.get('MODEL_ROOT','checkpoints'))
     qwen_path=os.environ.get('QWEN_MODEL',str(model_root/'qwen3.5-2b'))
-    model=PureQwenActionPolicy(qwen_path,pose_mode='numeric_token').to(device)
+    pose_progress_enabled=bool(cfg.get('model',{}).get('pose_progress_enabled',False))
+    model=PureQwenActionPolicy(qwen_path,pose_mode='numeric_token',pose_progress_enabled=pose_progress_enabled).to(device)
     model.encoder.qwen.eval()
     trainable=sum(p.numel() for p in model.parameters() if p.requires_grad)
-    optimizer=torch.optim.AdamW([
+    optimizer_groups=[
         {'params':[p for p in model.encoder.parameters() if p.requires_grad],'lr':float(cfg.training.lora_lr)},
         {'params':list(model.projection.parameters())+list(model.head.parameters())+list(model.state_encoder.parameters()),'lr':float(cfg.training.head_lr)},
-    ],weight_decay=float(cfg.training.weight_decay))
+    ]
+    if pose_progress_enabled:
+        optimizer_groups[1]['params']=list(model.projection.parameters())+list(model.head.parameters())
+        optimizer_groups.append({'params':list(model.state_encoder.parameters()),'lr':float(cfg.training.get('state_lr',cfg.training.lora_lr))})
+    optimizer=torch.optim.AdamW(optimizer_groups,weight_decay=float(cfg.training.weight_decay))
 
     start_epoch=0;start_batch=0;step=0
     output=Path(str(cfg.training.results_dir));output.mkdir(parents=True,exist_ok=True)
@@ -144,6 +155,8 @@ def main():
             raise ValueError('Resume expects a Pure-Qwen yaw4d numeric-token checkpoint')
         if checkpoint['train_size']!=train_set_size or checkpoint['world_size']!=world or checkpoint['batch_size']!=int(cfg.training.batch_size) or int(checkpoint.get('gradient_accumulation_steps',1))!=accumulation_steps:
             raise ValueError('Exact resume requires same train size, world size, per-device batch size and accumulation steps')
+        if bool(checkpoint.get('pose_progress_enabled',False))!=pose_progress_enabled:
+            raise ValueError('Cannot exactly resume between legacy 4D pose and 7D pose-progress; start a new run')
         model.load_trainable_state(checkpoint['trainable_state'])
         optimizer.load_state_dict(checkpoint['optimizer'])
         step=int(checkpoint['step']);start_epoch=int(checkpoint['epoch']);start_batch=int(checkpoint['batch'])
@@ -165,11 +178,13 @@ def main():
         (output/'resolved_config.yaml').write_text(OmegaConf.to_yaml(cfg,resolve=True))
         (output/'meta.json').write_text(json.dumps({'world_size':world,'per_device_batch':int(cfg.training.batch_size),
             'global_batch':world*int(cfg.training.batch_size)*accumulation_steps,'gradient_accumulation_steps':accumulation_steps,'train_size':len(train_set),'eval_size':len(eval_set),
-            'trainable_parameters':trainable,'pose_mode':'numeric_token/evaluator_yaw4d',
+            'trainable_parameters':trainable,'pose_mode':'numeric_token/evaluator_yaw4d','pose_progress_enabled':pose_progress_enabled,'pose_dimensions':7 if pose_progress_enabled else 4,
             'lr_schedule':'constant','warmup_steps':0},indent=2))
         print(f'Pure-Qwen yaw4d train={len(train_set)} eval={len(eval_set)} world={world} '
               f'per_device_batch={cfg.training.batch_size} accumulation={accumulation_steps} global_batch={world*int(cfg.training.batch_size)*accumulation_steps} trainable={trainable/1e6:.2f}M lr=constant '
-              f'lora_lr={cfg.training.lora_lr} head_lr={cfg.training.head_lr}',flush=True)
+              f'lora_lr={cfg.training.lora_lr} head_lr={cfg.training.head_lr} '
+              f'pose_dimensions={7 if pose_progress_enabled else 4} '
+              f'state_lr={cfg.training.get("state_lr",cfg.training.lora_lr) if pose_progress_enabled else cfg.training.head_lr}',flush=True)
 
     max_epochs=int(cfg.training.max_epochs)
     for epoch in range(start_epoch,max_epochs):
@@ -203,19 +218,19 @@ def main():
                 if rank==0:
                     atomic_save({'format':'uavflow_pure_qwen_yaw4d_v1','trainable_state':raw_model.trainable_state(),
                         'optimizer':optimizer.state_dict(),'step':step,'epoch':epoch,'batch':logical_batch,
-                        'world_size':world,'batch_size':int(cfg.training.batch_size),'gradient_accumulation_steps':accumulation_steps,'train_size':train_set_size,
+                        'world_size':world,'batch_size':int(cfg.training.batch_size),'gradient_accumulation_steps':accumulation_steps,'pose_progress_enabled':pose_progress_enabled,'train_size':train_set_size,
                         'action_normalizer':normalizer.state_dict(),'config':OmegaConf.to_container(cfg,resolve=True)},output/'last.pt')
                 if distributed:dist.barrier()
         val=_eval(model,eval_loader,normalizer,device,amp_type,int(cfg.training.eval_max_batches))
         if rank==0:
             atomic_save({'format':'uavflow_pure_qwen_yaw4d_v1','trainable_state':raw_model.trainable_state(),
                 'optimizer':optimizer.state_dict(),'step':step,'epoch':epoch+1,'batch':0,
-                'world_size':world,'batch_size':int(cfg.training.batch_size),'gradient_accumulation_steps':accumulation_steps,'train_size':train_set_size,
+                'world_size':world,'batch_size':int(cfg.training.batch_size),'gradient_accumulation_steps':accumulation_steps,'pose_progress_enabled':pose_progress_enabled,'train_size':train_set_size,
                 'action_normalizer':normalizer.state_dict(),'config':OmegaConf.to_container(cfg,resolve=True),
                 'val_action_l1':val},output/f'epoch_{epoch+1:02d}.pt')
             atomic_save({'format':'uavflow_pure_qwen_yaw4d_v1','trainable_state':raw_model.trainable_state(),
                 'optimizer':optimizer.state_dict(),'step':step,'epoch':epoch+1,'batch':0,
-                'world_size':world,'batch_size':int(cfg.training.batch_size),'gradient_accumulation_steps':accumulation_steps,'train_size':train_set_size,
+                'world_size':world,'batch_size':int(cfg.training.batch_size),'gradient_accumulation_steps':accumulation_steps,'pose_progress_enabled':pose_progress_enabled,'train_size':train_set_size,
                 'action_normalizer':normalizer.state_dict(),'config':OmegaConf.to_container(cfg,resolve=True),
                 'val_action_l1':val},output/'last.pt')
             with (output/'train.log').open('a') as log:log.write(f'epoch={epoch+1} step={step} val_action_l1={val:.8f}\n')

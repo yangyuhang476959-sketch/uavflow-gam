@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import sys
 
 import torch
+import pytest
 from omegaconf import OmegaConf
 from torch import nn
 from torch.utils.data import Dataset
@@ -28,7 +29,8 @@ class TinyPolicy(nn.Module):
     def load_trainable_state(self,state): self.load_state_dict(state)
 
 
-def test_real_pure_loop_accumulates_tail_and_resumes_exact_cursor(tmp_path,monkeypatch):
+@pytest.mark.parametrize("progress", [False, True])
+def test_real_pure_loop_accumulates_tail_and_resumes_exact_cursor(tmp_path,monkeypatch,progress):
     normalizer=SimpleNamespace(state_dict=lambda:{'test':True})
     monkeypatch.setattr(train,'build_robot_dataset',lambda *a,**k:TinyDataset())
     monkeypatch.setattr(train,'ActionNormalizer',SimpleNamespace(from_stats_dir=lambda *a:normalizer))
@@ -44,7 +46,7 @@ def test_real_pure_loop_accumulates_tail_and_resumes_exact_cursor(tmp_path,monke
         return loss,prediction.detach(),target,mask
     monkeypatch.setattr(train,'_forward',forward)
     def config(_):
-        return OmegaConf.create(dict(seed=42,dataset={'action_stats_key':'sim'},stage1={'action_stats_dir':'unused'},training=dict(batch_size=3,gradient_accumulation_steps=2,max_epochs=1,lr_schedule='constant',warmup_steps=0,lora_lr=1e-3,head_lr=1e-3,num_workers=0,weight_decay=0,log_every=1,save_every=1,eval_max_batches=0,results_dir=str(tmp_path/'full'))))
+        return OmegaConf.create(dict(seed=42,model={'pose_progress_enabled':progress},dataset={'action_stats_key':'sim'},stage1={'action_stats_dir':'unused'},training=dict(batch_size=3,gradient_accumulation_steps=2,max_epochs=1,lr_schedule='constant',warmup_steps=0,lora_lr=1e-3,head_lr=1e-3,num_workers=0,weight_decay=0,log_every=1,save_every=1,eval_max_batches=0,results_dir=str(tmp_path/'full'))))
     monkeypatch.setattr(train,'_cfg',config)
     original_save=train.atomic_save
     def save(payload,path):
@@ -64,3 +66,8 @@ def test_real_pure_loop_accumulates_tail_and_resumes_exact_cursor(tmp_path,monke
     assert (resumed['step'],resumed['epoch'],resumed['batch'])==(2,1,0)
     for name,value in full['trainable_state'].items():
         torch.testing.assert_close(value,resumed['trainable_state'][name],rtol=0,atol=0)
+
+    if not progress:
+        monkeypatch.setattr(sys,'argv',['pure','--resume',str(tmp_path/'mid.pt'),'--set','model.pose_progress_enabled=true'])
+        with pytest.raises(ValueError,match='4D pose and 7D pose-progress'):
+            train.main()
