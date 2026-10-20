@@ -14,7 +14,7 @@ The requested four-run experiment is now represented by executable jobs:
 | 1 | `experiments/uavflow_qwen_pure/train.py` | Pure Qwen, yaw-only numeric Pose Token, five Qwen action slots; no GAM/DA3 | None |
 | 2 | `experiments/metric_jobs/01_gam.py` | GAM/T5 metric-depth baseline | Blocks 13–39, rank64/alpha128 LoRA |
 | 3 | `experiments/metric_jobs/03_rgbwarp.py` | Qwen proposal -> Current metric depth -> bilinear RGB warp -> Future DA3 with proposal Action Tokens -> gated residual | All blocks 0–39, rank64/alpha128 LoRA |
-| 4 | `experiments/metric_jobs/04_rgbwarp_no_action.py` | Same as 3, but proposal Action Tokens are not passed into Future DA3; five readout queries read final visual patches | All blocks 0–39, rank64/alpha128 LoRA |
+| 4 | `experiments/metric_jobs/04_rgbwarp_no_action.py` | Same as 3, but proposal Action Tokens are not passed into Future DA3; five random-initialized residual readout queries read final visual patches | All blocks 0–39, rank64/alpha128 LoRA |
 
 The separate `02_current_bank.py` is retained as an older optional comparison,
 not one of these four. Original DA3 weights and DPT remain frozen; only listed
@@ -30,6 +30,13 @@ DA3 sequence; only after the Future DA3 pass do five learned readout queries
 attend to its final patch features to decode the residual. Real future images,
 depth and actions are not policy inputs (future targets remain training/eval
 supervision only).
+
+These five Candidate 4 readout queries are trainable parameters initialized
+from `N(0, 0.02)`; they are not the Qwen proposal Action Tokens and are not
+inserted into the Future DA3 sequence. The Qwen-derived proposal and its direct
+action supervision remain unchanged. Thus Candidate 4 tests whether visual-only
+Future DA3 features can provide a correction through independently initialized
+readout queries, while the proposal still comes from Qwen.
 
 Both correction entries use independent Proposal/Correction heads and
 `final = proposal + sigmoid(g) * delta`. Gate is one learned global scalar,
