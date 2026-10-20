@@ -7,17 +7,20 @@ is removed or changed by this release cleanup.
 
 ## Architecture and defaults
 
-The requested four-run experiment is now represented by executable jobs:
+The five formal experiments are represented by executable jobs. Existing
+Candidate 3/4 names and entry filenames are retained for compatibility:
 
 | ID | Entry | Design | DA3 trainable scope |
 |---|---|---|---|
 | 1 | `experiments/uavflow_qwen_pure/train.py` | Pure Qwen, yaw-only numeric Pose Token, five Qwen action slots; no GAM/DA3 | None |
 | 2 | `experiments/metric_jobs/01_gam.py` | GAM/T5 metric-depth baseline | Blocks 13–39, rank64/alpha128 LoRA |
+| Current Bank | `experiments/metric_jobs/02_current_bank.py` | VLA proposal -> GAM Future Predictor -> DA3 correction; Action reads Current Geometry Bank through per-layer CA | Blocks 13–39, rank64/alpha128 LoRA |
 | 3 | `experiments/metric_jobs/03_rgbwarp.py` | Qwen proposal -> Current metric depth -> bilinear RGB warp -> Future DA3 with proposal Action Tokens -> gated residual | All blocks 0–39, rank64/alpha128 LoRA |
 | 4 | `experiments/metric_jobs/04_rgbwarp_no_action.py` | Same as 3, replacing VLM-derived Future DA3 Action Tokens with five randomly initialized learned Action Tokens | All blocks 0–39, rank64/alpha128 LoRA |
 
-The separate `02_current_bank.py` is retained as an older optional comparison,
-not one of these four. Original DA3 weights and DPT remain frozen; only listed
+Current Bank is a formal experiment alongside the other four. Prioritize
+Candidates 3 and 4, then run the remaining comparisons. Original DA3 weights
+and DPT remain frozen; only listed
 LoRA adapters train. The Qwen Pure model uses all-linear LoRA rank32/alpha16,
 native causal attention, final-layer five action-placeholder hidden states and
 decoder-only learned action-step embeddings. Its numeric Pose Token contains
@@ -57,7 +60,7 @@ embedding. Candidate 2 already lacked that numeric embedding and is unchanged.
 See [dual_stream_rgbwarp.md](dual_stream_rgbwarp.md) for checkpoint compatibility
 and the distinction between gradient stability and navigation quality.
 
-All four use H1, visual stride5, five local-yaw action increments, target t+5.
+All five use H1, visual stride5, five local-yaw action increments, target t+5.
 Depth is **fixed metric**: GT metres / 100; prediction *100 is metres, with no
 per-frame/first-frame scale normalization. Current/Future losses in the two
 correction models use the same fixed physical scale.
@@ -160,7 +163,7 @@ python experiments/metric_jobs/03_rgbwarp.py --print-config
 python experiments/metric_jobs/04_rgbwarp_no_action.py --print-config
 
 # Run each as an independent eight-device job: per-device batch4, global batch32.
-# All four use constant LR (no decay) and zero warmup for all 10 epochs.
+# All five use constant LR (no decay) and zero warmup for all 10 epochs.
 torchrun --standalone --nproc_per_node=8 \
   experiments/uavflow_qwen_pure/train.py \
   --set training.max_epochs=10 --set training.lr_schedule=constant \
@@ -168,6 +171,11 @@ torchrun --standalone --nproc_per_node=8 \
 
 torchrun --standalone --nproc_per_node=8 \
   experiments/metric_jobs/01_gam.py \
+  --set training.max_epochs=10 --set training.lr_schedule=constant \
+  --set training.warmup_steps=0 --set training.batch_size=4
+
+torchrun --standalone --nproc_per_node=8 \
+  experiments/metric_jobs/02_current_bank.py \
   --set training.max_epochs=10 --set training.lr_schedule=constant \
   --set training.warmup_steps=0 --set training.batch_size=4
 
@@ -197,7 +205,7 @@ Set `UAVFLOW_ACCELERATOR=npu`, source the selected CANN environment, and retain
 the isolated Triton/FLA PYTHONPATH for Ascend as documented. These entry points
 do not install/repair environments or select devices for you. The old
 `run_experiment R1` backend remains only because the existing environment
-benchmark depends on it; it is not one of these four metric jobs.
+benchmark depends on it; it is not one of these five formal experiments.
 
 GAM and RGB-warp jobs use the shared trainer's optimizer/scaler/RNG/cursor
 resume. Pure-Qwen has its own optimizer and sampler-cursor checkpoints (BF16,
@@ -211,7 +219,7 @@ definition is a **new experiment**, not an exact continuation of a relative-dept
 
 Prioritize 3 and 4, as requested. The 10-epoch handoff explicitly overrides
 the maintained five-epoch defaults. LR is constant throughout; warmup is zero.
-No cosine scheduler is used for these four jobs.
+No cosine scheduler is used for these five jobs.
 
 ## Inference
 

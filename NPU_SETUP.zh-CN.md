@@ -95,18 +95,19 @@ python scripts/verify_uavflow_remote.py \
 
 ## 4. 训练命令与实验优先级
 
-四个实验都已提供独立入口。每个作业使用 8 卡、每卡 batch4（global batch32）、10 epoch，学习率全程 constant，不做 warmup：
+五个正式实验都已提供独立入口。保留既有 Candidate 3/4 编号和入口文件名。每个作业使用 8 卡、每卡 batch4（global batch32）、10 epoch，学习率全程 constant，不做 warmup：
 
 | ID | 实验设计 | 入口 |
 |---|---|---|
 | 1 | Pure Qwen + yaw-only numeric Pose Token；5 个 Qwen action slots，不含 GAM/DA3 | `experiments/uavflow_qwen_pure/train.py` |
 | 2 | GAM/T5 + metric-depth baseline | `experiments/metric_jobs/01_gam.py` |
+| Current Bank | VLA proposal → GAM Future Predictor → DA3 correction；Action 每层通过 CA 读取 Current Geometry Bank；DA3 blocks 13–39 LoRA | `experiments/metric_jobs/02_current_bank.py` |
 | 3 | Bilinear RGB warp；Proposal Action Tokens 注入 Future DA3；DA3 全部 blocks 使用 LoRA | `experiments/metric_jobs/03_rgbwarp.py` |
 | 4 | 在 3 上将 Future DA3 的 VLM Action Tokens 换成按 GAM 规则随机初始化的 5 个可学习 Action Tokens（正态标准差 0.02），其余交互及残差头相同 | `experiments/metric_jobs/04_rgbwarp_no_action.py` |
 
-第 4 项的 proposal 仍通过可微 RGB warp 影响 Future 图像；策略推理不读取真实 future image/depth/action。`02_current_bank.py` 保留为额外对照，不属于这四项。优先级为 3、4。
+Candidate 4 的 proposal 仍通过可微 RGB warp 影响 Future 图像；策略推理不读取真实 future image/depth/action。Current Bank 是正式实验，与其余四项并列。优先运行 Candidate 3、4，再运行其余对照。
 
-每条命令作为独立作业提交。4 个作业都是 10 epoch、constant LR、warmup 0；每卡 batch4、8 卡共 global batch32：
+每条命令作为独立作业提交。5 个作业都是 10 epoch、constant LR、warmup 0；每卡 batch4、8 卡共 global batch32：
 
 ```bash
 export OUTPUT_ROOT="$OUTPUT_ROOT/metric_release"
@@ -117,6 +118,10 @@ torchrun --standalone --nproc_per_node=8 experiments/uavflow_qwen_pure/train.py 
   --set training.warmup_steps=0 --set training.batch_size=4
 
 torchrun --standalone --nproc_per_node=8 experiments/metric_jobs/01_gam.py \
+  --set training.max_epochs=10 --set training.lr_schedule=constant \
+  --set training.warmup_steps=0 --set training.batch_size=4
+
+torchrun --standalone --nproc_per_node=8 experiments/metric_jobs/02_current_bank.py \
   --set training.max_epochs=10 --set training.lr_schedule=constant \
   --set training.warmup_steps=0 --set training.batch_size=4
 

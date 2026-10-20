@@ -314,7 +314,7 @@ new validation claim for these metric-depth/LoRA variants.
 
 ## 4. Run, resume and validate
 
-Run each of the four jobs in the [metric-depth experiment handoff](docs/METRIC_EXPERIMENTS.md)
+Run each of the five jobs in the [metric-depth experiment handoff](docs/METRIC_EXPERIMENTS.md)
 as an independent eight-NPU job. Each uses 10 epochs, constant LR, no warmup,
 per-device batch4 (global batch32):
 
@@ -328,6 +328,10 @@ torchrun --standalone --nproc_per_node=8 experiments/metric_jobs/01_gam.py \
   --set training.max_epochs=10 --set training.lr_schedule=constant \
   --set training.warmup_steps=0 --set training.batch_size=4
 
+torchrun --standalone --nproc_per_node=8 experiments/metric_jobs/02_current_bank.py \
+  --set training.max_epochs=10 --set training.lr_schedule=constant \
+  --set training.warmup_steps=0 --set training.batch_size=4
+
 torchrun --standalone --nproc_per_node=8 experiments/metric_jobs/03_rgbwarp.py \
   --set training.max_epochs=10 --set training.lr_schedule=constant \
   --set training.warmup_steps=0 --set training.batch_size=4 \
@@ -338,6 +342,11 @@ torchrun --standalone --nproc_per_node=8 experiments/metric_jobs/04_rgbwarp_no_a
   --set training.warmup_steps=0 --set training.batch_size=4 \
   --set model.rgbwarp_correction.warp_mode=bilinear
 ```
+
+Current Bank (`02_current_bank.py`) is a formal experiment: its VLA proposal
+passes through the GAM Future Predictor and DA3 correction, with per-layer
+Action CA reading the Current Geometry Bank. Prioritize the two RGB-warp
+experiments (Candidates 3/4); their existing names/filenames remain unchanged.
 
 The Pure-Qwen run uses its Pose Token/action-slot trainer and saves to
 `$OUTPUT_ROOT/01_pure_qwen_yaw4d`; the other runs save under their configured
