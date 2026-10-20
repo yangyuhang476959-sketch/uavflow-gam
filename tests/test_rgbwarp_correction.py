@@ -109,7 +109,7 @@ class TinyDA3(DA3GiantEncoder):
         self.register_buffer('encoder_mean',torch.zeros(1,3,1,1));self.register_buffer('encoder_std',torch.ones(1,3,1,1))
 
 
-def make_model(corr=True,mask=True,inject_actions=True):
+def make_model(corr=True,mask=True,inject_actions=True,qk_norm=False):
     da3=TinyDA3()
     da3.configure_deep_lora(0,rank=2,alpha=4,dropout=0,target_modules=['all-linear'])
     return UAVFlowPredictorIDM(da3=da3,idm=None,action_dim=4,action_chunk_size=5,
@@ -124,7 +124,7 @@ def make_model(corr=True,mask=True,inject_actions=True):
         dual_stream_rgbwarp_enabled=True,rgbwarp_correction={'correspondence_layers':[3,5,7,9],
             'correspondence_width':16,'correspondence_heads':4,'use_correspondence_attention':corr,
             'use_pixel_binary_mask':mask,'inject_proposal_action_tokens':inject_actions,
-            'visual_residual_heads':4})
+            'visual_residual_heads':4,'qk_norm':qk_norm})
 
 
 def run(model):
@@ -419,3 +419,20 @@ def test_camera_motion_composition_stays_fp32_under_bf16_amp():
     actual.square().sum().backward()
     assert actions.grad is not None and torch.isfinite(actions.grad).all()
     assert actions.grad.abs().sum() > 0
+
+
+@pytest.mark.parametrize('inject_actions',[True,False])
+def test_qk_normalized_warp_routes_both_candidates_through_same_action_decoder(inject_actions):
+    net=make_model(inject_actions=inject_actions,qk_norm=True).train()
+    ca=net.rgbwarp_correction.correspondence
+    assert ca.attention.qk_norm_enabled
+    nn.init.normal_(ca.output.weight,std=.01)
+    result,slots=run(net)
+    (result['deep_joint_features']['depth'].square().mean()+result['actions_norm'].square().mean()).backward()
+    assert torch.isfinite(slots.grad).all()
+    for norm in (ca.attention.q_norm,ca.attention.k_norm):
+        assert norm.weight.grad is not None and torch.isfinite(norm.weight.grad).all()
+        assert norm.weight.grad.abs().sum()>0
+    state=copy.deepcopy(net.state_dict())
+    restored=make_model(inject_actions=inject_actions,qk_norm=True)
+    restored.load_state_dict(state,strict=True)

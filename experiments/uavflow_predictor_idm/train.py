@@ -468,6 +468,7 @@ def main() -> None:
         action_residual_gate_init=cfg.model.get('action_residual_gate_init'),
         current_geometry_gate_init=cfg.model.get('current_geometry_gate_init'),
         current_geometry_zero_init=bool(cfg.model.get('current_geometry_zero_init',False)),
+        current_geometry_qk_norm=bool(cfg.model.get('current_geometry_qk_norm',False)),
         support_aware_transport=transport_cfg,
         correction_mode=correction_mode,
         provenance_correction=OmegaConf.to_container(correction_cfg, resolve=True) if OmegaConf.is_config(correction_cfg) else dict(correction_cfg),
@@ -815,6 +816,7 @@ def main() -> None:
             "model.current_geometry_read_mode",
             "model.current_geometry_gate_init",
             "model.current_geometry_zero_init",
+            "model.current_geometry_qk_norm",
             "model.current_geometry_bank_mode",
             "model.geometry_architecture",
             "model.vlm_action_seed_enabled",
@@ -891,7 +893,7 @@ def main() -> None:
         for path in compatibility_paths:
             saved_value = nested_get(saved_cfg, path)
             current_value = nested_get(current_cfg, path)
-            if path in {"training.current_geometry_head_lr", "model.current_geometry_zero_init"}:
+            if path in {"training.current_geometry_head_lr", "model.current_geometry_zero_init", "model.current_geometry_qk_norm"}:
                 saved_value, current_value = bool(saved_value), bool(current_value)
             if path == "training.gradient_accumulation_steps":
                 saved_value = 1 if saved_value is None else int(saved_value)
@@ -906,6 +908,11 @@ def main() -> None:
             if path == "model.current_geometry_bank_mode":
                 saved_value = saved_value or "every_layer_concat"
                 current_value = current_value or "every_layer_concat"
+            if path == "model.rgbwarp_correction":
+                saved_value = dict(saved_value or {})
+                current_value = dict(current_value or {})
+                saved_value.setdefault("qk_norm", False)
+                current_value.setdefault("qk_norm", False)
             if saved_value != current_value:
                 mismatches.append(f"{path}: checkpoint={saved_value!r}, current={current_value!r}")
         saved_world = ckpt.get("world_size")

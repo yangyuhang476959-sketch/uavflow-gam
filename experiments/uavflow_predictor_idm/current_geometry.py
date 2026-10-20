@@ -1,6 +1,7 @@
 """One observation-to-action read; no map, extra geometry loss or future GT."""
 import torch
 from torch import nn
+from .qk_normalized_attention import QKNormalizedAttention
 
 
 class CurrentGeometryRead(nn.Module):
@@ -12,7 +13,7 @@ class CurrentGeometryRead(nn.Module):
     existing action route while allowing gradients into the new branch.
     """
     def __init__(self, action_dim, width=256, heads=8, layer_indices=None,
-                 gate_init=1e-3, memory_dim=None, zero_init=False):
+                 gate_init=1e-3, memory_dim=None, zero_init=False, qk_norm=False):
         super().__init__()
         if width <= 0 or heads <= 0 or width % heads:
             raise ValueError("current_geometry width must be positive and divisible by heads")
@@ -23,7 +24,7 @@ class CurrentGeometryRead(nn.Module):
         self.memory = nn.Sequential(
             nn.LayerNorm(self.memory_dim), nn.Linear(self.memory_dim, width)
         )
-        self.attention = nn.MultiheadAttention(width, heads, batch_first=True)
+        self.attention = QKNormalizedAttention(width, heads, qk_norm=qk_norm)
         self.output = nn.Linear(width, action_dim)
         if zero_init:
             nn.init.zeros_(self.output.weight)

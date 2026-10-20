@@ -75,9 +75,10 @@ def test_model_constructor_applies_configured_bank_initialization():
         parallel_action_position_mode='decoder_only',parallel_vla_gfm_width=32,
         parallel_vla_gfm_heads=4,parallel_current_geometry_read_enabled=True,
         current_geometry_read_mode='per_layer',current_geometry_bank_mode='output_current',
-        current_geometry_gate_init=1.,current_geometry_zero_init=True,
+        current_geometry_gate_init=1.,current_geometry_zero_init=True,current_geometry_qk_norm=True,
         parallel_current_depth_enabled=True,depth_decode_enabled=True,
         correction_mode='pure',action_residual_gate_init=.1)
+    assert net.current_geometry_read.attention.qk_norm_enabled
     assert net.current_geometry_read.gate.item()==1.
     assert net.current_geometry_read.output.weight.count_nonzero()==0
     assert net.action_residual_gate_logit.sigmoid().item()==pytest.approx(.1)

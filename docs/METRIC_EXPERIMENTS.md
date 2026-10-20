@@ -328,3 +328,31 @@ do not describe them as this unified comparison. Exact-resume checks reject
 changed CA initialization/grouping settings. Legacy constructors preserve the
 old behavior when these new settings are absent; saved weights are not rewritten.
 Different CA query/memory locations remain the intended architectural contrast.
+
+
+## QK normalization for new geometry CA runs
+
+New Candidate 3/4 Warp correspondence CA defaults to
+`model.rgbwarp_correction.qk_norm=true`; Candidate 5 Current Bank defaults to
+`model.current_geometry_qk_norm=true`. Both normalize the actual projected
+Q and K separately with learned LayerNorm per attention head, after MHA's
+Q/K projections and before the dot product. Input feature LayerNorm alone is
+not QK normalization. V and the existing masks, gates and zero-output
+initialization stay unchanged. Q/K norm weights initialize to one, biases to
+zero, and follow the CA learning rate5e-4. Pure and GAM without these CA
+branches are unaffected.
+
+The normalized geometry attention uses math SDPA on CUDA. Captured saturated
+masked correspondence inputs produced incorrect gradients with efficient SDPA
+in the local PyTorch environment; math SDPA agreed with a float64 reference.
+Other devices use their standard SDPA dispatch. This backend choice does not
+change model weights or the attention mask semantics.
+
+Metric launchers preserve the checkpoint's QK normalization setting on
+`--resume`, including disabled normalization for legacy checkpoints with no
+flag. Explicit overrides remain subject to exact-resume compatibility checks;
+enabling QK normalization on an unnormalized checkpoint is not an exact resume.
+Inference reads the saved model settings. To start a legacy-layout comparison
+from scratch, explicitly set the corresponding flag false. New defaults apply
+to new runs; they do not retrofit running processes or previous experiment
+results. Existing local training is not changed by this release.

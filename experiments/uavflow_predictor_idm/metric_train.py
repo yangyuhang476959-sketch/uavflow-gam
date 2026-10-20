@@ -56,6 +56,7 @@ def build_config(variant,extra=()):
             cfg.model.current_geometry_read_mode='per_layer'
             cfg.model.current_geometry_gate_init=1.0
             cfg.model.current_geometry_zero_init=True
+            cfg.model.current_geometry_qk_norm=True
             cfg.training.current_geometry_head_lr=True
             cfg.loss.feature_weight=0.
             cfg.loss.action_direct_weight=.5
@@ -84,6 +85,24 @@ def build_config(variant,extra=()):
     return OmegaConf.merge(cfg,OmegaConf.from_dotlist(list(extra)))
 
 
+
+def preserve_resume_qk_norm(cfg, checkpoint_path, extra=()):
+    """A new default must not silently change an existing checkpoint's graph."""
+    import torch
+    saved = torch.load(checkpoint_path, map_location="cpu", weights_only=False, mmap=True)
+    model = saved.get("config", {}).get("model", {})
+    explicit = {item.split("=", 1)[0] for item in extra}
+    if bool(cfg.model.get("dual_stream_rgbwarp_enabled", False)):
+        key = "model.rgbwarp_correction.qk_norm"
+        if key not in explicit:
+            cfg.model.rgbwarp_correction.qk_norm = bool(model.get("rgbwarp_correction", {}).get("qk_norm", False))
+    elif bool(cfg.model.get("parallel_current_geometry_read_enabled", False)):
+        key = "model.current_geometry_qk_norm"
+        if key not in explicit:
+            cfg.model.current_geometry_qk_norm = bool(model.get("current_geometry_qk_norm", False))
+    return cfg
+
+
 def main(default_variant=None):
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--variant',choices=VARIANTS,default=default_variant,required=default_variant is None)
@@ -97,6 +116,8 @@ def main(default_variant=None):
     if args.max_trajectories is not None:
         extra.append(f'dataset.max_trajectories={args.max_trajectories}')
     cfg=build_config(args.variant,extra)
+    if args.resume:
+        cfg=preserve_resume_qk_norm(cfg,args.resume,extra)
     if args.print_config:
         print(OmegaConf.to_yaml(cfg,resolve=True));return
     if args.eval_only and not args.resume:

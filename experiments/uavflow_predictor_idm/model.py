@@ -537,6 +537,7 @@ class UAVFlowPredictorIDM(nn.Module):
         pose_progress_enabled: bool = False,
         current_geometry_gate_init: float | None = None,
         current_geometry_zero_init: bool = False,
+        current_geometry_qk_norm: bool = False,
         action_history_keep_prob: float = 1.0,
         pose_history_keep_prob: float = 1.0,
         pose_history_xyz_noise_meters: float = 0.0,
@@ -1020,6 +1021,7 @@ class UAVFlowPredictorIDM(nn.Module):
                 gate_init=(float(current_geometry_gate_init) if current_geometry_gate_init is not None
                            else (0.05 if self.parallel_vla_gfm_enabled else 1e-3)),
                 zero_init=bool(current_geometry_zero_init),
+                qk_norm=bool(current_geometry_qk_norm),
                 memory_dim=(
                     int(2 * da3.embed_dim)
                     if self.current_geometry_patch_mode == "concat"

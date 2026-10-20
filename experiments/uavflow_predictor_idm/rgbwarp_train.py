@@ -17,7 +17,7 @@ def build_config(extra=()):
         'warp_mode':'bilinear','alpha_radius':1.5,'alpha_points_per_pixel':8,
         'use_pixel_binary_mask':True,'use_correspondence_attention':True,
         'correspondence_layers':[19,27,33,39],'correspondence_width':256,'correspondence_heads':8,
-        'depth_scale_meters':100.,'fov_degrees':90.}
+        'depth_scale_meters':100.,'fov_degrees':90.,'qk_norm':True}
     cfg.model.action_residual_gate_init=.1
     cfg.model.train_deep_backbone=False
     cfg.model.deep_lora.enabled=False

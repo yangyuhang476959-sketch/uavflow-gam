@@ -13,8 +13,8 @@ from .support_aware_transport import decode_levels
 
 
 class CorrespondenceRead(CurrentGeometryRead):
-    def __init__(self,dim,layers,width=256,heads=8):
-        super().__init__(dim,width=width,heads=heads,memory_dim=dim,layer_indices=layers,gate_init=1.)
+    def __init__(self,dim,layers,width=256,heads=8,qk_norm=False):
+        super().__init__(dim,width=width,heads=heads,memory_dim=dim,layer_indices=layers,gate_init=1.,qk_norm=qk_norm)
         nn.init.zeros_(self.output.weight);nn.init.zeros_(self.output.bias)
 
     def forward(self,future,current,mask,layer_index):
@@ -59,7 +59,7 @@ class RGBWarpCorrection(nn.Module):
         allowed={'use_pixel_binary_mask','use_correspondence_attention','correspondence_layers',
                  'correspondence_width','correspondence_heads','depth_scale_meters','fov_degrees',
                  'heading_from_camera','warp_mode','alpha_radius','alpha_points_per_pixel',
-                 'inject_proposal_action_tokens','visual_residual_heads'}
+                 'inject_proposal_action_tokens','visual_residual_heads','qk_norm'}
         if set(self.config)-allowed:raise ValueError(f'Unknown RGB warp settings: {set(self.config)-allowed}')
         self.warp_mode=str(self.config.get('warp_mode','alpha'))
         if self.warp_mode not in {'alpha','bilinear'}:raise ValueError('Choose alpha or bilinear RGB warp')
@@ -78,7 +78,7 @@ class RGBWarpCorrection(nn.Module):
             self.mask_projection=nn.Conv2d(1,visual_dim,patch_size,stride=patch_size)
             nn.init.zeros_(self.mask_projection.weight);nn.init.zeros_(self.mask_projection.bias)
         self.correspondence=(CorrespondenceRead(visual_dim,self.layers,
-            width=int(self.config.get('correspondence_width',256)),heads=int(self.config.get('correspondence_heads',8)))
+            width=int(self.config.get('correspondence_width',256)),heads=int(self.config.get('correspondence_heads',8)),qk_norm=bool(self.config.get('qk_norm',False)))
             if self.config.get('use_correspondence_attention',True) else None)
         self.inject_proposal_action_tokens=bool(self.config.get('inject_proposal_action_tokens',True))
         # Match GAM's learned action-slot initialization (std=0.02). These
