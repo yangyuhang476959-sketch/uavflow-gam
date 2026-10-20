@@ -304,3 +304,27 @@ compatibility. Candidate2 remains the GAM/T5 baseline: its seven-dimensional
 pose/progress is encoded as a Predictor numeric input, with the existing
 q01/q99-normalized xyz/sin/cos plus accumulated-yaw/path scales, not as a Qwen
 Pose Token. Its baseline normalization and architecture are unchanged.
+
+
+## Unified new-comparison CA settings
+
+For new Candidate3/4/5 comparisons, Qwen/state LR is1e-5, DA3 LoRA LR is5e-5,
+and action heads/projections plus geometry-reading CA use5e-4. Pure uses the
+same7D pose-progress and state LR described above. The three correction
+models initialize their final-action residual sigmoid gate at0.1.
+
+Warp correspondence CA already used a raw global gate1, per-layer gate0,
+and a zero-initialized output projection. New Current Bank runs now use the
+same initialization via `model.current_geometry_gate_init=1.0` and
+`model.current_geometry_zero_init=true`. Its CA joins the head LR group via
+`training.current_geometry_head_lr=true`. Thus every new CA branch initially
+adds exactly zero features while its output projection can learn on step1.
+The effective CA gate is the raw sum of global and per-layer gates, not a
+sigmoid probability; it is distinct from the final-action sigmoid gate.
+
+These new-comparison defaults change Current Bank's old gate0.05/random-output
+initialization and CA LR1e-5. Existing trained results keep their actual settings;
+do not describe them as this unified comparison. Exact-resume checks reject
+changed CA initialization/grouping settings. Legacy constructors preserve the
+old behavior when these new settings are absent; saved weights are not rewritten.
+Different CA query/memory locations remain the intended architectural contrast.

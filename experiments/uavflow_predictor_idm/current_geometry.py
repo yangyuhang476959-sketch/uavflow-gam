@@ -12,7 +12,7 @@ class CurrentGeometryRead(nn.Module):
     existing action route while allowing gradients into the new branch.
     """
     def __init__(self, action_dim, width=256, heads=8, layer_indices=None,
-                 gate_init=1e-3, memory_dim=None):
+                 gate_init=1e-3, memory_dim=None, zero_init=False):
         super().__init__()
         if width <= 0 or heads <= 0 or width % heads:
             raise ValueError("current_geometry width must be positive and divisible by heads")
@@ -25,6 +25,9 @@ class CurrentGeometryRead(nn.Module):
         )
         self.attention = nn.MultiheadAttention(width, heads, batch_first=True)
         self.output = nn.Linear(width, action_dim)
+        if zero_init:
+            nn.init.zeros_(self.output.weight)
+            nn.init.zeros_(self.output.bias)
         self.gate = nn.Parameter(torch.tensor(float(gate_init)))
         self.layer_gates = nn.ParameterDict({
             str(int(index)): nn.Parameter(torch.tensor(0.0))

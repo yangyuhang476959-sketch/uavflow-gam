@@ -466,6 +466,8 @@ def main() -> None:
         ),
         parallel_action_position_mode=str(cfg.model.get("parallel_action_position_mode", "legacy")),
         action_residual_gate_init=cfg.model.get('action_residual_gate_init'),
+        current_geometry_gate_init=cfg.model.get('current_geometry_gate_init'),
+        current_geometry_zero_init=bool(cfg.model.get('current_geometry_zero_init',False)),
         support_aware_transport=transport_cfg,
         correction_mode=correction_mode,
         provenance_correction=OmegaConf.to_container(correction_cfg, resolve=True) if OmegaConf.is_config(correction_cfg) else dict(correction_cfg),
@@ -636,6 +638,8 @@ def main() -> None:
         direct_head_ids.update(id(p) for p in raw_model.rgbwarp_correction.parameters() if p.requires_grad)
     if raw_model.action_residual_gate_logit is not None:
         direct_head_ids.add(id(raw_model.action_residual_gate_logit))
+    if bool(cfg.training.get('current_geometry_head_lr',False)) and raw_model.current_geometry_read is not None:
+        direct_head_ids.update(id(p) for p in raw_model.current_geometry_read.parameters() if p.requires_grad)
     separate_stop_lr = cfg.training.get("stop_head_lr") is not None
     stop_head_ids = {
         id(parameter) for parameter in raw_model.stop_head.parameters()
@@ -809,6 +813,8 @@ def main() -> None:
             "model.deep_action_enabled",
             "model.current_geometry_action_enabled",
             "model.current_geometry_read_mode",
+            "model.current_geometry_gate_init",
+            "model.current_geometry_zero_init",
             "model.current_geometry_bank_mode",
             "model.geometry_architecture",
             "model.vlm_action_seed_enabled",
@@ -865,6 +871,7 @@ def main() -> None:
             "loss.depth_grad_weight",
             "training.batch_size",
             "training.gradient_accumulation_steps",
+            "training.current_geometry_head_lr",
             "training.amp_dtype",
             "training.direct_action_head_lr_mult",
             "training.predictor_lr_mult",
@@ -884,6 +891,8 @@ def main() -> None:
         for path in compatibility_paths:
             saved_value = nested_get(saved_cfg, path)
             current_value = nested_get(current_cfg, path)
+            if path in {"training.current_geometry_head_lr", "model.current_geometry_zero_init"}:
+                saved_value, current_value = bool(saved_value), bool(current_value)
             if path == "training.gradient_accumulation_steps":
                 saved_value = 1 if saved_value is None else int(saved_value)
                 current_value = 1 if current_value is None else int(current_value)
