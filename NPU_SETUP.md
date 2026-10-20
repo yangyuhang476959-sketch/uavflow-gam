@@ -1,5 +1,7 @@
 # Ascend NPU handoff
 
+Language: [简体中文](NPU_SETUP.zh-CN.md) | English
+
 The code was previously validated on **Ascend 910B2, aarch64, Driver 25.2.1,
 CANN 9.0.0, Python 3.11.15, PyTorch 2.7.1 and torch_npu 2.7.1.post4**.
 This is a validation record, **not a universal installation prescription**.
@@ -31,10 +33,47 @@ conda create -n uavflow-npu python=3.11 pip -y
 conda activate uavflow-npu
 ```
 
-Install the engineer-confirmed PyTorch/torch_npu/torchvision and Triton-Ascend
-packages into **this environment** following their official instructions. A new
-Conda environment does not inherit packages from an administrator's other Python.
-Then load the exact existing CANN installation selected by the engineer:
+### Reference install command for the validated stack
+
+The following commands reproduce the recorded **910B2 + CANN 9.0.0** software
+combination. The compatibility table maps `torch-npu==2.7.1.post4` to
+`torch==2.7.1` and CANN 9.0.0. For another accelerator, driver, CANN, Python, or
+torch_npu release, use Huawei's current official compatibility guidance instead
+of copying these pins.
+
+```bash
+source /usr/local/Ascend/cann-9.0.0/set_env.sh
+
+# Install CPU-build PyTorch wheels required by the Ascend adapter.
+python -m pip install \
+  'torch==2.7.1+cpu' 'torchvision==0.22.1' \
+  --index-url https://download.pytorch.org/whl/cpu
+
+# Record the platform trio so later pip operations cannot replace it.
+cat > platform-constraints.txt <<'EOF'
+torch==2.7.1+cpu
+torch-npu==2.7.1.post4
+torchvision==0.22.1
+EOF
+export PLATFORM_CONSTRAINTS="$PWD/platform-constraints.txt"
+
+python -m pip install -c "$PLATFORM_CONSTRAINTS" \
+  'torch-npu==2.7.1.post4' --index-url https://pypi.org/simple
+python -c 'import torch, torch_npu, torchvision; print(torch.__version__, torch_npu.__version__, torchvision.__version__)'
+```
+
+This is a reference command for the one validated stack, not automatic hardware
+detection. Confirm the target machine's driver, CANN, Python and wheel
+compatibility before installing. If its approved versions differ, edit the
+constraints to those exact versions and follow the corresponding official
+PyTorch/TorchNPU installation instructions. A new Conda environment does not
+inherit packages from an administrator's Python.
+
+For a different platform stack, first have the engineer install its compatible
+PyTorch/torch_npu/torchvision trio using Huawei's official guidance. Then record
+those already-installed versions in `platform-constraints.txt` before installing
+project packages. Load the exact existing CANN installation selected by the
+engineer:
 
 ```bash
 # Replace the placeholder with the confirmed existing file.
@@ -49,17 +88,8 @@ git clone https://github.com/yangyuhang476959-sketch/uavflow-gam.git
 cd uavflow-gam
 export PROJECT_ROOT="$PWD"
 
-# EXAMPLE ONLY: previously validated Ascend 910B2 + CANN 9.0.0 stack.
-# Before executing, replace these pins with the receiving machine's actual
-# officially compatible PyTorch / torch_npu / torchvision versions, including
-# local version suffixes. Do not overwrite an existing engineer-provided file.
-cat > platform-constraints.txt <<'EOF'
-torch==2.7.1+cpu
-torch-npu==2.7.1.post4
-torchvision==0.22.1
-EOF
-
-export PLATFORM_CONSTRAINTS="$PWD/platform-constraints.txt"
+# Point this to the engineer's exact platform constraint file.
+export PLATFORM_CONSTRAINTS="${PLATFORM_CONSTRAINTS:-$PWD/platform-constraints.txt}"
 test -f "$PLATFORM_CONSTRAINTS"
 # Reference ONLY: previously validated 910B2/aarch64, CANN 9.0.0,
 # torch_npu 2.7.1.post4. Engineer must approve compatibility before running.

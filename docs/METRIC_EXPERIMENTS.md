@@ -1,4 +1,4 @@
-# Three maintained metric-depth experiments
+# Metric-depth experiment handoff
 
 Environment and data preparation remain in [NPU_SETUP.md](../NPU_SETUP.md)
 (Ascend) and [REMOTE_TRAINING.md](REMOTE_TRAINING.md) (NVIDIA). No installer,
@@ -7,11 +7,28 @@ is removed or changed by this release cleanup.
 
 ## Architecture and defaults
 
+The currently implemented entry points are not a Pure-Qwen four-run matrix.
+Use the table below to distinguish existing runnable jobs from the requested
+follow-up variants:
+
 | Entry | Model | Current geometry read | DA3 LoRA |
 |---|---|---|---|
 | `01_gam.py` | Local GAM/T5 + numeric pose baseline; F0/Ft context; future Predictor; one future deep view | None: preserve baseline | blocks 13–39, rank64/alpha128 |
 | `02_current_bank.py` | Native Qwen five-slot proposal + GAM future Predictor + residual correction | Future Action slots read Current patches by per-output-layer CA | blocks 13–39, rank64/alpha128 |
-| `03_rgbwarp.py` | Qwen proposal + predicted Current depth -> RGB warp -> shared Future DA3 + gated residual | Future patches read geometrically corresponding Current patches after blocks 19/27/33/39 | **all blocks 0–39**, rank64/alpha128 |
+| `03_rgbwarp.py` | Qwen proposal + predicted Current depth -> RGB warp -> shared Future DA3 + gated residual | Future patches read geometrically corresponding Current patches after blocks 19/27/33/39 | **all blocks 0–39**, rank64/alpha128; warp mode selectable |
+
+Requested handoff matrix and code status:
+
+| ID | Requested design | Current release status |
+|---|---|---|
+| 1 | Pure Qwen with the yaw-only numeric Pose Token | Not runnable here: the Qwen model definition is present, but its standalone training entry point is absent. Old Pure-Qwen checkpoints use the older `preprocessed` pose convention; they are not yaw-only-token runs. |
+| 2 | GAM/T5 metric-depth baseline | Runnable as `01_gam.py`; this is not Pure Qwen. |
+| 3 | Bilinear RGB-warp correction, all-block DA3 LoRA, proposal action tokens in Future DA3 | Runnable as `03_rgbwarp.py` with the explicit bilinear override below. |
+| 4 | Candidate 3 without proposal action tokens in Future DA3; residual based on warped-vs-real future feature discrepancy | Not implemented/runnable yet. The real future feature may supervise a residual target during training, but cannot be a test-time input; inference must predict the residual from available current/warped inputs. |
+
+`02_current_bank.py` remains an implemented comparison job (Qwen proposal +
+GAM Future Predictor and Current Bank CA), but is not a substitute for either
+the missing Pure-Qwen trainer or Candidate 4.
 
 All original DA3 weights and DPT stay frozen. Both correction variants have
 Current-depth supervision and enabled Current Bank reads, but these reads are
@@ -61,7 +78,7 @@ Aligned loss weights: Action3, Depth3; only GAM adds Feature1.
 - Gated residual merge is unchanged. Changed loss definitions/weights are not
   silently accepted as an exact resume of a previous loss configuration.
 
-Default **5 epochs**, constant LR, no warmup; batch4 per process, AdamW with
+Repository defaults are **5 epochs**, constant LR, no warmup; batch4 per process, AdamW with
 weight_decay0, grad_clip1. Predictor/Qwen/state LR=1e-5; DA3 LoRA=5e-5;
 action heads and new warp/read modules=5e-4. No model has been automatically
 started by this release update. Full-model GPU/NPU memory must be measured;
@@ -135,14 +152,25 @@ python experiments/metric_jobs/01_gam.py --print-config
 python experiments/metric_jobs/02_current_bank.py --print-config
 python experiments/metric_jobs/03_rgbwarp.py --print-config
 
-# Each is an independent single-process job:
-python experiments/metric_jobs/01_gam.py
-python experiments/metric_jobs/02_current_bank.py
-python experiments/metric_jobs/03_rgbwarp.py
-
-# One experiment across an eight-device node, global batch32:
+# Handoff runs: 10 epochs, the current cosine LR schedule, 500 warmup steps,
+# per-device batch4. Repository defaults above are not changed by these overrides.
+# (global batch32 on eight devices). Submit ONE command per eight-device node.
 python -m torch.distributed.run --standalone --nproc_per_node=8 \
-  experiments/metric_jobs/02_current_bank.py --set training.batch_size=4
+  experiments/metric_jobs/01_gam.py \
+  --set training.max_epochs=10 --set training.lr_schedule=cosine \
+  --set training.warmup_steps=500 --set training.batch_size=4
+
+python -m torch.distributed.run --standalone --nproc_per_node=8 \
+  experiments/metric_jobs/02_current_bank.py \
+  --set training.max_epochs=10 --set training.lr_schedule=cosine \
+  --set training.warmup_steps=500 --set training.batch_size=4
+
+# Candidate 3: explicitly use bilinear RGB warp; DA3 LoRA covers blocks 0–39.
+python -m torch.distributed.run --standalone --nproc_per_node=8 \
+  experiments/metric_jobs/03_rgbwarp.py \
+  --set training.max_epochs=10 --set training.lr_schedule=cosine \
+  --set training.warmup_steps=500 --set training.batch_size=4 \
+  --set model.rgbwarp_correction.warp_mode=bilinear
 
 # Real smoke: use a separate output directory; not a scientific run.
 OUTPUT_ROOT="$OUTPUT_ROOT/smoke" python experiments/metric_jobs/02_current_bank.py \
@@ -165,6 +193,15 @@ in the shared trainer. Validation normally runs every2000 steps (100 batches),
 checkpoint archives every epoch. RGB-warp best selection uses final action L1;
 old correction retains its existing weighted action selection. Changing a depth
 definition is a **new experiment**, not an exact continuation of a relative-depth run.
+
+## Handoff scope and priority
+
+Prioritize 3 and 4, as requested. Candidate 3 is executable now; Candidate 4
+needs an implementation before an honest runnable command can be supplied. The
+only current-cosine 10-epoch launch commands are for implemented entries above;
+the Pure-Qwen and Candidate-4 commands must not be fabricated from unrelated
+trainers. The real future feature is training-only supervision for Candidate 4,
+never an inference input. Repository defaults remain unchanged.
 
 ## Inference
 
