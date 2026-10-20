@@ -52,9 +52,13 @@ bound is applied. It is separate from Predictor feature-residual/CA gates.
 Old ungated or bounded checkpoints cannot silently resume as this new topology;
 the gate is saved in architecture state and optimized with the action-head group.
 
-RGB-warp now uses radius-1.5-pixel, nearest-K8 depth-sorted alpha-over, without
-RGB mass normalization. Its missing-coverage embedding receives detached
-`1-opacity`; patch correspondence follows positive alpha-over contributors.
+New RGB-warp runs default to **bilinear forward splatting**, matching the
+locally trained full-LoRA Bilinear experiment. The missing-coverage embedding
+uses the binary warp-valid mask, and patch correspondence follows the splat
+contributors. Alpha-over remains available with
+`--set model.rgbwarp_correction.warp_mode=alpha` (radius1.5, nearest-K8); its
+missing-coverage embedding uses detached `1-opacity`. Saved checkpoint modes
+remain authoritative; changing the new-run default does not convert checkpoints.
 DA3 action tokens are only projected VLM hidden states, with no proposal-value
 embedding. Candidate 2 already lacked that numeric embedding and is unchanged.
 See [dual_stream_rgbwarp.md](dual_stream_rgbwarp.md) for checkpoint compatibility
@@ -86,7 +90,7 @@ Aligned loss weights: Action3, Depth3; only GAM adds Feature1.
 - Gated residual merge is unchanged. Changed loss definitions/weights are not
   silently accepted as an exact resume of a previous loss configuration.
 
-Repository defaults are **5 epochs**, constant LR, no warmup; batch4 per process, AdamW with
+Repository defaults are **10 epochs**, constant LR, no warmup; batch4 per process, AdamW with
 weight_decay0, grad_clip1. Predictor/Qwen/state LR=1e-5; DA3 LoRA=5e-5;
 action heads and new warp/read modules=5e-4. No model has been automatically
 started by this release update. Full-model GPU/NPU memory must be measured;

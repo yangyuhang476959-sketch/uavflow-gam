@@ -59,10 +59,10 @@ def build_config(variant,extra=()):
             cfg.loss.action_refine_weight=.5
         cfg.loss.depth_scale_mode='fixed_metric'
         cfg.loss.depth_fixed_scale_meters=100.
-        cfg.training.max_epochs=5
     # Correction graphs can leave disabled/optional heads unused on any backend.
     cfg.training.find_unused_parameters = variant in {'current_bank', 'rgbwarp', 'rgbwarp_no_action'}
     cfg.training.gradient_accumulation_steps = 1
+    cfg.training.max_epochs = 10
     # Split the outer depth budget3 equally, like proposal/final action.
     cfg.loss.depth_linear_weight=1./3.
     cfg.loss.depth_log_weight=1./3.

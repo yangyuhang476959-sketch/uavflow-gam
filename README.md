@@ -50,7 +50,7 @@ Follow the manual Python/package, data preparation and smoke-test commands in
 workflow. This workflow does not install or modify Driver, Firmware or CANN.
 
 Choose one of the [three metric experiments](docs/METRIC_EXPERIMENTS.md).
-Defaults are **5 epochs, constant LR, no Stop phase**, per-process batch 4.
+Defaults are **10 epochs, constant LR, no Stop phase**, per-process batch 4.
 One distributed experiment per node is supported through the existing trainer;
 use explicit `--resume` with unchanged data/batch/world-size for exact continuation.
 

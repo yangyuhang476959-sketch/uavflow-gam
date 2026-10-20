@@ -79,7 +79,7 @@ python -m torch.distributed.run --standalone --nproc_per_node=8 experiments/metr
 Submit each line as an independent node job, not all three on one node.
 Run the data/runtime audit above first. Default per-device batch4 gives global32
 on eight devices; actual memory feasibility remains to be measured. Defaults
-are five epochs constant LR, no Stop. Resume explicitly with `--resume` and the
+are ten epochs constant LR, no Stop. Resume explicitly with `--resume` and the
 same world size/data/batch. Outputs are `$OUTPUT_ROOT/{gam,current_bank,rgbwarp}`.
 Exact loss/pose/readout differences are documented in
 [METRIC_EXPERIMENTS.md](METRIC_EXPERIMENTS.md).

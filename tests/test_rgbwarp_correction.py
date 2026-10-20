@@ -323,12 +323,12 @@ def test_entrypoint_explicit_defaults():
     assert cfg.model.dual_stream_rgbwarp_enabled and not cfg.model.support_aware_transport
     assert not cfg.model.use_fixed_first_frame and not cfg.model.stop_head_enabled
     assert cfg.stage1.qwen_numeric_pose_token
-    assert cfg.model.rgbwarp_correction.warp_mode=='alpha'
+    assert cfg.model.rgbwarp_correction.warp_mode=='bilinear'
     assert cfg.model.da3_lora.target_modules==['all-linear']
     assert cfg.loss.action_weight==3 and cfg.loss.depth_weight==3 and cfg.loss.feature_weight==0
     assert cfg.loss.action_direct_weight==cfg.loss.action_refine_weight==.5
     assert cfg.loss.depth_reconstruction=='l1'
-    assert cfg.training.max_epochs==5
+    assert cfg.training.max_epochs==10
 
 
 def test_numeric_state_hook_and_observation_only_service(monkeypatch):

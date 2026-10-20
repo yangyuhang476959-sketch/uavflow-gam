@@ -23,13 +23,14 @@ quality remain to be measured. CPU regression tests do not constitute NPU valida
    motions, convert body motion to camera motion by the configured extrinsic,
    and forward-splat current RGB using predicted current z-depth. Projection and
    accumulation are FP32; no GT action/depth drives the warp at train or test time.
-   The default rasterizer is finite-disk **alpha-over**, radius 1.5 target pixels,
-   nearest 8 points per pixel, gamma=1, black background. RGB is NOT divided by
-   accumulated mass; weak coverage stays weak. This is SynSin-inspired PyTorch
-   code, not a claimed exact reproduction of the author's renderer.
+   The default rasterizer is **bilinear forward splatting**, matching the locally
+   trained Bilinear experiment: four-neighbor bilinear weights, z-buffer visibility,
+   and RGB normalization by accumulated mass. Holes stay black. Optional
+   `warp_mode=alpha` selects radius1.5/nearest-K8 alpha-over without mass division.
 5. Feed warped RGB through the **same** DA3 again. A zero-initialized Conv14/14
-   embeds detached `1-opacity` (continuous missing coverage) and adds it to patch
-   embeddings before block 0. Coverage is geometric opacity, not learned confidence.
+   embeds the binary missing-coverage mask in Bilinear mode, or detached
+   `1-opacity` in optional Alpha mode, and adds it to patch embeddings before
+   block0. Coverage is geometric, not learned confidence.
    Five action tokens are **only projected Qwen hidden states** (LN + Linear);
    no proposal-value embedding is added. Numeric proposal values drive the RGB
    warp, not the action-token initialization. Existing GAM packing inserts them at the deep boundary:
@@ -41,7 +42,7 @@ quality remain to be measured. CPU regression tests do not constitute NPU valida
    output projection preserves the initial stream. Actions see updates through
    subsequent native SA; the last-block CA directly affects depth, not an already
    computed last-layer action hidden.
-   Effective front-to-back alpha weights affect warped RGB and visible pixel contributions,
+   Effective splat weights affect warped RGB and visible pixel contributions,
    but are **not** used as soft CA priors: the patch matrix is binary (at least
    one retained source-pixel contribution). Among allowed Current patches the
    read uses ordinary learned QK softmax. There is no extra XYZ-relative bias or
@@ -98,8 +99,8 @@ not proof that untouched DA3 outputs are already calibrated metric depths.
 Early depth-scale errors can therefore make early warps inaccurate. No GT-based
 per-sample scale fit is used to hide this train/test issue.
 
-Future loss gradients reach **proposal and predicted current depth** via RGB
-disk opacity and alpha-over weights. Frozen DPT remains in autograd. Pixel
+Future loss gradients reach **proposal and predicted current depth** via the differentiable
+RGB splat weights (bilinear by default, optional alpha-over). Frozen DPT remains in autograd. Pixel
 indexing, depth ordering, mask input and correspondence topology are detached: the warp is piecewise
 differentiable, not differentiable through appearance/disappearance decisions.
 At identity motion, constant RGB regions or full occlusion, useful warp gradients
@@ -118,12 +119,13 @@ Legacy four-channel pose-token checkpoints remain supported with progress off.
 - Default camera-to-body extrinsic is axis conversion only (CV right/down/forward
   to body forward/right/up), zero mounting offset. Override
   `heading_from_camera` when a calibrated offset is available; none is invented.
-- Project each source point into a radius-1.5-pixel disk, retain the nearest
-  8 points by target z, then use front-to-back alpha-over. Tied depths use stable
-  source-index ordering. Holes stay black; no triangle, dilation or hole filling.
-  No coverage normalization or numeric action-value embedding is used.
+- Default Bilinear mode splats into four neighboring pixels, applies z-buffer
+  visibility, and normalizes RGB by accumulated mass. Optional Alpha mode uses
+  radius1.5/nearest-K8 depth-sorted alpha-over without RGB mass normalization.
+  Holes stay black; no triangle, dilation or hole filling is used. Neither mode
+  adds a numeric action-value embedding.
 - Warp validity uses predicted current depth/motion only. Binary patch
-  correspondence records positive effective alpha contributions, excluding fully
+  correspondence records retained visible splat contributions, excluding fully
   occluded farther points; no GT future mask
   is used for attention or observation preprocessing.
 - Numeric state is the seven-channel relative pose/progress documented above,
@@ -156,7 +158,7 @@ torchrun --standalone --nproc_per_node=2 --module \
   experiments.uavflow_predictor_idm.rgbwarp_train --set training.batch_size=4
 ```
 
-Default: five epochs, constant LR, no warmup; per-process batch 4 (not a measured
+Default: ten epochs, constant LR, no warmup; per-process batch 4 (not a measured
 memory guarantee). Qwen LR 1e-5, DA3 LoRA 5e-5, heads/new modules 5e-4. BF16/FP32
 and GradScaler policy are inherited unchanged. Natural absorbing windows, no
 extra start/end repetition, same stratified split/seed as the handoff matrix.
@@ -205,11 +207,12 @@ real Qwen+DA3 forward/backward on the target accelerator is still required.
 
 ## Compatibility and verification
 
-Entry configs explicitly save `warp_mode=alpha`, `alpha_radius=1.5` and
-`alpha_points_per_pixel=8`. Architecture loading rejects old bilinear settings;
+New entry configs explicitly save `warp_mode=bilinear` and full DA3 LoRA
+`start_block=0`. Alpha remains available via an explicit override. Checkpoints
+retain their saved rasterizer: changing the new-run default does not convert
+Alpha checkpoints to Bilinear. Exact resume requires the saved architecture;
 old checkpoints containing removed `action_values` weights are not exact resumes.
-The prior bilinear function remains available for diagnostic comparisons, not
-as the new public job default. Optimizer/scaler/RNG/data cursor behavior is unchanged.
+The maintained runners default to10 epochs; batch settings remain configurable.
 
 CPU tests cover actual shared-backbone tiny-model forward/backward through
 future depth to proposal/current depth, exact training/probe alpha parity,

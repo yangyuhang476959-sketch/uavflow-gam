@@ -14,14 +14,14 @@ def build_config(extra=()):
     cfg.model.provenance_correction={}
     cfg.model.dual_stream_rgbwarp_enabled=True
     cfg.model.rgbwarp_correction={
-        'warp_mode':'alpha','alpha_radius':1.5,'alpha_points_per_pixel':8,
+        'warp_mode':'bilinear','alpha_radius':1.5,'alpha_points_per_pixel':8,
         'use_pixel_binary_mask':True,'use_correspondence_attention':True,
         'correspondence_layers':[19,27,33,39],'correspondence_width':256,'correspondence_heads':8,
         'depth_scale_meters':100.,'fov_degrees':90.}
     cfg.model.action_residual_gate_init=.1
     cfg.model.train_deep_backbone=False
     cfg.model.deep_lora.enabled=False
-    cfg.model.da3_lora={'enabled':True,'rank':64,'alpha':128.,'dropout':0.,'target_modules':['all-linear']}
+    cfg.model.da3_lora={'enabled':True,'start_block':0,'rank':64,'alpha':128.,'dropout':0.,'target_modules':['all-linear']}
     cfg.model.use_fixed_first_frame=False
     cfg.model.use_reference_type_embedding=False
     cfg.stage1.qwen_numeric_pose_token=True
@@ -43,6 +43,7 @@ def build_config(extra=()):
     cfg.loss.depth_grad_weight=1./3.
     cfg.loss.depth_semantic_weight=1.
     cfg.loss.depth_semantic_separate_weight=0.
+    cfg.training.max_epochs=10
     cfg.training.results_dir=str(Path(os.environ.get('OUTPUT_ROOT','results'))/'dual_stream_rgbwarp')
     return OmegaConf.merge(cfg,OmegaConf.from_dotlist(list(extra)))
 

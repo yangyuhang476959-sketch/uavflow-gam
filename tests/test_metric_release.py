@@ -19,7 +19,7 @@ def test_three_metric_release_contracts(variant,tmp_path,monkeypatch):
     assert cfg.dataset.visual_anchor_stride==5 and cfg.model.action_chunk_size==5
     assert not cfg.model.train_deep_backbone
     assert not cfg.model.stop_head_enabled and cfg.loss.stop_weight==0
-    assert cfg.training.max_epochs==5 and cfg.training.lr_schedule=='constant'
+    assert cfg.training.max_epochs==10 and cfg.training.lr_schedule=='constant'
     assert cfg.loss.action_weight==3 and cfg.loss.depth_weight==3
     assert cfg.loss.depth_linear_weight==cfg.loss.depth_log_weight==cfg.loss.depth_grad_weight==pytest.approx(1./3.)
     assert cfg.stage1.t5_model==str(tmp_path/'models/t5-base')
@@ -52,7 +52,7 @@ def test_three_metric_release_contracts(variant,tmp_path,monkeypatch):
         assert cfg.model.dual_stream_rgbwarp_enabled
         assert cfg.model.da3_lora.enabled and cfg.model.da3_lora.target_modules==['all-linear']
         assert cfg.model.rgbwarp_correction.use_correspondence_attention
-        assert cfg.model.rgbwarp_correction.warp_mode=='alpha'
+        assert cfg.model.rgbwarp_correction.warp_mode=='bilinear'
         assert cfg.model.rgbwarp_correction.alpha_radius==1.5
         assert cfg.model.rgbwarp_correction.alpha_points_per_pixel==8
         assert not cfg.model.deep_lora.enabled

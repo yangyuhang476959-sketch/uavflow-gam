@@ -350,8 +350,8 @@ experiments (Candidates 3/4); their existing names/filenames remain unchanged.
 
 The Pure-Qwen run uses its Pose Token/action-slot trainer and saves to
 `$OUTPUT_ROOT/01_pure_qwen_yaw4d`; the other runs save under their configured
-variant output directories. The GAM/correction repository defaults remain
-5 epochs constant LR, so the launch commands explicitly set 10. There is no
+variant output directories. All maintained runners now default to
+10 epochs constant LR; the launch commands retain explicit 10-epoch overrides. There is no
 Stop phase. To resume, use the same entry/world size/data/batch with
 `--resume /path/to/checkpoint.pt`. GAM/RGB-warp use the shared trainer and
 restore optimizer/scaler/RNG/data cursor; Pure-Qwen restores optimizer and

@@ -30,3 +30,19 @@ def test_accumulation_override_preserves_requested_total32_and_defaults():
         assert cfg.training.lr==baseline.training.lr
         assert cfg.training.lr_schedule==baseline.training.lr_schedule
     assert pure_qwen_config().training.gradient_accumulation_steps==1
+
+
+def test_ten_epoch_bilinear_defaults_match_local_warp_topology():
+    for variant in VARIANTS:
+        assert build_config(variant).training.max_epochs==10
+    assert pure_qwen_config().training.max_epochs==10
+    for variant in ('rgbwarp','rgbwarp_no_action'):
+        cfg=build_config(variant)
+        assert cfg.model.rgbwarp_correction.warp_mode=='bilinear'
+        assert cfg.model.da3_lora.start_block==0
+        assert cfg.model.da3_lora.rank==64 and cfg.model.da3_lora.alpha==128
+        assert cfg.model.rgbwarp_correction.use_pixel_binary_mask
+        assert cfg.model.rgbwarp_correction.use_correspondence_attention
+    alternate=build_config('rgbwarp',['model.rgbwarp_correction.warp_mode=alpha','training.max_epochs=2'])
+    assert alternate.model.rgbwarp_correction.warp_mode=='alpha'
+    assert alternate.training.max_epochs==2
