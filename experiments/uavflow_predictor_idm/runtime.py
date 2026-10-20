@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import itertools
 import math
 import os
 import time
@@ -393,3 +394,15 @@ def env_truthy(name: str, default: bool = False) -> bool:
     raise ValueError(
         f"{name} must be one of 1/0, true/false, yes/no, on/off; got {value!r}."
     )
+
+
+def optimizer_batches(loader, accumulation_steps, *, drop_incomplete=True):
+    """Group microbatches into updates; optionally retain a partial final group."""
+    if accumulation_steps < 1:
+        raise ValueError("gradient_accumulation_steps must be positive")
+    iterator = iter(loader)
+    while True:
+        group = list(itertools.islice(iterator, accumulation_steps))
+        if not group or (drop_incomplete and len(group) < accumulation_steps):
+            return
+        yield group

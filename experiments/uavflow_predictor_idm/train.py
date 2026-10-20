@@ -34,6 +34,7 @@ from experiments.uavflow_predictor_idm.runtime import (
     max_memory_allocated_gb,
     profile_phase,
     StepBenchmark,
+    optimizer_batches,
     step_generator,
 )
 
@@ -863,6 +864,7 @@ def main() -> None:
             "loss.depth_log_weight",
             "loss.depth_grad_weight",
             "training.batch_size",
+            "training.gradient_accumulation_steps",
             "training.amp_dtype",
             "training.direct_action_head_lr_mult",
             "training.predictor_lr_mult",
@@ -882,6 +884,9 @@ def main() -> None:
         for path in compatibility_paths:
             saved_value = nested_get(saved_cfg, path)
             current_value = nested_get(current_cfg, path)
+            if path == "training.gradient_accumulation_steps":
+                saved_value = 1 if saved_value is None else int(saved_value)
+                current_value = 1 if current_value is None else int(current_value)
             if path == "model.current_geometry_action_enabled":
                 # Checkpoints predating CA1_HB omit this disabled-by-default flag.
                 saved_value, current_value = bool(saved_value), bool(current_value)
@@ -995,6 +1000,9 @@ def main() -> None:
             gradient_as_bucket_view=True,
         )
 
+    accumulation_steps = int(cfg.training.get("gradient_accumulation_steps", 1))
+    if accumulation_steps < 1:
+        raise ValueError("gradient_accumulation_steps must be positive")
     train_sampler = (
         CursorDistributedSampler(
             train_set,
@@ -1004,7 +1012,7 @@ def main() -> None:
             seed=int(cfg.seed),
             resume_epoch=start_epoch,
             resume_batch=start_batch,
-            batch_size=int(cfg.training.batch_size),
+            batch_size=int(cfg.training.batch_size) * accumulation_steps,
         )
         if is_dist else None
     )
@@ -1192,7 +1200,9 @@ def main() -> None:
     samples_per_rank = (
         int(math.ceil(len(train_set) / float(world))) if is_dist else len(train_set)
     )
-    steps_per_epoch = samples_per_rank // int(cfg.training.batch_size)
+    steps_per_epoch = samples_per_rank // int(cfg.training.batch_size) // accumulation_steps
+    if steps_per_epoch < 1:
+        raise ValueError("Dataset is too small for one accumulated optimizer update")
     max_steps = (
         configured_epochs * steps_per_epoch
         if configured_epochs > 0
@@ -1208,7 +1218,9 @@ def main() -> None:
     if rank == 0:
         print(
             f"training_budget steps_per_epoch={steps_per_epoch} "
-            f"max_epochs={configured_epochs} max_steps={max_steps}",
+            f"max_epochs={configured_epochs} max_steps={max_steps} "
+            f"micro_batch={int(cfg.training.batch_size)} accumulation={accumulation_steps} "
+            f"global_batch={int(cfg.training.batch_size) * accumulation_steps * world}",
             flush=True,
         )
     def checkpoint_payload(saved_step: int, saved_epoch: int, saved_batch: int) -> dict:
@@ -1277,6 +1289,7 @@ def main() -> None:
             "pose_stats": pose_normalizer.state_dict() if pose_normalizer is not None else None,
             "optimizer": optimizer.state_dict(), "scaler": scaler.state_dict(),
             "config": cfg_dict,
+            "warp_health_state": health_guard.state_dict() if health_guard is not None else None,
             **({"action_normalizer": normalizer.state_dict()} if transport_enabled or provenance_enabled or rgbwarp_enabled else {}),
         }
 
@@ -1332,9 +1345,31 @@ def main() -> None:
     if profiler is not None:
         profiler.start()
     last_saved_step = start_step if args.resume else -1
+    health_cfg = cfg.training.get("warp_health", {}) or {}
+    health_guard = None
+    stop_reason = None
+    if rgbwarp_enabled and bool(health_cfg.get("enabled", False)):
+        from .training_health import WarpHealthGuard
+        health_guard = WarpHealthGuard(
+            patience=int(health_cfg.get("patience", 100)),
+            minimum_coverage=float(health_cfg.get("minimum_coverage", 0.001)),
+            collapse_fraction=float(health_cfg.get("collapse_fraction", 0.99)),
+        )
+    if health_guard is not None and args.resume:
+        guard_state = ckpt.get("warp_health_state")
+        if guard_state is None:
+            history = output / "health.jsonl"
+            if history.exists():
+                for line in reversed(history.read_text().splitlines()):
+                    record = json.loads(line)
+                    if int(record["step"]) == start_step:
+                        guard_state = record
+                        break
+        if guard_state is not None:
+            health_guard.load_state_dict(guard_state)
     pbar = tqdm(total=max_steps, initial=step, disable=rank != 0, desc="uav-predictor-idm")
     model.train()
-    while step < max_steps:
+    while step < max_steps and stop_reason is None:
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
         if hasattr(train_set, "set_epoch"):
@@ -1342,7 +1377,7 @@ def main() -> None:
         # With DDP, CursorDistributedSampler has already sliced away consumed
         # samples. Keep a logical (pre-slice) batch index for future checkpoints.
         resumed_batch_offset = start_batch if (is_dist and epoch == start_epoch) else 0
-        for batch_idx, batch in enumerate(train_loader):
+        for batch_idx, microbatches in enumerate(optimizer_batches(train_loader, accumulation_steps)):
             if not is_dist and epoch == start_epoch and batch_idx < start_batch:
                 continue
             logical_batch_idx = batch_idx + resumed_batch_offset
@@ -1363,118 +1398,176 @@ def main() -> None:
                 raise ValueError(f"Unsupported training.lr_schedule={lr_schedule!r}.")
             for group in optimizer.param_groups:
                 group["lr"] = lr * float(group.get("lr_multiplier", 1.0))
-            batch = move_batch(batch, device)
-            # Step-keyed randomness makes context sampling and augmentation
-            # bitwise resume-stable without serializing global CUDA RNG state.
-            batch_generator = step_generator(
-                accelerator, int(cfg.seed) + step * world + rank
-            )
-            augmented_sequence = temporal_color_augment(
-                torch.cat([
-                    batch["episode_first_image"][:, None],
-                    batch["all_view_images"],
-                ], dim=1),
-                OmegaConf.to_container(cfg.augmentation, resolve=True),
-                generator=batch_generator,
-            )
-            batch["episode_first_image"] = augmented_sequence[:, 0]
-            batch["all_view_images"] = augmented_sequence[:, 1:]
-            h = choose_context_length(
-                OmegaConf.to_container(cfg.model, resolve=True), device,
-                generator=batch_generator,
-            )
-            values = forward_batch(
-                model=model, da3=da3, text=text, normalizer=normalizer, batch=batch,
-                pose_normalizer=pose_normalizer,
-                context_len=h, rollout_steps=int(cfg.model.rollout_steps),
-                feature_horizon_weights=list(cfg.loss.feature_horizon_weights),
-                feature_patch_weight=float(cfg.loss.feature_patch_weight),
-                feature_cls_weight=float(cfg.loss.feature_cls_weight),
-                feature_register_weight=float(cfg.loss.feature_register_weight),
-                deep_feature_enabled=float(cfg.loss.get("deep_feature_weight", 0.0)) > 0.0,
-                deep_feature_patch_weight=float(cfg.loss.get("deep_feature_patch_weight", 1.0)),
-                deep_feature_cls_weight=float(cfg.loss.get("deep_feature_cls_weight", 0.25)),
-                stop_pos_weight=float(cfg.loss.get("stop_pos_weight", 1.0)),
-                action_direct_weight=float(cfg.loss.get("action_direct_weight", 1.0)),
-                action_refine_weight=float(cfg.loss.get("action_refine_weight", 1.0)),
-                dual_branch_action_aux_weight=float(
-                    cfg.loss.get("dual_branch_action_aux_weight", 0.5)
-                ),
-                amp=bool(cfg.training.amp),
-                amp_dtype=str(cfg.training.get("amp_dtype", "auto")),
-                depth_target_source=str(cfg.loss.get("depth_target_source", "ue_gt")),
-                depth_scale_mode=str(cfg.loss.get("depth_scale_mode", "per_frame_median")),
-                depth_target_mode=str(cfg.loss.get("depth_target_mode", "future")),
-                depth_fixed_scale_meters=float(cfg.loss.get("depth_fixed_scale_meters", 100.0)),
-                depth_scale_loss_weight=float(cfg.loss.get("depth_scale_loss_weight", 1.0)),
-                depth_linear_weight=float(cfg.loss.get("depth_linear_weight", 0.5)),
-                depth_log_weight=float(cfg.loss.get("depth_log_weight", 1.0)),
-                depth_log_epsilon_normalized=float(
-                    cfg.loss.get("depth_log_epsilon_normalized", 1e-6)
-                ),
-                depth_grad_weight=float(cfg.loss.get("depth_grad_weight", 1.0)),
-                depth_semantic_weight=float(cfg.loss.get("depth_semantic_weight", 3.0)),
-                depth_semantic_separate_weight=float(
-                    cfg.loss.get("depth_semantic_separate_weight", 0.0)
-                ),
-                depth_semantic_linear_weight=float(
-                    cfg.loss.get("depth_semantic_linear_weight", cfg.loss.get("depth_linear_weight", 0.5))
-                ),
-                depth_semantic_log_weight=float(
-                    cfg.loss.get("depth_semantic_log_weight", cfg.loss.get("depth_log_weight", 1.0))
-                ),
-                depth_semantic_grad_weight=float(
-                    cfg.loss.get("depth_semantic_grad_weight", cfg.loss.get("depth_grad_weight", 1.0))
-                ),
-                depth_gradient_mode=str(
-                    cfg.loss.get("depth_gradient_mode", "tolerant_log")
-                ),
-                depth_gradient_tolerance_pixels=int(
-                    cfg.loss.get("depth_gradient_tolerance_pixels", 2)
-                ),
-                conditioning_generator=batch_generator,
-            )
+            optimizer.zero_grad(set_to_none=True)
+            averaged_values = {}
+            averaged_loss = None
+            for micro_idx, batch in enumerate(microbatches):
+                batch = move_batch(batch, device)
+                # Step-keyed randomness makes context sampling and augmentation
+                # bitwise resume-stable without serializing global CUDA RNG state.
+                batch_generator = step_generator(
+                    accelerator, int(cfg.seed) + ((step - 1) * accumulation_steps + micro_idx + 1) * world + rank
+                )
+                augmented_sequence = temporal_color_augment(
+                    torch.cat([
+                        batch["episode_first_image"][:, None],
+                        batch["all_view_images"],
+                    ], dim=1),
+                    OmegaConf.to_container(cfg.augmentation, resolve=True),
+                    generator=batch_generator,
+                )
+                batch["episode_first_image"] = augmented_sequence[:, 0]
+                batch["all_view_images"] = augmented_sequence[:, 1:]
+                h = choose_context_length(
+                    OmegaConf.to_container(cfg.model, resolve=True), device,
+                    generator=batch_generator,
+                )
+                values = forward_batch(
+                    model=model, da3=da3, text=text, normalizer=normalizer, batch=batch,
+                    pose_normalizer=pose_normalizer,
+                    context_len=h, rollout_steps=int(cfg.model.rollout_steps),
+                    feature_horizon_weights=list(cfg.loss.feature_horizon_weights),
+                    feature_patch_weight=float(cfg.loss.feature_patch_weight),
+                    feature_cls_weight=float(cfg.loss.feature_cls_weight),
+                    feature_register_weight=float(cfg.loss.feature_register_weight),
+                    deep_feature_enabled=float(cfg.loss.get("deep_feature_weight", 0.0)) > 0.0,
+                    deep_feature_patch_weight=float(cfg.loss.get("deep_feature_patch_weight", 1.0)),
+                    deep_feature_cls_weight=float(cfg.loss.get("deep_feature_cls_weight", 0.25)),
+                    stop_pos_weight=float(cfg.loss.get("stop_pos_weight", 1.0)),
+                    action_direct_weight=float(cfg.loss.get("action_direct_weight", 1.0)),
+                    action_refine_weight=float(cfg.loss.get("action_refine_weight", 1.0)),
+                    dual_branch_action_aux_weight=float(
+                        cfg.loss.get("dual_branch_action_aux_weight", 0.5)
+                    ),
+                    amp=bool(cfg.training.amp),
+                    amp_dtype=str(cfg.training.get("amp_dtype", "auto")),
+                    depth_target_source=str(cfg.loss.get("depth_target_source", "ue_gt")),
+                    depth_scale_mode=str(cfg.loss.get("depth_scale_mode", "per_frame_median")),
+                    depth_target_mode=str(cfg.loss.get("depth_target_mode", "future")),
+                    depth_fixed_scale_meters=float(cfg.loss.get("depth_fixed_scale_meters", 100.0)),
+                    depth_scale_loss_weight=float(cfg.loss.get("depth_scale_loss_weight", 1.0)),
+                    depth_linear_weight=float(cfg.loss.get("depth_linear_weight", 0.5)),
+                    depth_log_weight=float(cfg.loss.get("depth_log_weight", 1.0)),
+                    depth_log_epsilon_normalized=float(
+                        cfg.loss.get("depth_log_epsilon_normalized", 1e-6)
+                    ),
+                    depth_grad_weight=float(cfg.loss.get("depth_grad_weight", 1.0)),
+                    depth_semantic_weight=float(cfg.loss.get("depth_semantic_weight", 3.0)),
+                    depth_semantic_separate_weight=float(
+                        cfg.loss.get("depth_semantic_separate_weight", 0.0)
+                    ),
+                    depth_semantic_linear_weight=float(
+                        cfg.loss.get("depth_semantic_linear_weight", cfg.loss.get("depth_linear_weight", 0.5))
+                    ),
+                    depth_semantic_log_weight=float(
+                        cfg.loss.get("depth_semantic_log_weight", cfg.loss.get("depth_log_weight", 1.0))
+                    ),
+                    depth_semantic_grad_weight=float(
+                        cfg.loss.get("depth_semantic_grad_weight", cfg.loss.get("depth_grad_weight", 1.0))
+                    ),
+                    depth_gradient_mode=str(
+                        cfg.loss.get("depth_gradient_mode", "tolerant_log")
+                    ),
+                    depth_gradient_tolerance_pixels=int(
+                        cfg.loss.get("depth_gradient_tolerance_pixels", 2)
+                    ),
+                    conditioning_generator=batch_generator,
+                )
+                weighted_action = float(cfg.loss.action_weight) * values["action"]
+                weighted_feature = float(cfg.loss.feature_weight) * values["feature"]
+                if "depth_global_weight" in cfg.loss or "depth_dynamic_weight" in cfg.loss:
+                    weighted_depth_global = float(
+                        cfg.loss.get("depth_global_weight", 0.0)
+                    ) * values["depth_global"]
+                    weighted_depth_dynamic = float(
+                        cfg.loss.get("depth_dynamic_weight", 0.0)
+                    ) * values["depth_semantic_total"]
+                else:
+                    weighted_depth_global = float(
+                        cfg.loss.get("depth_weight", 0.0)
+                    ) * values["depth"]
+                    weighted_depth_dynamic = values["depth"].new_zeros(())
+                loss = (
+                    weighted_action
+                    + weighted_feature
+                    + float(cfg.loss.get("deep_feature_weight", 0.0)) * values["deep_feature"]
+                    + float(cfg.loss.get("stop_weight", 0.0)) * values["stop"]
+                    + weighted_depth_global
+                    + weighted_depth_dynamic
+                    + float(cfg.loss.get("relative_pose_weight", 0.0))
+                    * values["relative_pose"]
+                    + float(cfg.loss.get("action_rollout_pose_weight", 0.0))
+                    * values["action_rollout_pose"]
+                    + float(cfg.loss.get("pose_consistency_weight", 0.0))
+                    * values["pose_consistency"]
+                    + float(cfg.loss.get("transport_geometry_weight", 1.0))
+                    * values.get("transport_geometry", values["action"].new_zeros(()))
+                    + float(transport_cfg.get("uncertainty_weight", 1.0))
+                    * values.get("completion_uncertainty_loss", values["action"].new_zeros(()))
+                )
+                if correction_mode == 'uncertain':
+                    loss = loss + float(correction_cfg.get('uncertainty_weight', 1.))*values['provenance_uncertainty_loss']
+                with profile_phase("R1/backward"):
+                    scaler.scale(loss / accumulation_steps).backward()
+                for key, value in values.items():
+                    if isinstance(value, torch.Tensor):
+                        detached = value.detach() / accumulation_steps
+                        averaged_values[key] = averaged_values.get(key, 0) + detached
+                detached_loss = loss.detach() / accumulation_steps
+                averaged_loss = detached_loss if averaged_loss is None else averaged_loss + detached_loss
+            values = averaged_values
+            loss = averaged_loss
             weighted_action = float(cfg.loss.action_weight) * values["action"]
             weighted_feature = float(cfg.loss.feature_weight) * values["feature"]
             if "depth_global_weight" in cfg.loss or "depth_dynamic_weight" in cfg.loss:
-                weighted_depth_global = float(
-                    cfg.loss.get("depth_global_weight", 0.0)
-                ) * values["depth_global"]
-                weighted_depth_dynamic = float(
-                    cfg.loss.get("depth_dynamic_weight", 0.0)
-                ) * values["depth_semantic_total"]
+                weighted_depth_global = float(cfg.loss.get("depth_global_weight", 0.0)) * values["depth_global"]
+                weighted_depth_dynamic = float(cfg.loss.get("depth_dynamic_weight", 0.0)) * values["depth_semantic_total"]
             else:
-                weighted_depth_global = float(
-                    cfg.loss.get("depth_weight", 0.0)
-                ) * values["depth"]
+                weighted_depth_global = float(cfg.loss.get("depth_weight", 0.0)) * values["depth"]
                 weighted_depth_dynamic = values["depth"].new_zeros(())
-            loss = (
-                weighted_action
-                + weighted_feature
-                + float(cfg.loss.get("deep_feature_weight", 0.0)) * values["deep_feature"]
-                + float(cfg.loss.get("stop_weight", 0.0)) * values["stop"]
-                + weighted_depth_global
-                + weighted_depth_dynamic
-                + float(cfg.loss.get("relative_pose_weight", 0.0))
-                * values["relative_pose"]
-                + float(cfg.loss.get("action_rollout_pose_weight", 0.0))
-                * values["action_rollout_pose"]
-                + float(cfg.loss.get("pose_consistency_weight", 0.0))
-                * values["pose_consistency"]
-                + float(cfg.loss.get("transport_geometry_weight", 1.0))
-                * values.get("transport_geometry", values["action"].new_zeros(()))
-                + float(transport_cfg.get("uncertainty_weight", 1.0))
-                * values.get("completion_uncertainty_loss", values["action"].new_zeros(()))
-            )
-            if correction_mode == 'uncertain':
-                loss = loss + float(correction_cfg.get('uncertainty_weight', 1.))*values['provenance_uncertainty_loss']
-            optimizer.zero_grad(set_to_none=True)
-            with profile_phase("R1/backward"):
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                grad = torch.nn.utils.clip_grad_norm_(
-                    trainable, float(cfg.training.grad_clip)
+            scaler.unscale_(optimizer)
+            grad = torch.nn.utils.clip_grad_norm_(trainable, float(cfg.training.grad_clip))
+            if health_guard is not None:
+                # Equal local batch sizes: averaging these pixel fractions across
+                # ranks represents the entire effective batch, not just rank 0.
+                health = torch.stack((
+                    values["rgbwarp_valid_ratio"].float(),
+                    values["rgbwarp_current_depth_zero_fraction"].float(),
+                    values["rgbwarp_current_depth_mean_m"].float(),
+                    (~(torch.isfinite(loss) & torch.isfinite(grad))).float(),
+                )).detach()
+                if is_dist:
+                    dist.all_reduce(health, op=dist.ReduceOp.SUM)
+                    health[:3] /= world
+                coverage, zero_fraction, depth_mean_m, bad_ranks = health.cpu().tolist()
+                stop_reason = health_guard.update(
+                    coverage=coverage, zero_fraction=zero_fraction,
+                    depth_mean_m=depth_mean_m, finite=bad_ranks == 0,
                 )
+                record = dict(step=step, warp_valid_ratio=coverage,
+                              current_depth_zero_fraction=zero_fraction,
+                              current_depth_mean_m=depth_mean_m,
+                              empty_steps=health_guard.empty_steps,
+                              collapsed_steps=health_guard.collapsed_steps,
+                              stop_reason=stop_reason)
+                if rank == 0:
+                    with (output / "health.jsonl").open("a") as handle:
+                        handle.write(json.dumps(record) + "\n")
+                if stop_reason is not None:
+                    # No optimizer update has happened for this observed batch.
+                    # Save the preceding completed step and its exact cursor.
+                    observed_step = step
+                    step -= 1
+                    if rank == 0:
+                        destination = save_numbered_checkpoint(step, epoch, logical_batch_idx)
+                        last_saved_step = step
+                        record.update(observed_step=observed_step, completed_steps=step,
+                                      checkpoint=str(destination))
+                        (output / "early_stop.json").write_text(json.dumps(record, indent=2) + "\n")
+                        print("\n[EARLY_STOP] " + json.dumps(record), flush=True)
+                    if is_dist:
+                        dist.barrier()
+                    break
             with profile_phase("R1/optimizer"):
                 scaler.step(optimizer); scaler.update()
             if profiler is not None:
@@ -1730,7 +1823,7 @@ def main() -> None:
                     save_numbered_checkpoint(step, epoch, logical_batch_idx + 1)
                     last_saved_step = step
                 break
-        if step >= max_steps:
+        if stop_reason is not None or step >= max_steps:
             break
         epoch += 1; start_batch = 0
         save_every_epochs = int(cfg.training.get("save_every_epochs", 0))

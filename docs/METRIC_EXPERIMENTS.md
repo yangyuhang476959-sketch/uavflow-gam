@@ -237,3 +237,52 @@ actions = output["actions_meters_radians"]  # [B,5,4]
 Images are float[0,1], shape `[B,1,3,224,224]`. New policies need no future GT
 image/depth/action. Loading old weights does not change their pose semantics.
 UE service integration and closed-loop accelerator runs remain separate checks.
+
+
+## Portable runtime recovery and gradient accumulation
+
+All metric runners and the standalone Pure-Qwen trainer accept
+`--set training.gradient_accumulation_steps=N` (default `1`, positive integer).
+`training.batch_size` remains the **per-device microbatch**; the effective
+optimizer batch is `batch_size * world_size * gradient_accumulation_steps`.
+Existing remote batch settings are unchanged. For example, total batch32 on
+2 devices can use per-device16/accumulation1, 8/2, or 4/4:
+
+```bash
+python -m torch.distributed.run --nproc_per_node=2 experiments/metric_jobs/03_rgbwarp.py \
+  --set training.batch_size=8 --set training.gradient_accumulation_steps=2
+```
+
+The same two overrides work with `01_gam.py`, `02_current_bank.py`,
+`04_rgbwarp_no_action.py`, and
+`python -m experiments.uavflow_qwen_pure.train`. They are independent of the
+accelerator backend. LR scheduling, validation/save intervals, and checkpoint
+`step`/`batch` cursors count **optimizer updates**, not microbatches. Startup logs
+print microbatch, accumulation, and effective global batch. Pure retains its
+partial final batch and weights unequal microbatches by valid action elements;
+the shared trainer drops incomplete accumulation groups.
+
+Resume retains optimizer/scaler state and seeks the sampler by effective
+per-device batch. Compatibility checks reject changed batch/accumulation
+settings; do not change these on resume without a verified cursor conversion.
+Older checkpoints without an accumulation setting mean accumulation1.
+The exact requested final-step checkpoint preserves the current epoch and
+next-update cursor rather than incorrectly advancing to the next epoch.
+
+Correction metric runners enable configurable DDP unused-parameter detection
+for optional/disabled heads. RGB-warp depth validation accepts both the released
+equal-weight linear/log/gradient recipe and the legacy no-log recipe. Explicit
+DA3 LoRA start blocks are honored in training and inference; omission defaults
+to block0 for RGB-warp. Camera pose composition/inversion uses FP32 even under
+BF16 autocast, with action gradients preserved. Predictor-free Warp startup
+logging no longer assumes `GAMFuturePredictor` attributes. Inference freezes all
+base DA3 parameters before enabling trained LoRA adapters, matching training.
+
+Optional `training.warp_health.enabled=true` records dual-rank coverage/depth
+health and stops before an invalid update. `patience` defaults to100 consecutive
+updates (recovery resets the counters), `minimum_coverage` to0.001, and
+`collapse_fraction` to0.99. Counters are saved/restored in checkpoints. This
+checks persistent empty warp or almost-all-zero current depth; it does not
+classify every temporary scale error as collapse. It is off unless enabled.
+No machine-specific shutdown, paths, batch tuning, or CUDA package changes are
+part of these portable fixes.

@@ -16,7 +16,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from experiments.uavflow_predictor_idm.runtime import (
     amp_dtype, bootstrap_accelerator_plugin, configure_accelerator,
-    distributed_info, manual_seed_all,
+    distributed_info, manual_seed_all, optimizer_batches,
 )
 bootstrap_accelerator_plugin()
 
@@ -48,6 +48,7 @@ def _cfg(max_trajectories=None):
     cfg.stage1.qwen_model=os.environ.get('QWEN_MODEL',str(model_root/'qwen3.5-2b'))
     cfg.model.pose_mode='numeric_token'
     cfg.training.batch_size=4
+    cfg.training.gradient_accumulation_steps=1
     cfg.training.max_epochs=10
     cfg.training.lr_schedule='constant'
     cfg.training.warmup_steps=0
@@ -107,6 +108,9 @@ def main():
     if args.set: cfg=OmegaConf.merge(cfg,OmegaConf.from_dotlist(args.set))
     if str(cfg.training.lr_schedule).lower()!='constant' or int(cfg.training.warmup_steps)!=0:
         raise ValueError('Pure-Qwen handoff uses constant LR and zero warmup; cosine is not supported here')
+    accumulation_steps=int(cfg.training.get('gradient_accumulation_steps',1))
+    if accumulation_steps < 1:
+        raise ValueError('gradient_accumulation_steps must be positive')
     if args.print_config:
         print(OmegaConf.to_yaml(cfg,resolve=True)); return
     distributed,rank,local_rank,world=distributed_info()
@@ -138,14 +142,14 @@ def main():
         checkpoint=torch.load(args.resume,map_location='cpu',weights_only=False)
         if checkpoint.get('format')!='uavflow_pure_qwen_yaw4d_v1':
             raise ValueError('Resume expects a Pure-Qwen yaw4d numeric-token checkpoint')
-        if checkpoint['train_size']!=train_set_size or checkpoint['world_size']!=world or checkpoint['batch_size']!=int(cfg.training.batch_size):
-            raise ValueError('Exact resume requires same train size, world size and per-device batch size')
+        if checkpoint['train_size']!=train_set_size or checkpoint['world_size']!=world or checkpoint['batch_size']!=int(cfg.training.batch_size) or int(checkpoint.get('gradient_accumulation_steps',1))!=accumulation_steps:
+            raise ValueError('Exact resume requires same train size, world size, per-device batch size and accumulation steps')
         model.load_trainable_state(checkpoint['trainable_state'])
         optimizer.load_state_dict(checkpoint['optimizer'])
         step=int(checkpoint['step']);start_epoch=int(checkpoint['epoch']);start_batch=int(checkpoint['batch'])
 
     train_sampler=CursorSampler(train_set,num_replicas=world,rank=rank,shuffle=True,seed=int(cfg.seed),
-        batch_size=int(cfg.training.batch_size),resume_epoch=start_epoch,resume_batch=start_batch)
+        batch_size=int(cfg.training.batch_size)*accumulation_steps,resume_epoch=start_epoch,resume_batch=start_batch)
     val_sampler=DistributedSampler(eval_set,num_replicas=world,rank=rank,shuffle=False) if world>1 else None
     workers=int(cfg.training.num_workers)
     train_loader=DataLoader(train_set,batch_size=int(cfg.training.batch_size),sampler=train_sampler,
@@ -160,11 +164,11 @@ def main():
     if rank==0:
         (output/'resolved_config.yaml').write_text(OmegaConf.to_yaml(cfg,resolve=True))
         (output/'meta.json').write_text(json.dumps({'world_size':world,'per_device_batch':int(cfg.training.batch_size),
-            'global_batch':world*int(cfg.training.batch_size),'train_size':len(train_set),'eval_size':len(eval_set),
+            'global_batch':world*int(cfg.training.batch_size)*accumulation_steps,'gradient_accumulation_steps':accumulation_steps,'train_size':len(train_set),'eval_size':len(eval_set),
             'trainable_parameters':trainable,'pose_mode':'numeric_token/evaluator_yaw4d',
             'lr_schedule':'constant','warmup_steps':0},indent=2))
         print(f'Pure-Qwen yaw4d train={len(train_set)} eval={len(eval_set)} world={world} '
-              f'per_device_batch={cfg.training.batch_size} trainable={trainable/1e6:.2f}M lr=constant '
+              f'per_device_batch={cfg.training.batch_size} accumulation={accumulation_steps} global_batch={world*int(cfg.training.batch_size)*accumulation_steps} trainable={trainable/1e6:.2f}M lr=constant '
               f'lora_lr={cfg.training.lora_lr} head_lr={cfg.training.head_lr}',flush=True)
 
     max_epochs=int(cfg.training.max_epochs)
@@ -174,32 +178,44 @@ def main():
         raw_model.train();raw_model.encoder.qwen.eval()
         logical_batch=start_batch if epoch==start_epoch else 0
         running=0.0
-        for batch in train_loader:
+        running_updates=0
+        for microbatches in optimizer_batches(train_loader,accumulation_steps,drop_incomplete=False):
             optimizer.zero_grad(set_to_none=True)
-            loss,_,_,_=_forward(model,batch,normalizer,device,True,amp_type)
-            loss.backward()
+            # Preserve Pure's partial last batch and weight unequal microbatches
+            # by their actual valid action-element counts.
+            counts=[int(b['action_loss_mask'][:,0].sum()) if 'action_loss_mask' in b
+                    else int(b['actions'][:,0].numel()) for b in microbatches]
+            denominator=max(1,sum(counts))
+            average=None
+            for batch,count in zip(microbatches,counts):
+                micro_loss,_,_,_=_forward(model,batch,normalizer,device,True,amp_type)
+                weighted=micro_loss*(count/denominator)
+                weighted.backward()
+                average=weighted.detach() if average is None else average+weighted.detach()
+            loss=average
+            running_updates+=1
             torch.nn.utils.clip_grad_norm_([p for p in raw_model.parameters() if p.requires_grad],1.0)
             optimizer.step();step+=1;logical_batch+=1;running+=float(loss.detach())
             if rank==0 and step%int(cfg.training.log_every)==0:
                 print(f'[step={step:07d}] epoch={epoch+1}/{max_epochs} action={float(loss.detach()):.6f} '
-                      f'epoch_mean_so_far={running/max(1,logical_batch):.6f}',flush=True)
+                      f'epoch_mean_so_far={running/max(1,running_updates):.6f}',flush=True)
             if step%int(cfg.training.save_every)==0:
                 if rank==0:
                     atomic_save({'format':'uavflow_pure_qwen_yaw4d_v1','trainable_state':raw_model.trainable_state(),
                         'optimizer':optimizer.state_dict(),'step':step,'epoch':epoch,'batch':logical_batch,
-                        'world_size':world,'batch_size':int(cfg.training.batch_size),'train_size':train_set_size,
+                        'world_size':world,'batch_size':int(cfg.training.batch_size),'gradient_accumulation_steps':accumulation_steps,'train_size':train_set_size,
                         'action_normalizer':normalizer.state_dict(),'config':OmegaConf.to_container(cfg,resolve=True)},output/'last.pt')
                 if distributed:dist.barrier()
         val=_eval(model,eval_loader,normalizer,device,amp_type,int(cfg.training.eval_max_batches))
         if rank==0:
             atomic_save({'format':'uavflow_pure_qwen_yaw4d_v1','trainable_state':raw_model.trainable_state(),
                 'optimizer':optimizer.state_dict(),'step':step,'epoch':epoch+1,'batch':0,
-                'world_size':world,'batch_size':int(cfg.training.batch_size),'train_size':train_set_size,
+                'world_size':world,'batch_size':int(cfg.training.batch_size),'gradient_accumulation_steps':accumulation_steps,'train_size':train_set_size,
                 'action_normalizer':normalizer.state_dict(),'config':OmegaConf.to_container(cfg,resolve=True),
                 'val_action_l1':val},output/f'epoch_{epoch+1:02d}.pt')
             atomic_save({'format':'uavflow_pure_qwen_yaw4d_v1','trainable_state':raw_model.trainable_state(),
                 'optimizer':optimizer.state_dict(),'step':step,'epoch':epoch+1,'batch':0,
-                'world_size':world,'batch_size':int(cfg.training.batch_size),'train_size':train_set_size,
+                'world_size':world,'batch_size':int(cfg.training.batch_size),'gradient_accumulation_steps':accumulation_steps,'train_size':train_set_size,
                 'action_normalizer':normalizer.state_dict(),'config':OmegaConf.to_container(cfg,resolve=True),
                 'val_action_l1':val},output/'last.pt')
             with (output/'train.log').open('a') as log:log.write(f'epoch={epoch+1} step={step} val_action_l1={val:.8f}\n')

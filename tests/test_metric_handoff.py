@@ -19,3 +19,14 @@ def test_pure_qwen_handoff_is_yaw4d_pose_token_and_constant_lr():
     assert cfg.model.pose_mode=='numeric_token'
     assert cfg.training.lr_schedule=='constant' and cfg.training.warmup_steps==0
     assert cfg.training.max_epochs==10 and cfg.training.batch_size==4
+
+
+def test_accumulation_override_preserves_requested_total32_and_defaults():
+    for variant in VARIANTS:
+        baseline=build_config(variant)
+        assert baseline.training.gradient_accumulation_steps==1
+        cfg=build_config(variant,['training.batch_size=8','training.gradient_accumulation_steps=2'])
+        assert 2*cfg.training.batch_size*cfg.training.gradient_accumulation_steps==32
+        assert cfg.training.lr==baseline.training.lr
+        assert cfg.training.lr_schedule==baseline.training.lr_schedule
+    assert pure_qwen_config().training.gradient_accumulation_steps==1

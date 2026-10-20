@@ -95,6 +95,12 @@ def forward_rgbwarp_batch(*,model,da3,text,normalizer,batch,context_len,rollout_
         raw_per_chunk_slot=raw_error.sum((0,1,3))/mask.float().sum((0,1,3)).clamp_min(1.),
         target_zero_slot_fraction=((target_raw.abs().amax(-1)<1e-8)&mask.any(-1)).float().mean(),
         **output['diagnostics'])
+    for branch, prediction_depth in [('current', current), ('future', future)]:
+        detached = prediction_depth.detach().float()
+        values[f'rgbwarp_{branch}_depth_mean_m'] = detached.mean() * scale
+        values[f'rgbwarp_{branch}_depth_zero_fraction'] = (detached <= 1e-6).float().mean()
+        values[f'rgbwarp_{branch}_depth_min_m'] = detached.amin() * scale
+        values[f'rgbwarp_{branch}_depth_max_m'] = detached.amax() * scale
     values['rgbwarp_proposal_loss']=proposal_loss.detach()
     values['rgbwarp_refine_loss']=refine_loss.detach()
     for branch,loss in [('current',curr_loss),('future',fut_loss)]:
