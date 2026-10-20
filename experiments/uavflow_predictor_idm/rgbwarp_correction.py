@@ -81,8 +81,12 @@ class RGBWarpCorrection(nn.Module):
             width=int(self.config.get('correspondence_width',256)),heads=int(self.config.get('correspondence_heads',8)))
             if self.config.get('use_correspondence_attention',True) else None)
         self.inject_proposal_action_tokens=bool(self.config.get('inject_proposal_action_tokens',True))
-        self.visual_residual_queries=(None if self.inject_proposal_action_tokens else
-            VisualResidualQueries(visual_dim,heads=int(self.config.get('visual_residual_heads',8)),chunk_size=5))
+        # Match GAM's learned action-slot initialization (std=0.02). These
+        # slots enter the same Future DA3 blocks as the VLM seeds in Candidate 3.
+        self.random_action_tokens=None
+        if not self.inject_proposal_action_tokens:
+            self.random_action_tokens=nn.Parameter(torch.empty(1,5,visual_dim))
+            nn.init.normal_(self.random_action_tokens,std=0.02)
         if float(self.config.get('depth_scale_meters',100.))<=0:raise ValueError('Positive depth scale required')
 
     def forward(self,model,current_rgb,language,denormalize,intrinsics=None):
@@ -110,34 +114,20 @@ class RGBWarpCorrection(nn.Module):
             invalid_mask=(1-warp['opacity'].detach() if self.warp_mode=='alpha' else (~warp['valid']).float())
                 if self.mask_projection is not None else None,
             mask_projection=self.mask_projection,gradient_checkpointing=model.deep_gradient_checkpointing)
-        if self.inject_proposal_action_tokens:
-            # Candidate 3: proposal action tokens enter Future DA3.
-            deep=da3.propagate_shallow_with_actions_grad(future_shallow,seed[:,None,None],
-                gradient_checkpointing=model.deep_gradient_checkpointing,decode_visuals=True,return_multi_level=True,
-                correspondence_read=self.correspondence,
-                correspondence_by_layer=observed.get('layer_patches',{}),
-                correspondence_mask=warp['correspondence'])
-            tokens=deep['action_tokens'].reshape(b,1,1,5,da3.embed_dim)
-        else:
-            # Candidate 4: Future DA3 is strictly visual-only. The Proposal
-            # affects it only through the differentiable RGB warp; lightweight
-            # readout queries consume the final patches after DA3 has finished.
-            deep=da3.propagate_shallow_visual_slots_grad(future_shallow,
-                gradient_checkpointing=model.deep_gradient_checkpointing,
-                return_layer_patches=True,layer_patch_indices=self.layers,
-                layer_patch_mode='current',
-                correspondence_read=self.correspondence,
-                correspondence_by_layer=observed.get('layer_patches',{}),
-                correspondence_mask=warp['correspondence'])
-            patches=deep['layer_patches'][max(self.layers)][:,0,0]
-            tokens=self.visual_residual_queries(patches)[:,None,None]
-            decoded_future=decode_levels(da3,deep['deep_levels'],1+int(da3.num_register_tokens))
-            deep.update(decoded_future)
+        future_actions=(seed if self.inject_proposal_action_tokens else
+                        self.random_action_tokens.expand(b,-1,-1).to(dtype=seed.dtype))
+        deep=da3.propagate_shallow_with_actions_grad(future_shallow,future_actions[:,None,None],
+            gradient_checkpointing=model.deep_gradient_checkpointing,decode_visuals=True,return_multi_level=True,
+            correspondence_read=self.correspondence,
+            correspondence_by_layer=observed.get('layer_patches',{}),
+            correspondence_mask=warp['correspondence'])
+        tokens=deep['action_tokens'].reshape(b,1,1,5,da3.embed_dim)
         z=model.parallel_action_correction_head(tokens)
         delta=model.gate_action_residual(z)
         diagnostics={'rgbwarp_valid_ratio':warp['valid'].float().mean().detach(),
                      'rgbwarp_correspondence_ratio':warp['correspondence'].float().mean().detach(),
-                     'rgbwarp_future_action_tokens':torch.tensor(float(self.inject_proposal_action_tokens),device=current_rgb.device)}
+                     'rgbwarp_future_action_tokens':torch.tensor(1.,device=current_rgb.device),
+                     'rgbwarp_future_vlm_action_tokens':torch.tensor(float(self.inject_proposal_action_tokens),device=current_rgb.device)}
         for i,axis in enumerate(('x','y','z','yaw')):
             diagnostics['rgbwarp_residual_abs_'+axis]=delta[...,i].abs().mean().detach()
             diagnostics['rgbwarp_residual_raw_abs_'+axis]=z[...,i].abs().mean().detach()

@@ -102,7 +102,7 @@ python scripts/verify_uavflow_remote.py \
 | 1 | Pure Qwen + yaw-only numeric Pose Token；5 个 Qwen action slots，不含 GAM/DA3 | `experiments/uavflow_qwen_pure/train.py` |
 | 2 | GAM/T5 + metric-depth baseline | `experiments/metric_jobs/01_gam.py` |
 | 3 | Bilinear RGB warp；Proposal Action Tokens 注入 Future DA3；DA3 全部 blocks 使用 LoRA | `experiments/metric_jobs/03_rgbwarp.py` |
-| 4 | 在 3 上不把 Proposal Action Tokens 输入 Future DA3；Future DA3 完成后用 5 个 readout queries 从视觉 patches 解码残差 | `experiments/metric_jobs/04_rgbwarp_no_action.py` |
+| 4 | 在 3 上将 Future DA3 的 VLM Action Tokens 换成按 GAM 规则随机初始化的 5 个可学习 Action Tokens（正态标准差 0.02），其余交互及残差头相同 | `experiments/metric_jobs/04_rgbwarp_no_action.py` |
 
 第 4 项的 proposal 仍通过可微 RGB warp 影响 Future 图像；策略推理不读取真实 future image/depth/action。`02_current_bank.py` 保留为额外对照，不属于这四项。优先级为 3、4。
 

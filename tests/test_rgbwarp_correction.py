@@ -206,35 +206,35 @@ def test_future_depth_gradient_through_warp_not_action_value_shortcut(monkeypatc
     assert not [n for n,p in net.named_parameters() if p.requires_grad and p.grad is None]
 
 
-def test_candidate4_keeps_future_da3_action_free_and_reads_its_patches(monkeypatch):
+def test_candidate4_injects_random_learned_slots_at_same_future_boundary(monkeypatch):
     net=make_model(corr=True,inject_actions=False).train()
     # The production correction decoder is zero-initialized; give it a
     # nonzero test projection so gradients can reach the preceding readout.
     with torch.no_grad():
         net.parallel_action_correction_head.decoder.output.weight.normal_(0,.01)
-    captured={'visual':0,'action':0}
-    original_visual=net.da3.propagate_shallow_visual_slots_grad
-    def visual_only(shallow,**kwargs):
-        captured['visual']+=1
-        return original_visual(shallow,**kwargs)
-    def forbidden_action(*args,**kwargs):
-        captured['action']+=1
-        raise AssertionError('Candidate 4 must not inject proposal Action Tokens into Future DA3')
-    monkeypatch.setattr(net.da3,'propagate_shallow_visual_slots_grad',visual_only)
-    monkeypatch.setattr(net.da3,'propagate_shallow_with_actions_grad',forbidden_action)
+    captured={}
+    original=net.da3.propagate_shallow_with_actions_grad
+    def with_actions(shallow,actions,**kwargs):
+        captured['actions']=actions
+        return original(shallow,actions,**kwargs)
+    monkeypatch.setattr(net.da3,'propagate_shallow_with_actions_grad',with_actions)
     result,slots=run(net)
-    assert captured=={'visual':2,'action':0}  # Current depth pass + visual-only Future pass.
+    learned=net.rgbwarp_correction.random_action_tokens
+    torch.testing.assert_close(captured['actions'],learned[:,None,None])
+    assert 0.01 < learned.detach().std() < 0.04
+    assert torch.autograd.grad(captured['actions'].sum(),slots,allow_unused=True)[0] is None
     assert result['actions_norm'].shape==(1,1,5,4)
-    assert result['deep_joint_features']['depth'].shape==(1,224,224)
-    assert result['diagnostics']['rgbwarp_future_action_tokens'].item()==0
+    assert result['deep_joint_features']['depth'].shape==(1,1,224,224)
+    assert result['diagnostics']['rgbwarp_future_action_tokens'].item()==1
+    assert result['diagnostics']['rgbwarp_future_vlm_action_tokens'].item()==0
     # Geometry depth still differentiates through Proposal -> bilinear RGB warp
-    # -> visual-only Future DA3; proposal tokens are only used for the proposal.
+    # -> Future DA3; random learned slots supply the correction token content.
     result['deep_joint_features']['depth'].square().mean().backward(retain_graph=True)
     assert slots.grad is not None and torch.isfinite(slots.grad).all()
     net.zero_grad(set_to_none=True)
     result['actions_norm'].square().mean().backward()
-    assert net.rgbwarp_correction.visual_residual_queries.queries.grad is not None
-    assert torch.isfinite(net.rgbwarp_correction.visual_residual_queries.queries.grad).all()
+    assert learned.grad is not None and torch.isfinite(learned.grad).all()
+    assert learned.grad.abs().sum()>0
 
 
 def test_fixed_target_objective_and_eval_proposal_final_metrics(monkeypatch):

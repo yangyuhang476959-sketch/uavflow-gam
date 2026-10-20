@@ -1,4 +1,4 @@
-"""Candidate 4: bilinear RGB warp, with no proposal action tokens in Future DA3."""
+"""Candidate 4: RGB warp with GAM-style random learned Future DA3 action slots."""
 import sys
 from pathlib import Path
 
