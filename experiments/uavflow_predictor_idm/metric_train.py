@@ -12,14 +12,18 @@ from .rgbwarp_train import build_config as rgbwarp_config
 from experiments.uavflow_remote_ablation.matrix_v2 import overrides
 
 
-VARIANTS=('gam','current_bank','rgbwarp')
+VARIANTS=('gam','current_bank','rgbwarp','rgbwarp_no_action')
 
 
 def build_config(variant,extra=()):
     if variant not in VARIANTS:
         raise ValueError(f'Choose one of {VARIANTS}')
-    if variant=='rgbwarp':
+    if variant in {'rgbwarp','rgbwarp_no_action'}:
         cfg=rgbwarp_config()
+        if variant=='rgbwarp_no_action':
+            cfg.model.rgbwarp_correction.inject_proposal_action_tokens=False
+            cfg.model.rgbwarp_correction.visual_residual_heads=8
+            cfg.training.results_dir=str(Path(os.environ.get('OUTPUT_ROOT','results/metric_release'))/variant)
     else:
         cfg=correction_config('pure')
         cfg.model.provenance_correction={}

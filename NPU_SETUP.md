@@ -314,20 +314,42 @@ new validation claim for these metric-depth/LoRA variants.
 
 ## 4. Run, resume and validate
 
-Choose one of [the three metric-depth experiments](docs/METRIC_EXPERIMENTS.md),
-one experiment per eight-NPU node. Example Current Bank correction:
+Run each of the four jobs in the [metric-depth experiment handoff](docs/METRIC_EXPERIMENTS.md)
+as an independent eight-NPU job. Each uses 10 epochs, constant LR, no warmup,
+per-device batch4 (global batch32):
 
 ```bash
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-python -m torch.distributed.run --standalone --nproc_per_node=8 \
-  experiments/metric_jobs/02_current_bank.py --set training.batch_size=4
+torchrun --standalone --nproc_per_node=8 experiments/uavflow_qwen_pure/train.py \
+  --set training.max_epochs=10 --set training.lr_schedule=constant \
+  --set training.warmup_steps=0 --set training.batch_size=4
+
+torchrun --standalone --nproc_per_node=8 experiments/metric_jobs/01_gam.py \
+  --set training.max_epochs=10 --set training.lr_schedule=constant \
+  --set training.warmup_steps=0 --set training.batch_size=4
+
+torchrun --standalone --nproc_per_node=8 experiments/metric_jobs/03_rgbwarp.py \
+  --set training.max_epochs=10 --set training.lr_schedule=constant \
+  --set training.warmup_steps=0 --set training.batch_size=4 \
+  --set model.rgbwarp_correction.warp_mode=bilinear
+
+torchrun --standalone --nproc_per_node=8 experiments/metric_jobs/04_rgbwarp_no_action.py \
+  --set training.max_epochs=10 --set training.lr_schedule=constant \
+  --set training.warmup_steps=0 --set training.batch_size=4 \
+  --set model.rgbwarp_correction.warp_mode=bilinear
 ```
 
-Defaults: 5 epochs constant LR, no Stop phase. Outputs are
-`$OUTPUT_ROOT/{gam,current_bank,rgbwarp}`. To resume, use the same entry/world
-size/data/batch with `--resume /path/to/checkpoint.pt`; optimizer/scaler/RNG/data
-cursor restoration stays in the shared trainer. Validation normally runs every
-2,000 steps with 100 batches; epoch checkpoint archives are enabled.
+The Pure-Qwen run uses its Pose Token/action-slot trainer and saves to
+`$OUTPUT_ROOT/01_pure_qwen_yaw4d`; the other runs save under their configured
+variant output directories. The GAM/correction repository defaults remain
+5 epochs constant LR, so the launch commands explicitly set 10. There is no
+Stop phase. To resume, use the same entry/world size/data/batch with
+`--resume /path/to/checkpoint.pt`. GAM/RGB-warp use the shared trainer and
+restore optimizer/scaler/RNG/data cursor; Pure-Qwen restores optimizer and
+sampler cursor from its own checkpoint (BF16, so no GradScaler). Pure-Qwen
+worker-side random image crops may differ after resume. Shared-trainer
+validation normally runs every 2,000 steps with 100 batches; epoch checkpoint
+archives are enabled.
 
 Standalone full validation, using the saved configuration:
 

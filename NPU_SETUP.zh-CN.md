@@ -95,35 +95,40 @@ python scripts/verify_uavflow_remote.py \
 
 ## 4. 训练命令与实验优先级
 
-先区分请求的四项和仓库中实际可运行的入口：
+四个实验都已提供独立入口。每个作业使用 8 卡、每卡 batch4（global batch32）、10 epoch，学习率全程 constant，不做 warmup：
 
-| ID | 实验设计 | 当前仓库状态 |
+| ID | 实验设计 | 入口 |
 |---|---|---|
-| 1 | Pure Qwen + yaw-only numeric Pose Token | 暂不可运行：有 Qwen 模型定义，但缺独立训练入口。旧 Pure-Qwen checkpoint 使用旧 `preprocessed` pose 约定，不是 yaw-only-token 实验。 |
-| 2 | GAM/T5 + metric-depth baseline | 可运行：`01_gam.py`；它不是 Pure Qwen。 |
-| 3 | Bilinear RGB-warp correction；proposal action tokens 进入 Future DA3；DA3 全部 blocks 使用 LoRA | 可运行：`03_rgbwarp.py`，命令显式覆盖为 bilinear。 |
-| 4 | 在 3 上移除 Future DA3 的 proposal action tokens；残差目标来自 warp 与真实 future feature 的差异 | 尚未实现，不能给可执行命令。真实 future feature 只能作训练监督目标，不能成为闭环推理输入；推理时残差必须由当前可用的 current/warp 信息预测。 |
+| 1 | Pure Qwen + yaw-only numeric Pose Token；5 个 Qwen action slots，不含 GAM/DA3 | `experiments/uavflow_qwen_pure/train.py` |
+| 2 | GAM/T5 + metric-depth baseline | `experiments/metric_jobs/01_gam.py` |
+| 3 | Bilinear RGB warp；Proposal Action Tokens 注入 Future DA3；DA3 全部 blocks 使用 LoRA | `experiments/metric_jobs/03_rgbwarp.py` |
+| 4 | 在 3 上不把 Proposal Action Tokens 输入 Future DA3；Future DA3 完成后用 5 个 readout queries 从视觉 patches 解码残差 | `experiments/metric_jobs/04_rgbwarp_no_action.py` |
 
-现有 `02_current_bank.py`（Qwen proposal + GAM Future Predictor + Current Bank CA）保留为额外对照，不等同于缺失的 Pure-Qwen 训练器或第 4 项。实验优先级按你的要求为 3、4。
+第 4 项的 proposal 仍通过可微 RGB warp 影响 Future 图像；策略推理不读取真实 future image/depth/action。`02_current_bank.py` 保留为额外对照，不属于这四项。优先级为 3、4。
 
-8 卡、每卡 batch4（全局 batch32），10 epoch、cosine、warmup 500。每条命令作为独立作业提交：
+每条命令作为独立作业提交。4 个作业都是 10 epoch、constant LR、warmup 0；每卡 batch4、8 卡共 global batch32：
 
 ```bash
 export OUTPUT_ROOT="$OUTPUT_ROOT/metric_release"
 export UAVFLOW_ACCELERATOR=npu
 
-torchrun --standalone --nproc_per_node=8 experiments/metric_jobs/01_gam.py \
-  --set training.max_epochs=10 --set training.lr_schedule=cosine \
-  --set training.warmup_steps=500 --set training.batch_size=4
+torchrun --standalone --nproc_per_node=8 experiments/uavflow_qwen_pure/train.py \
+  --set training.max_epochs=10 --set training.lr_schedule=constant \
+  --set training.warmup_steps=0 --set training.batch_size=4
 
-torchrun --standalone --nproc_per_node=8 experiments/metric_jobs/02_current_bank.py \
-  --set training.max_epochs=10 --set training.lr_schedule=cosine \
-  --set training.warmup_steps=500 --set training.batch_size=4
+torchrun --standalone --nproc_per_node=8 experiments/metric_jobs/01_gam.py \
+  --set training.max_epochs=10 --set training.lr_schedule=constant \
+  --set training.warmup_steps=0 --set training.batch_size=4
 
 torchrun --standalone --nproc_per_node=8 experiments/metric_jobs/03_rgbwarp.py \
-  --set training.max_epochs=10 --set training.lr_schedule=cosine \
-  --set training.warmup_steps=500 --set training.batch_size=4 \
+  --set training.max_epochs=10 --set training.lr_schedule=constant \
+  --set training.warmup_steps=0 --set training.batch_size=4 \
+  --set model.rgbwarp_correction.warp_mode=bilinear
+
+torchrun --standalone --nproc_per_node=8 experiments/metric_jobs/04_rgbwarp_no_action.py \
+  --set training.max_epochs=10 --set training.lr_schedule=constant \
+  --set training.warmup_steps=0 --set training.batch_size=4 \
   --set model.rgbwarp_correction.warp_mode=bilinear
 ```
 
-仓库默认仍为 5 epoch constant；以上命令覆盖为本次交接的 10 epoch cosine。历史 R1 benchmark 不等于这三个新模型已完成 8 卡性能验证。Candidate 4 尚未实现，暂时不能提交其训练命令。
+仓库中 GAM/校正模型默认仍为 5 epoch constant；命令明确覆盖为 10 epoch，学习率不衰减且无 warmup。历史 R1 benchmark 不等于这些新实验已完成 8 卡性能验证。

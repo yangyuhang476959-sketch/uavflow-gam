@@ -1950,6 +1950,9 @@ class DA3GiantEncoder(nn.Module):
         return_layer_patches: bool = False,
         layer_patch_indices: Optional[Sequence[int]] = None,
         layer_patch_mode: str = "concat",
+        correspondence_read=None,
+        correspondence_by_layer=None,
+        correspondence_mask=None,
     ) -> Dict[str, object]:
         """Resume frozen DA3 from the pre-global boundary without action tokens.
 
@@ -1985,6 +1988,8 @@ class DA3GiantEncoder(nn.Module):
             raise ValueError(f"Invalid shallow token count {n_tokens} (patches={num_patches}).")
 
         total_views = int(steps) * int(views)
+        if correspondence_read is not None and total_views != 1:
+            raise ValueError("Correspondence reads in the visual-only DA3 path currently require H1/V1")
         trans = self.backbone.pretrained
         backbone_dtype = next(self.backbone.parameters()).dtype
         current_x = visual_tokens.reshape(b, total_views, n_tokens, dim).to(backbone_dtype).clone()
@@ -2003,6 +2008,8 @@ class DA3GiantEncoder(nn.Module):
         )
         deep_by_layer: Dict[int, torch.Tensor] = {}
         layer_patches = {}
+        correspondence_by_layer = correspondence_by_layer or {}
+        patch_start = 1 + num_register_tokens
         start_block = int(trans.alt_start)
         if start_block < 0:
             raise ValueError("DA3 backbone has no alt_start; cannot resume shallow boundary.")
@@ -2041,6 +2048,15 @@ class DA3GiantEncoder(nn.Module):
                 current_x = trans.process_attention(
                     current_x, block, attn_type=attn_type, pos=pos_emb
                 )
+            if correspondence_read is not None and i in correspondence_by_layer:
+                patches=current_x[:,:,patch_start:].reshape(b,num_patches,dim)
+                memory=correspondence_by_layer[i][:,0,0]
+                def corr_step(q,kv,layer=i):
+                    return correspondence_read(q,kv,correspondence_mask,layer)
+                patches=(torch_checkpoint(corr_step,patches,memory,use_reentrant=False)
+                         if bool(gradient_checkpointing) and torch.is_grad_enabled() and current_x.requires_grad
+                         else corr_step(patches,memory))
+                current_x=torch.cat((current_x[:,:,:patch_start],patches.reshape(b,total_views,num_patches,dim)),2)
             if attn_type == "local":
                 local_x = current_x
             if return_layer_patches and (
