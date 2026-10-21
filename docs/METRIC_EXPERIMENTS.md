@@ -356,3 +356,28 @@ Inference reads the saved model settings. To start a legacy-layout comparison
 from scratch, explicitly set the corresponding flag false. New defaults apply
 to new runs; they do not retrofit running processes or previous experiment
 results. Existing local training is not changed by this release.
+
+
+## One-percent full validation for new runs
+
+All five maintained candidates now default to `dataset.eval_ratio=0.01` and
+`training.eval_max_batches=0`. The ratio selects held-out episodes, rather
+than exactly one percent of windows; class rounding can change the exact
+window proportion. The existing split seed and stratification are retained.
+Every scheduled validation evaluates the entire resulting held-out dataset.
+Validation frequency is unchanged.
+
+Full distributed validation uses exact non-padding shards: every window is
+counted once, including the final partial batch. Results are reduced across
+ranks. Evaluation bypasses DDP forward buffer broadcasts on the already
+synchronized model, so uneven shard batch counts cannot deadlock. Stage-2
+metrics expose `H1_evaluated_windows`; Pure logs the full-validation window
+count. Explicit positive `eval_max_batches` overrides still allow bounded
+monitoring with the historical sampler behavior.
+
+Changing the split also changes the training dataset and is not an exact
+resume of a five-percent-split checkpoint. Existing running jobs and their
+saved splits are untouched. To continue such a run, explicitly retain its
+original `dataset.eval_ratio=0.05`; `eval_max_batches=0` can still evaluate
+that entire original validation set. Validation scores from different splits
+are not directly comparable.

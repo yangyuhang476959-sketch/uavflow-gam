@@ -12,7 +12,7 @@ import torch
 import torch.distributed as dist
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
+from experiments.uavflow_predictor_idm.eval_sampler import evaluation_sampler
 
 from experiments.uavflow_predictor_idm.runtime import (
     amp_dtype, bootstrap_accelerator_plugin, configure_accelerator,
@@ -61,7 +61,7 @@ def _cfg(max_trajectories=None):
     cfg.training.num_workers=4
     cfg.training.log_every=25
     cfg.training.save_every=1000
-    cfg.training.eval_max_batches=100
+    cfg.training.eval_max_batches=0
     cfg.training.results_dir=str(Path(os.environ.get('OUTPUT_ROOT','results/metric_release'))/'01_pure_qwen_yaw4d')
     return cfg
 
@@ -90,6 +90,7 @@ def _forward(model,batch,normalizer,device,amp_enabled,amp_type):
 
 
 def _eval(model,loader,normalizer,device,amp_type,limit):
+    model=model.module if hasattr(model,'module') else model
     model.eval(); model.encoder.qwen.eval()
     sums=torch.zeros(2,device=device)
     with torch.no_grad():
@@ -163,7 +164,8 @@ def main():
 
     train_sampler=CursorSampler(train_set,num_replicas=world,rank=rank,shuffle=True,seed=int(cfg.seed),
         batch_size=int(cfg.training.batch_size)*accumulation_steps,resume_epoch=start_epoch,resume_batch=start_batch)
-    val_sampler=DistributedSampler(eval_set,num_replicas=world,rank=rank,shuffle=False) if world>1 else None
+    val_sampler=evaluation_sampler(eval_set,world=world,rank=rank,
+        max_batches=int(cfg.training.eval_max_batches),shuffle=False,seed=int(cfg.seed))
     workers=int(cfg.training.num_workers)
     train_loader=DataLoader(train_set,batch_size=int(cfg.training.batch_size),sampler=train_sampler,
         shuffle=False,num_workers=workers,pin_memory=accelerator.kind=='cuda',drop_last=False)
@@ -234,7 +236,9 @@ def main():
                 'action_normalizer':normalizer.state_dict(),'config':OmegaConf.to_container(cfg,resolve=True),
                 'val_action_l1':val},output/'last.pt')
             with (output/'train.log').open('a') as log:log.write(f'epoch={epoch+1} step={step} val_action_l1={val:.8f}\n')
-            print(f'[epoch={epoch+1:02d}] val_action_l1={val:.6f}',flush=True)
+            print(f'[epoch={epoch+1:02d}] val_action_l1={val:.6f} '
+                  f'full_validation={int(cfg.training.eval_max_batches)<=0} '
+                  f'validation_windows={len(eval_set) if int(cfg.training.eval_max_batches)<=0 else "bounded"}',flush=True)
         if distributed:dist.barrier()
         start_batch=0
     if distributed:dist.destroy_process_group()

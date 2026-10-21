@@ -19,6 +19,7 @@ from torch.utils.data import ConcatDataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
+from experiments.uavflow_predictor_idm.eval_sampler import evaluation_sampler
 from experiments.uavflow_predictor_idm.runtime import (
     apply_overrides,
     amp_dtype,
@@ -778,6 +779,7 @@ def main() -> None:
             "model.pose_progress_enabled",
             "stage1.qwen_pose_progress_enabled",
             "dataset.split_file",
+            "dataset.eval_ratio",
             "dataset.real_root",
             "dataset.sim_root",
             "dataset.mixture_weights",
@@ -895,6 +897,9 @@ def main() -> None:
             current_value = nested_get(current_cfg, path)
             if path in {"training.current_geometry_head_lr", "model.current_geometry_zero_init", "model.current_geometry_qk_norm"}:
                 saved_value, current_value = bool(saved_value), bool(current_value)
+            if path == "dataset.eval_ratio":
+                saved_value = float(0.05 if saved_value is None else saved_value)
+                current_value = float(0.05 if current_value is None else current_value)
             if path == "training.gradient_accumulation_steps":
                 saved_value = 1 if saved_value is None else int(saved_value)
                 current_value = 1 if current_value is None else int(current_value)
@@ -1032,17 +1037,10 @@ def main() -> None:
         )
         if is_dist else None
     )
-    # A bounded evaluation must not consume the Real-first ConcatDataset prefix
-    # (which previously contained zero Sim windows).  A fixed shuffled sampler
-    # gives every evaluation the same deterministic subset over all physical
-    # validation windows and both domains.
-    eval_sampler = (
-        DistributedSampler(
-            eval_set, num_replicas=world, rank=rank, shuffle=True,
-            seed=int(cfg.seed), drop_last=False,
-        )
-        if is_dist else None
-    )
+    # Full validation shards never pad/repeat examples. Bounded monitoring
+    # retains the historical fixed shuffled subset.
+    eval_sampler = evaluation_sampler(eval_set,world=world,rank=rank,
+        max_batches=int(cfg.training.eval_max_batches),shuffle=True,seed=int(cfg.seed))
     train_loader = DataLoader(
         train_set, batch_size=int(cfg.training.batch_size), sampler=train_sampler,
         shuffle=train_sampler is None, num_workers=int(cfg.training.num_workers),
@@ -1060,13 +1058,9 @@ def main() -> None:
     # degradation can be measured without Real/Sim mixture bias.
     eval_domain_loaders: dict[str, DataLoader] = {}
     for domain_index, (domain_name, domain_set) in enumerate(eval_domain_sets.items()):
-        domain_sampler = (
-            DistributedSampler(
-                domain_set, num_replicas=world, rank=rank, shuffle=True,
-                seed=int(cfg.seed) + 1000 + domain_index, drop_last=False,
-            )
-            if is_dist else None
-        )
+        domain_sampler = evaluation_sampler(domain_set,world=world,rank=rank,
+            max_batches=int(cfg.training.eval_max_batches),shuffle=True,
+            seed=int(cfg.seed)+1000+domain_index)
         eval_domain_loaders[domain_name] = DataLoader(
             domain_set,
             batch_size=int(cfg.training.batch_size),

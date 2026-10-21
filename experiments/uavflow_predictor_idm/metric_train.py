@@ -76,6 +76,8 @@ def build_config(variant,extra=()):
     cfg.loss.depth_semantic_grad_weight=1./3.
     # All new pose-token runs use the online yaw4d convention explicitly.
     cfg.dataset.openvla_prompt_pose_mode='evaluator_yaw4d'
+    cfg.dataset.eval_ratio=0.01
+    cfg.training.eval_max_batches=0
     cfg.dataset.pose_progress_enabled=True
     cfg.model.pose_progress_enabled=True
     cfg.stage1.qwen_pose_progress_enabled=variant!='gam'

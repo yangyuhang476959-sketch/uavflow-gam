@@ -1614,6 +1614,9 @@ def evaluate(
     depth_gradient_mode: str = "tolerant_log",
     depth_gradient_tolerance_pixels: int = 2,
 ) -> dict[str, float]:
+    # Unequal exact shards can have different forward counts. Validation
+    # needs no DDP buffer broadcasts; parameters were synchronized in training.
+    model = model.module if hasattr(model, "module") else model
     model.eval()
     sums = {h: torch.zeros(37, device=device) for h in contexts}
     from experiments.uavflow_predictor_idm.logging_metrics import action_statistics
@@ -1834,6 +1837,7 @@ def evaluate(
     result: dict[str, float] = {}
     for context, value in sums.items():
         count = value[36].clamp_min(1.0)
+        result[f"H{context}_evaluated_windows"] = int(value[36].item())
         if (getattr(model_ref, "transport_policy", None) is not None or getattr(model_ref, 'correction_mode', 'legacy') in {'support_aware', 'uncertain'}
                 or getattr(model_ref,'dual_stream_rgbwarp_enabled',False)
                 or model_ref.action_residual_gate_logit is not None):
