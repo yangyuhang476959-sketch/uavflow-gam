@@ -11,6 +11,8 @@ from .correction_train import build_config as correction_config
 def build_config(extra=()):
     cfg=correction_config('pure')
     cfg.dataset.eval_ratio=0.01
+    cfg.training.eval_every=5000
+    cfg.training.eval_every_epoch=True
     cfg.training.eval_max_batches=0
     cfg.model.correction_mode='legacy'
     cfg.model.provenance_correction={}

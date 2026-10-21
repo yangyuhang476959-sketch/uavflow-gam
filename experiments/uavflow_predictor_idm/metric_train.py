@@ -77,6 +77,8 @@ def build_config(variant,extra=()):
     # All new pose-token runs use the online yaw4d convention explicitly.
     cfg.dataset.openvla_prompt_pose_mode='evaluator_yaw4d'
     cfg.dataset.eval_ratio=0.01
+    cfg.training.eval_every=5000
+    cfg.training.eval_every_epoch=True
     cfg.training.eval_max_batches=0
     cfg.dataset.pose_progress_enabled=True
     cfg.model.pose_progress_enabled=True

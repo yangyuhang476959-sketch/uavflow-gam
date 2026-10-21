@@ -61,6 +61,8 @@ def _cfg(max_trajectories=None):
     cfg.training.num_workers=4
     cfg.training.log_every=25
     cfg.training.save_every=1000
+    cfg.training.eval_every=5000
+    cfg.training.eval_every_epoch=True
     cfg.training.eval_max_batches=0
     cfg.training.results_dir=str(Path(os.environ.get('OUTPUT_ROOT','results/metric_release'))/'01_pure_qwen_yaw4d')
     return cfg
@@ -189,6 +191,21 @@ def main():
               f'state_lr={cfg.training.get("state_lr",cfg.training.lora_lr) if pose_progress_enabled else cfg.training.head_lr}',flush=True)
 
     max_epochs=int(cfg.training.max_epochs)
+    last_eval_step=None
+    last_eval_value=None
+    def validate(epoch_number):
+        nonlocal last_eval_step,last_eval_value
+        if last_eval_step==step:
+            return last_eval_value
+        val=_eval(model,eval_loader,normalizer,device,amp_type,int(cfg.training.eval_max_batches))
+        last_eval_step,last_eval_value=step,val
+        if rank==0:
+            with (output/'train.log').open('a') as log:
+                log.write(f'epoch={epoch_number} step={step} val_action_l1={val:.8f}\n')
+            print(f'[step={step:07d}] epoch={epoch_number} val_action_l1={val:.6f} '
+                  f'full_validation={int(cfg.training.eval_max_batches)<=0} '
+                  f'validation_windows={len(eval_set) if int(cfg.training.eval_max_batches)<=0 else "bounded"}',flush=True)
+        return val
     for epoch in range(start_epoch,max_epochs):
         train_sampler.set_epoch(epoch)
         if hasattr(train_set,'set_epoch'):train_set.set_epoch(epoch)
@@ -216,6 +233,9 @@ def main():
             if rank==0 and step%int(cfg.training.log_every)==0:
                 print(f'[step={step:07d}] epoch={epoch+1}/{max_epochs} action={float(loss.detach()):.6f} '
                       f'epoch_mean_so_far={running/max(1,running_updates):.6f}',flush=True)
+            eval_every=int(cfg.training.get('eval_every',0))
+            if eval_every>0 and step%eval_every==0:
+                validate(epoch+1)
             if step%int(cfg.training.save_every)==0:
                 if rank==0:
                     atomic_save({'format':'uavflow_pure_qwen_yaw4d_v1','trainable_state':raw_model.trainable_state(),
@@ -223,7 +243,7 @@ def main():
                         'world_size':world,'batch_size':int(cfg.training.batch_size),'gradient_accumulation_steps':accumulation_steps,'pose_progress_enabled':pose_progress_enabled,'train_size':train_set_size,
                         'action_normalizer':normalizer.state_dict(),'config':OmegaConf.to_container(cfg,resolve=True)},output/'last.pt')
                 if distributed:dist.barrier()
-        val=_eval(model,eval_loader,normalizer,device,amp_type,int(cfg.training.eval_max_batches))
+        val=validate(epoch+1)
         if rank==0:
             atomic_save({'format':'uavflow_pure_qwen_yaw4d_v1','trainable_state':raw_model.trainable_state(),
                 'optimizer':optimizer.state_dict(),'step':step,'epoch':epoch+1,'batch':0,
@@ -235,10 +255,6 @@ def main():
                 'world_size':world,'batch_size':int(cfg.training.batch_size),'gradient_accumulation_steps':accumulation_steps,'pose_progress_enabled':pose_progress_enabled,'train_size':train_set_size,
                 'action_normalizer':normalizer.state_dict(),'config':OmegaConf.to_container(cfg,resolve=True),
                 'val_action_l1':val},output/'last.pt')
-            with (output/'train.log').open('a') as log:log.write(f'epoch={epoch+1} step={step} val_action_l1={val:.8f}\n')
-            print(f'[epoch={epoch+1:02d}] val_action_l1={val:.6f} '
-                  f'full_validation={int(cfg.training.eval_max_batches)<=0} '
-                  f'validation_windows={len(eval_set) if int(cfg.training.eval_max_batches)<=0 else "bounded"}',flush=True)
         if distributed:dist.barrier()
         start_batch=0
     if distributed:dist.destroy_process_group()

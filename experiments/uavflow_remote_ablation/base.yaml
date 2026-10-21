@@ -210,8 +210,9 @@ training:
   # matrix does not introduce accelerator-specific numeric precision.
   amp_dtype: auto
   log_every: 25
-  eval_every: 2000
-  eval_max_batches: 100
+  eval_every: 5000
+  eval_every_epoch: true
+  eval_max_batches: 0
   save_every: 0
   # Match the five-epoch CLIP runs: archive one checkpoint per epoch.
   # Mid-epoch last.pt remains available as an opt-in launcher override.

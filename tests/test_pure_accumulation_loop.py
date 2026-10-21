@@ -29,8 +29,9 @@ class TinyPolicy(nn.Module):
     def load_trainable_state(self,state): self.load_state_dict(state)
 
 
+@pytest.mark.parametrize("eval_every", [0, 1, 2])
 @pytest.mark.parametrize("progress", [False, True])
-def test_real_pure_loop_accumulates_tail_and_resumes_exact_cursor(tmp_path,monkeypatch,progress):
+def test_real_pure_loop_accumulates_tail_and_resumes_exact_cursor(tmp_path,monkeypatch,progress,eval_every):
     normalizer=SimpleNamespace(state_dict=lambda:{'test':True})
     monkeypatch.setattr(train,'build_robot_dataset',lambda *a,**k:TinyDataset())
     monkeypatch.setattr(train,'ActionNormalizer',SimpleNamespace(from_stats_dir=lambda *a:normalizer))
@@ -45,8 +46,14 @@ def test_real_pure_loop_accumulates_tail_and_resumes_exact_cursor(tmp_path,monke
         loss=(prediction-target).abs().mean()
         return loss,prediction.detach(),target,mask
     monkeypatch.setattr(train,'_forward',forward)
+    evaluations=[]
+    real_eval=train._eval
+    def evaluate(*args):
+        evaluations.append(True)
+        return real_eval(*args)
+    monkeypatch.setattr(train,'_eval',evaluate)
     def config(_):
-        return OmegaConf.create(dict(seed=42,model={'pose_progress_enabled':progress},dataset={'action_stats_key':'sim'},stage1={'action_stats_dir':'unused'},training=dict(batch_size=3,gradient_accumulation_steps=2,max_epochs=1,lr_schedule='constant',warmup_steps=0,lora_lr=1e-3,head_lr=1e-3,num_workers=0,weight_decay=0,log_every=1,save_every=1,eval_max_batches=0,results_dir=str(tmp_path/'full'))))
+        return OmegaConf.create(dict(seed=42,model={'pose_progress_enabled':progress},dataset={'action_stats_key':'sim'},stage1={'action_stats_dir':'unused'},training=dict(batch_size=3,gradient_accumulation_steps=2,max_epochs=1,lr_schedule='constant',warmup_steps=0,lora_lr=1e-3,head_lr=1e-3,num_workers=0,weight_decay=0,log_every=1,save_every=1,eval_every=eval_every,eval_max_batches=0,results_dir=str(tmp_path/'full'))))
     monkeypatch.setattr(train,'_cfg',config)
     original_save=train.atomic_save
     def save(payload,path):
@@ -56,12 +63,15 @@ def test_real_pure_loop_accumulates_tail_and_resumes_exact_cursor(tmp_path,monke
     monkeypatch.setattr(train,'atomic_save',save)
     monkeypatch.setattr(sys,'argv',['pure'])
     train.main()
+    assert len(evaluations)==(2 if eval_every==1 else 1)
+    evaluations.clear()
     full=torch.load(tmp_path/'full/last.pt',weights_only=False)
     mid=torch.load(tmp_path/'mid.pt',weights_only=False)
     assert (mid['step'],mid['epoch'],mid['batch'],mid['gradient_accumulation_steps'])==(1,0,1,2)
     assert full['step']==2  # update sizes6 and4; the final1-sample microbatch is retained
     monkeypatch.setattr(sys,'argv',['pure','--resume',str(tmp_path/'mid.pt'),'--set',f'training.results_dir={tmp_path / "resumed"}'])
     train.main()
+    assert len(evaluations)==1  # periodic + epoch-end at the same step run once
     resumed=torch.load(tmp_path/'resumed/last.pt',weights_only=False)
     assert (resumed['step'],resumed['epoch'],resumed['batch'])==(2,1,0)
     for name,value in full['trainable_state'].items():

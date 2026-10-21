@@ -1,6 +1,7 @@
 import datetime
 from pathlib import Path
 import pytest
+from omegaconf import OmegaConf
 import torch
 from torch import nn
 import torch.distributed as dist
@@ -30,6 +31,8 @@ def test_all_five_candidates_use_one_percent_and_no_validation_limit():
     for cfg in [_cfg()]+[build_config(x) for x in ['gam','rgbwarp','rgbwarp_no_action','current_bank']]:
         assert cfg.dataset.eval_ratio==.01
         assert cfg.training.eval_max_batches==0
+        assert cfg.training.eval_every==5000
+        assert cfg.training.eval_every_epoch is True
 
 
 class _EvalPolicy(nn.Module):
@@ -70,3 +73,25 @@ def test_full_eval_all_reduces_uneven_shards_without_forward_broadcast_deadlock(
         for process in context.processes:
             if process.is_alive():process.terminate();process.join()
     for rank in range(3):assert float((tmp_path/f'rank{rank}').read_text())==pytest.approx(.3,abs=1e-6)
+
+
+def test_shared_trainer_validation_triggers_cover_periodic_and_epoch_end():
+    # Exercise the actual loop predicates, including a checkpoint resumed at an epoch boundary.
+    import ast
+    from types import SimpleNamespace
+    tree=ast.parse(Path('experiments/uavflow_predictor_idm/train.py').read_text())
+    predicates={node.targets[0].id:compile(ast.Expression(node.value),'<validation trigger>','eval')
+                for node in ast.walk(tree) if isinstance(node,ast.Assign)
+                and len(node.targets)==1 and isinstance(node.targets[0],ast.Name)
+                and node.targets[0].id in {'periodic_eval_due','epoch_eval_due'}}
+    assert len(predicates)==2
+    cfg=SimpleNamespace(training=OmegaConf.create(dict(eval_every=5000,eval_every_epoch=True)))
+    def due(step,batch,epoch_steps):
+        scope=dict(cfg=cfg,step=step,logical_batch_idx=batch,steps_per_epoch=epoch_steps)
+        return any(eval(code,scope) for code in predicates.values())
+    assert due(150000,1919,18510)
+    assert due(166590,18509,18510)
+    assert due(185100,18509,18510)
+    assert not due(148081,0,18510)
+    assert not due(152000,3919,18510)  # old 2000-step schedule is gone
+    assert due(10000,4999,5000)  # both triggers request one evaluation

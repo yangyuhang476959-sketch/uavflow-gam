@@ -162,7 +162,8 @@ Default: ten epochs, constant LR, no warmup; per-process batch 4 (not a measured
 memory guarantee). Qwen LR 1e-5, DA3 LoRA 5e-5, heads/new modules 5e-4. BF16/FP32
 and GradScaler policy are inherited unchanged. Natural absorbing windows, no
 extra start/end repetition, same stratified split/seed as the handoff matrix.
-Validation every 2000 updates, maximum 100 batches; checkpoints each epoch;
+Validation every 5000 optimizer updates and each epoch end, over the full 1%
+held-out split (`eval_max_batches=0`); coincident triggers run once. Checkpoints each epoch;
 `best_action.pt` uses **final/refined validation action L1**, while logs
 separately report proposal, refined and averaged action loss. No stop phase.
 

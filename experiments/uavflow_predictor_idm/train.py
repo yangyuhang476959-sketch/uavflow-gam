@@ -1659,7 +1659,9 @@ def main() -> None:
                 line = compact_train_line(line, values, cfg)
                 print("\n" + line, flush=True)
                 with (output / "train.log").open("a") as handle: handle.write(line + "\n")
-            if int(cfg.training.eval_every) > 0 and step % int(cfg.training.eval_every) == 0:
+            periodic_eval_due = int(cfg.training.eval_every) > 0 and step % int(cfg.training.eval_every) == 0
+            epoch_eval_due = bool(cfg.training.get("eval_every_epoch", False)) and logical_batch_idx + 1 == steps_per_epoch
+            if periodic_eval_due or epoch_eval_due:
                 ev = evaluate(
                     model=model, da3=da3, text=text, normalizer=normalizer,
                     pose_normalizer=pose_normalizer,

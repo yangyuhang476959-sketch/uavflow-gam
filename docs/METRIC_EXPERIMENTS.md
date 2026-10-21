@@ -219,8 +219,10 @@ benchmark depends on it; it is not one of these five formal experiments.
 GAM and RGB-warp jobs use the shared trainer's optimizer/scaler/RNG/cursor
 resume. Pure-Qwen has its own optimizer and sampler-cursor checkpoints (BF16,
 no GradScaler); worker-side stochastic image crops may differ after resume.
-Validation normally runs every2000 steps (100 batches) in the shared trainer;
-checkpoint archives every epoch. RGB-warp best selection uses final action L1;
+All five maintained experiments validate every 5000 optimizer updates and at
+each epoch end, evaluating the entire held-out split (`eval_max_batches=0`).
+If both triggers coincide, validation runs once. The default split holds out 1%
+of episodes; checkpoints are archived every epoch. RGB-warp best selection uses final action L1;
 old correction retains its existing weighted action selection. Changing a depth
 definition is a **new experiment**, not an exact continuation of a relative-depth run.
 
