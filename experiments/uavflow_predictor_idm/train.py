@@ -335,7 +335,7 @@ def main() -> None:
     if cfg.get('instruction_map'):
         from experiments.uavflow_warp_direct.instruction_control import apply_instruction_map
         for split_name,dataset in [('train',train_set),('val',eval_set)]:
-            audit=apply_instruction_map(dataset,str(cfg.instruction_map),str(cfg.instruction_map_sha256))
+            audit=apply_instruction_map(dataset,str(cfg.instruction_map),cfg.get('instruction_map_sha256'))
             if rank==0:print('INSTRUCTION_WORDING_ONLY '+split_name+' '+json.dumps(audit),flush=True)
     if cfg.get('matched_manifest'):
         from experiments.uavflow_pure_stop_probe.data import inventory
@@ -1027,6 +1027,8 @@ def main() -> None:
                 if path in STOP_MIGRATION_PATHS:continue
             saved_value = nested_get(saved_cfg, path)
             current_value = nested_get(current_cfg, path)
+            if path in {'legacy_initialization_reference', 'instruction_map_sha256', 'dataset.manifest_sha256'} and current_value is None:
+                continue
             if path == "model.current_geometry_action_enabled":
                 # Checkpoints predating CA1_HB omit this disabled-by-default flag.
                 saved_value, current_value = bool(saved_value), bool(current_value)

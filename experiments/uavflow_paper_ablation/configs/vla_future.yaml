@@ -254,6 +254,4 @@ training:
   log_global_interval: true
   epoch_weights_only: false
   preserve_warp24_microgroups: true
-legacy_initialization_reference: docs/experiment_baselines/warp_20261029/common_init_hashes.json
 instruction_map: docs/experiment_baselines/warp_20261029/raw_instructions.json
-instruction_map_sha256: 0ec7276977ca233ea4236ea7ddf31859778a8f9c2f1d76006e357df621223c0d

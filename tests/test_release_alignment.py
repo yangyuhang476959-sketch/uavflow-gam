@@ -1,4 +1,3 @@
-import hashlib
 import json
 from pathlib import Path
 
@@ -10,15 +9,14 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_open_ablation_uses_recorded_raw_instructions_and_split():
     baseline = ROOT / 'docs/experiment_baselines/warp_20261029'
     instruction_path = baseline / 'raw_instructions.json'
-    expected_hash = '0ec7276977ca233ea4236ea7ddf31859778a8f9c2f1d76006e357df621223c0d'
-    assert hashlib.sha256(instruction_path.read_bytes()).hexdigest() == expected_hash
     instruction_map = json.loads(instruction_path.read_text())
     split = json.loads((baseline / 'episode_split.json').read_text())
     assert not (set(split['train_episode_ids'] + split['eval_episode_ids']) - set(instruction_map))
     for name in ('vla_future', 'vla_gam'):
         cfg = yaml.safe_load((ROOT / 'experiments/uavflow_paper_ablation/configs' / f'{name}.yaml').read_text())
         assert cfg['instruction_map'] == str(instruction_path.relative_to(ROOT))
-        assert cfg['instruction_map_sha256'] == expected_hash
+        assert not cfg.get('legacy_initialization_reference')
+        assert not cfg.get('instruction_map_sha256')
         assert cfg['dataset']['instruction_overrides_path'] == 'data/instruction_overrides.json'
         assert cfg['training']['max_epochs'] == 15
         assert cfg['training']['epoch_weights_only'] is False

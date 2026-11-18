@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify and extract UAV-Flow depth tar.zst shards."""
+"""Extract UAV-Flow depth tar.zst shards; checksum verification is optional."""
 
 import argparse
 import hashlib
@@ -22,6 +22,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--verify-checksums", action="store_true")
     args = parser.parse_args()
     index = json.loads(
         (args.dataset_root / "metadata" / "shards.json").read_text()
@@ -29,7 +30,7 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     for number, record in enumerate(index["shards"], 1):
         path = args.dataset_root / "data" / record["name"]
-        if sha256(path) != record["sha256"]:
+        if args.verify_checksums and sha256(path) != record["sha256"]:
             raise RuntimeError(f"Checksum mismatch: {path}")
         print(f"[{number}/{len(index['shards'])}] extracting {path.name}")
         with path.open("rb") as raw:

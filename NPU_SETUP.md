@@ -200,7 +200,7 @@ guess `LD_LIBRARY_PATH` or `ASCEND_OPP_PATH`.
 ## 2. Prepare data and pretrained weights
 
 The existing helper downloads RGB/parquet and weights through the HF mirror,
-downloads our depth archive from ModelScope, and verifies/extracts that archive:
+downloads our depth archive from ModelScope and extracts that archive:
 Set `DATA_ROOT`, `MODEL_ROOT`, and `OUTPUT_ROOT` to your chosen directories
 before this block if needed. Unset variables retain the existing repository-local
 defaults; the same selected paths are used for downloads and training.

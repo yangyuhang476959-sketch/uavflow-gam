@@ -150,3 +150,23 @@ def test_observation_only_inference_converts_independent_targets_and_yaw_units()
     np.testing.assert_allclose(output['simulator_target_poses'][:,3],np.pi/2)
     assert policy.inputs['current_prompt_pose'].tolist()==[[0.,0.,0.,0.,1.]]
     assert not any('depth' in key for key in policy.inputs)
+
+
+def test_action_statistics_match_original_concatenation():
+    ds = IndoorUAVVLADataset.__new__(IndoorUAVVLADataset)
+    ds.chunk_size = 5
+    ds.action_stats_key = 'indooruav_vla'
+    ds.is_eval = False
+    ds.episodes = {
+        'a': {'poses': [[0, 0, 0, 0], [0, -1, 0, 30], [1, -1, 1, 90]]},
+        'b': {'poses': [[2, 3, 1, -20], [1, 4, 1, 45]]},
+    }
+    ds.samples = [('a', 0), ('b', 0), ('a', 2), ('a', 1), ('b', 1)]
+    original = np.concatenate([cumulative_local_targets(ds.episodes[key]['poses'], step)
+                               for key, step in ds.samples], axis=0)
+    result = ds.compute_action_statistics()['indooruav_vla']
+    for key, expected in [('mean', original.mean(0)), ('std', original.std(0)),
+                          ('min', original.min(0)), ('max', original.max(0)),
+                          ('q01', np.quantile(original, .01, axis=0)),
+                          ('q99', np.quantile(original, .99, axis=0))]:
+        np.testing.assert_array_equal(result[key], expected)

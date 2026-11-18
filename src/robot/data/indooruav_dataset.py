@@ -227,8 +227,12 @@ class IndoorUAVVLADataset(Dataset):
 
     def compute_action_statistics(self,max_samples=None):
         samples=self.samples if not max_samples or max_samples<0 else self.samples[:max_samples]
-        actions=np.concatenate([cumulative_local_targets(self.episodes[key]['poses'],s)
-                                for key,s in samples],axis=0)
+        # Preallocate instead of holding hundreds of thousands of small arrays.
+        actions=np.empty((len(samples)*self.chunk_size,4),dtype=np.float32)
+        for index,(key,start) in enumerate(samples):
+            begin=index*self.chunk_size
+            actions[begin:begin+self.chunk_size]=cumulative_local_targets(
+                self.episodes[key]['poses'],start,chunk_size=self.chunk_size)
         stats={name:value.tolist() for name,value in dict(mean=actions.mean(0),std=actions.std(0),
                min=actions.min(0),max=actions.max(0),q01=np.quantile(actions,.01,axis=0),
                q99=np.quantile(actions,.99,axis=0)).items()}

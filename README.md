@@ -90,7 +90,7 @@ python scripts/download_uavflow_assets.py \
   --depth-repo acetaffy123/UAV-Flow-Sim-Depth --workers 2
 ```
 
-训练使用仓库内固定划分、Open 原始指令映射和动作归一化统计。路径不同时，在 `experiments/uavflow_paper_ablation/configs/` 的对应 YAML 中修改数据及权重路径。权重哈希和数据说明见 [docs/ABLATION_NPU.md](docs/ABLATION_NPU.md)。
+训练使用仓库内固定划分、Open 原始指令映射和动作归一化统计。路径不同时，在 `experiments/uavflow_paper_ablation/configs/` 的对应 YAML 中修改数据及权重路径。数据和训练配置说明见 [docs/ABLATION_NPU.md](docs/ABLATION_NPU.md)。
 
 ### IndoorUAV
 

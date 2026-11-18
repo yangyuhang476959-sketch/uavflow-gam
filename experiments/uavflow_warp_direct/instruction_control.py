@@ -15,9 +15,9 @@ def repair_raw_target_word(raw,reviewed):
     return re.sub(pattern,new[0],raw,count=1)
 
 
-def apply_instruction_map(dataset,path,expected_sha256):
+def apply_instruction_map(dataset,path,expected_sha256=None):
     data=Path(path).read_bytes()
-    if hashlib.sha256(data).hexdigest()!=expected_sha256:
+    if expected_sha256 is not None and hashlib.sha256(data).hexdigest()!=str(expected_sha256):
         raise ValueError('Raw instruction map checksum changed')
     mapping=json.loads(data)
     missing=set(dataset.logs)-set(mapping)

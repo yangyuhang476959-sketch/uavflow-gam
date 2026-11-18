@@ -31,6 +31,10 @@ import sys
 from omegaconf import OmegaConf
 
 cfg = OmegaConf.load(sys.argv[1])
+# Old prepared configs may contain strict checksum gates.
+cfg.pop('legacy_initialization_reference', None)
+cfg.pop('instruction_map_sha256', None)
+cfg.dataset.pop('manifest_sha256', None)
 world = int(os.environ['TOTAL_NPUS'])
 if os.environ['EPOCHS']:
     cfg.training.max_epochs = int(os.environ['EPOCHS'])

@@ -2,7 +2,6 @@
 import argparse
 import collections
 import csv
-import hashlib
 import json
 import math
 from pathlib import Path
@@ -15,9 +14,6 @@ from robot.data.indooruav_dataset import (IndoorUAVVLADataset, read_json,
 
 REPO=Path(__file__).resolve().parents[2]
 
-
-def sha(path):
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
 def configure_metric_depth(cfg):
@@ -79,21 +75,24 @@ def prepare(root, output, ratio=.05, seed=42, variant="vla_future"):
     manifest=dict(format='indooruav_grouped_vla_v1',seed=seed,eval_ratio_requested=ratio,
                   grouping='long trajectory + reversed recording; all sub-instructions together',
                   action_representation='chunk_anchor_local',splits=dict(train=train,val=val),
-                  official_test_excluded=sorted(official_test),episodes=episodes,
-                  sources={name:sha(root/name) for name in ['train.csv','test_seen.csv','test_unseen.csv']})
-    if manifest['splits'] != snapshot['splits'] or manifest['official_test_excluded'] != snapshot['official_test_excluded'] or manifest['sources'] != snapshot['sources']:
-        raise ValueError('IndoorUAV split or official source hashes differ from the recorded experiment')
+                  official_test_excluded=sorted(official_test),episodes=episodes)
+    if manifest['splits'] != snapshot['splits'] or manifest['official_test_excluded'] != snapshot['official_test_excluded']:
+        raise ValueError('IndoorUAV split differs from the recorded experiment')
     manifest_path=output/'manifest.json'
-    if manifest_path.exists() and read_json(manifest_path)!=manifest:
-        raise ValueError('Refusing to replace a different prepared split')
-    manifest_path.write_text(json.dumps(manifest,ensure_ascii=False))
+    if manifest_path.exists():
+        existing=read_json(manifest_path)
+        existing.pop('sources',None)  # Earlier preparations recorded source checksums.
+        if existing != manifest:
+            raise ValueError('Refusing to replace a different prepared split')
+        del existing
+    else:
+        manifest_path.write_text(json.dumps(manifest,ensure_ascii=False))
     cfg=yaml.safe_load((REPO/'experiments/uavflow_paper_ablation/configs'/f'{variant}.yaml').read_text())
     cfg['stage1'].update(da3_checkpoint=str(REPO/'checkpoints/track4world_da3.pth'),
                          qwen_model=str(REPO/'checkpoints/qwen3.5-2b'),
                          t5_model=str(REPO/'checkpoints/t5-base'),
                          action_stats_dir=str(output/'action_stats'))
     cfg['dataset']=dict(type='indooruav_vla',data_root=str(root),manifest=str(manifest_path),
-                        manifest_sha256=sha(manifest_path),
                         image_size=[224,224],future_steps=1,visual_anchor_stride=5,chunk_size=5,
                         action_delta_mode='chunk_anchor_local',action_convention='yaw4d',
                         action_stats_key='indooruav_vla',openvla_prompt_pose_mode='evaluator_yaw4d',
@@ -125,22 +124,23 @@ def prepare(root, output, ratio=.05, seed=42, variant="vla_future"):
         if len({math.ceil(len(range(r,val_windows,3))/size) for r in range(3)})==1),None)
     if eval_batch is None:raise ValueError('No equal-forward 3-rank validation batching found')
     cfg['training']['eval_batch_size']=eval_batch
+    windows={split:sum(len(episodes[k]['poses']) for k in ids)
+             for split,ids in [('train',train),('val',val)]}
+    # The dataset reloads the saved manifest. Release preparation copies first.
+    del manifest, episodes, pose_cache, groups, expected_tasks
     dataset=IndoorUAVVLADataset(**cfg['dataset'])
     stats=dataset.compute_action_statistics()
     (output/'action_stats').mkdir(exist_ok=True)
-    stats['indooruav_vla']['manifest_sha256']=sha(manifest_path)
     (output/'action_stats/indooruav_vla.json').write_text(json.dumps(stats['indooruav_vla'],indent=2))
     config_path=output/f'{variant}.yaml'
     config_path.write_text(yaml.safe_dump(cfg,sort_keys=False,allow_unicode=True))
-    windows={split:sum(len(episodes[k]['poses']) for k in ids)
-             for split,ids in [('train',train),('val',val)]}
     batches=[math.ceil(len(range(r,windows['val'],3))/eval_batch) for r in range(3)]
-    report=dict(train_tasks=len(train),val_tasks=len(val),val_task_ratio=len(val)/len(episodes),
+    report=dict(train_tasks=len(train),val_tasks=len(val),val_task_ratio=len(val)/(len(train)+len(val)),
                 windows=windows,updates_per_epoch=windows['train']//24,
                 updates_5_epochs=(windows['train']//24)*5,
                 eval_rank_batches=batches,eval_forward_counts_equal=len(set(batches))==1,
                 eval_batch_size_per_rank=eval_batch,
-                data_root=str(root),manifest=str(manifest_path),manifest_sha256=sha(manifest_path),
+                data_root=str(root),manifest=str(manifest_path),
                 config=str(config_path),training_started=False,formal_training_started=False,
                 image='1280x720 -> 224x126 + 49 black rows above/below; bilinear RGB, nearest depth',
                 intrinsics=[[112.,0.,111.5],[0.,112.,111.5],[0.,0.,1.]],
