@@ -26,7 +26,7 @@ The expected manifest SHA-256 is `11e059df476bfff92da9921f47acec9409c725b41aa1cc
 
 ## Training commands
 
-The default is **15 epochs for UAVFlow-Open** and **5 epochs for IndoorUAV**. Set `NPROC` to 1, 2, 3, 4, 6 or 8 and `EPOCHS` to the total target number of epochs. `NPROC` is the number of NPUs used by this job. Set `ASCEND_RT_VISIBLE_DEVICES` to the desired devices before launching. The launcher maintains global batch 24.
+The default is **15 epochs for UAVFlow-Open** and **5 epochs for IndoorUAV**. Set total NPU count to 1, 2, 3, 4, 6, 8, 12 or 24 and `EPOCHS` to the total target number of epochs. `NPROC` is the number of NPUs per node, and `NNODES` defaults to 1. Total NPU count is `NPROC × NNODES`. These counts divide the fixed global batch of 24 evenly. Set `ASCEND_RT_VISIBLE_DEVICES` to the desired devices before launching. The launcher maintains global batch 24.
 
 | NPUs | Microbatch per NPU | Gradient accumulation |
 | --- | ---: | ---: |
@@ -36,8 +36,10 @@ The default is **15 epochs for UAVFlow-Open** and **5 epochs for IndoorUAV**. Se
 | 4 | 6 | 1 |
 | 6 | 4 | 1 |
 | 8 | 3 | 1 |
+| 12 | 2 | 1 |
+| 24 | 1 | 1 |
 
-One and three NPUs retain the reference 8-sample microgroups. Other counts repartition each reference global batch of 24 while retaining its sample identities and ordering. Depth-loss reduction groups and floating-point results can differ. The evaluation batch size is selected automatically to give all ranks equal numbers of forward calls without repeating validation windows. Verify memory capacity on the target NPU.
+One and three NPUs retain the reference 8-sample microgroups. The 2, 4, 6, 8, 12 and 24 NPU configurations repartition each reference global batch of 24 while retaining its sample identities and ordering. Depth-loss reduction groups and floating-point results can differ. The evaluation batch size is selected automatically to give all ranks equal numbers of forward calls without repeating validation windows. Verify memory capacity on the target NPU.
 
 ```bash
 # Choose the devices available on this machine.
@@ -52,7 +54,19 @@ NPROC=8 EPOCHS=5 bash scripts/run_ablation_npu.sh prepared/indoor_future/vla_fut
 NPROC=8 EPOCHS=5 bash scripts/run_ablation_npu.sh prepared/indoor_gam/vla_gam.yaml
 ```
 
-Run each training command as a separate job with its own available devices. To resume, pass the matching full checkpoint as the second argument and keep the same `NPROC` and data configuration. `EPOCHS` is the total target, not the number of extra epochs.
+For 24 NPUs across three nodes with eight NPUs each, run the following on **each node**, setting `NODE_RANK` to 0, 1 and 2 respectively. Set `MASTER_ADDR` to a network address reachable on node 0 and use the same free `MASTER_PORT` on all nodes. The repository, generated config, checkpoints, data and results paths must be available at the same paths to all nodes. The results directory must be shared.
+
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export NNODES=3 NPROC=8 MASTER_ADDR=192.0.2.10 MASTER_PORT=29500  # replace with node 0 address
+export NODE_RANK=0  # set to 1 and 2 on the other two nodes
+
+# Choose one experiment and run the same command on all three nodes.
+EPOCHS=15 bash scripts/run_ablation_npu.sh experiments/uavflow_paper_ablation/configs/vla_future.yaml
+# IndoorUAV uses EPOCHS=5 with its prepared config.
+```
+
+Run each training command as a separate job with its own available devices. To resume, pass the matching full checkpoint as the second argument and keep the same total device count and data configuration. `EPOCHS` is the total target, not the number of extra epochs.
 
 ```bash
 NPROC=8 EPOCHS=5 bash scripts/run_ablation_npu.sh prepared/indoor_future/vla_future.yaml /path/to/last.pt
@@ -64,4 +78,4 @@ Preparation and configuration inspection do not start training.
 
 For each dataset, the ablations use that dataset's recorded split, image processing, action representation, normalizer, Qwen/DA3 weights, shared Pose MLP and final action-head initialization. Qwen LoRA learning rate is 1e-5, DA3 LoRA learning rate is 5e-5, and Pose MLP and action heads use 5e-4. AdamW uses constant learning rate and zero warmup. Each epoch, last and best checkpoint includes the full optimizer and training state.
 
-The intentional model differences are VLA+Future's single current-image DA3 pass supervised with future depth, and VLA+GAM's future-feature Predictor with feature MSE and future-depth supervision. VLA+GAM keeps the specified Qwen slot and Pose design. Five-slot Predictor embeddings and an extra Future DA3 Pose token are not enabled in its default configuration. Hardware-dependent grouping on 2, 4, 6 and 8 NPUs is documented above. These are new experiments and the recorded runs retain their historical configurations.
+The intentional model differences are VLA+Future's single current-image DA3 pass supervised with future depth, and VLA+GAM's future-feature Predictor with feature MSE and future-depth supervision. VLA+GAM keeps the specified Qwen slot and Pose design. Five-slot Predictor embeddings and an extra Future DA3 Pose token are not enabled in its default configuration. Hardware-dependent grouping on 2, 4, 6, 8, 12 and 24 NPUs is documented above. These are new experiments and the recorded runs retain their historical configurations.

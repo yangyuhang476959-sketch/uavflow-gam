@@ -2,7 +2,7 @@ import pytest
 from experiments.uavflow_paper_ablation.sampling import Warp24MicrogroupSampler
 
 
-@pytest.mark.parametrize('world', [2, 4, 6, 8])
+@pytest.mark.parametrize('world', [2, 4, 6, 8, 12, 24])
 def test_repartition_matches_three_rank_baseline_and_resume(world):
     data = range(137)
     baseline = [Warp24MicrogroupSampler(data, 3, rank, 42, batch_size=8)

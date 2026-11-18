@@ -7,8 +7,8 @@ from torch.utils.data import Sampler
 class Warp24MicrogroupSampler(Sampler):
     def __init__(self, dataset, num_replicas, rank, seed, resume_epoch=0,
                  resume_batch=0, batch_size=24, **unused):
-        if num_replicas not in (1, 2, 3, 4, 6, 8) or not 0 <= rank < num_replicas:
-            raise ValueError('Warp24 sampling supports 1, 2, 3, 4, 6 or 8 devices')
+        if num_replicas not in (1, 2, 3, 4, 6, 8, 12, 24) or not 0 <= rank < num_replicas:
+            raise ValueError('Warp24 sampling supports 1, 2, 3, 4, 6, 8, 12 or 24 devices')
         if batch_size != 24 // num_replicas:
             raise ValueError('Warp24 sampling requires effective batch24')
         self.size = len(dataset)

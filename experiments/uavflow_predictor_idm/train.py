@@ -1178,7 +1178,7 @@ def main() -> None:
         repartition_single = (world == 1 and int(cfg.training.batch_size) == 24
                               and accumulation_steps == 1
                               and bool(cfg.training.get('allow_warp24_single_gpu_repartition',False)))
-        repartition_multi = (world in (4, 6, 8) and int(cfg.training.batch_size) == 24 // world
+        repartition_multi = (world in (4, 6, 8, 12, 24) and int(cfg.training.batch_size) == 24 // world
                              and accumulation_steps == 1
                              and bool(cfg.training.get('allow_warp24_multi_device_repartition',False)))
         if not repartition_two and not repartition_single and not repartition_multi and (int(cfg.training.batch_size)!=8 or accumulation_steps*world!=3):
