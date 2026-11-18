@@ -1178,10 +1178,15 @@ def main() -> None:
         repartition_single = (world == 1 and int(cfg.training.batch_size) == 24
                               and accumulation_steps == 1
                               and bool(cfg.training.get('allow_warp24_single_gpu_repartition',False)))
-        if not repartition_two and not repartition_single and (int(cfg.training.batch_size)!=8 or accumulation_steps*world!=3):
+        repartition_multi = (world in (4, 6, 8) and int(cfg.training.batch_size) == 24 // world
+                             and accumulation_steps == 1
+                             and bool(cfg.training.get('allow_warp24_multi_device_repartition',False)))
+        if not repartition_two and not repartition_single and not repartition_multi and (int(cfg.training.batch_size)!=8 or accumulation_steps*world!=3):
             raise ValueError('Warp24 requires original micro8 groups, or explicit two-GPU micro12 repartition')
         if repartition_two and rank == 0:
             print('WARP24_TWO_GPU_REPARTITION global24 samples preserved; local batches12 replace reference8; loss groups/numerics may differ',flush=True)
+        if repartition_multi and rank == 0:
+            print(f'WARP24_MULTI_DEVICE_REPARTITION world={world}; global24 samples preserved; loss groups/numerics may differ',flush=True)
         if repartition_single:
             print('WARP24_SINGLE_GPU_REPARTITION global24 sample identities/order preserved; local batch24 replaces distributed microbatches; depth reduction/numerics can differ',flush=True)
         sampler_cls=Warp24MicrogroupSampler
@@ -1212,7 +1217,14 @@ def main() -> None:
     if bool(cfg.training.get("full_eval_unique", False)):
         # Exact strided shards: no DistributedSampler padding/repeated windows.
         eval_sampler = list(range(rank, len(eval_set), world)) if is_dist else None
-        eval_batch_size = int(cfg.training.get("eval_batch_size", cfg.training.batch_size))
+        eval_batch_setting = cfg.training.get("eval_batch_size", cfg.training.batch_size)
+        if eval_batch_setting == "auto":
+            eval_batch_size = next((size for size in range(8, 0, -1)
+                if len({math.ceil(len(range(r, len(eval_set), world)) / size) for r in range(world)}) == 1), None)
+            if eval_batch_size is None:
+                raise ValueError("No equal-forward unique evaluation batch size found")
+        else:
+            eval_batch_size = int(eval_batch_setting)
         batch_counts = [math.ceil(len(range(r, len(eval_set), world)) / eval_batch_size)
                         for r in range(world)]
         if len(set(batch_counts)) != 1:

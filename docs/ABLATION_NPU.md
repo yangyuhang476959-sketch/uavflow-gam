@@ -24,11 +24,38 @@ python -m experiments.indooruav_warp.prepare --data-root /path/to/indoor-data --
 
 The expected manifest SHA-256 is `11e059df476bfff92da9921f47acec9409c725b41aa1cc706b3587c8abd1d77e`. Indoor actions are five cumulative current-anchor targets, and Habitat depth is converted to metres and trained with depth scale 1. The recorded split has 24,288 train and 1,279 validation tasks. Prepared config paths refer to the location used during preparation, so regenerate if data or checkout moves.
 
-Train from a generated configuration with the intended NPU device allocation. The reference is three devices, batch 8 per device and global batch 24. For example:
+## Training commands
+
+The default is **20 epochs**. Set `NPROC` to 1, 2, 3, 4, 6 or 8 and `EPOCHS` to the total target number of epochs. `NPROC` is the number of NPUs used by this job. Set `ASCEND_RT_VISIBLE_DEVICES` to the desired devices before launching. The launcher maintains global batch 24.
+
+| NPUs | Microbatch per NPU | Gradient accumulation |
+| --- | ---: | ---: |
+| 1 | 8 | 3 |
+| 2 | 12 | 1 |
+| 3 | 8 | 1 |
+| 4 | 6 | 1 |
+| 6 | 4 | 1 |
+| 8 | 3 | 1 |
+
+One and three NPUs retain the reference 8-sample microgroups. Other counts repartition each reference global batch of 24 while retaining its sample identities and ordering. Depth-loss reduction groups and floating-point results can differ. The evaluation batch size is selected automatically to give all ranks equal numbers of forward calls without repeating validation windows. Verify memory capacity on the target NPU.
 
 ```bash
-torchrun --standalone --nproc_per_node=3 -m experiments.uavflow_predictor_idm.train --config prepared/indoor_future/vla_future.yaml
-torchrun --standalone --nproc_per_node=3 -m experiments.uavflow_predictor_idm.train --config prepared/indoor_gam/vla_gam.yaml
+# Choose the devices available on this machine.
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+
+# UAVFlow-Open
+NPROC=8 EPOCHS=20 bash scripts/run_ablation_npu.sh experiments/uavflow_paper_ablation/configs/vla_future.yaml
+NPROC=8 EPOCHS=20 bash scripts/run_ablation_npu.sh experiments/uavflow_paper_ablation/configs/vla_gam.yaml
+
+# IndoorUAV, after preparing the two configs above
+NPROC=8 EPOCHS=20 bash scripts/run_ablation_npu.sh prepared/indoor_future/vla_future.yaml
+NPROC=8 EPOCHS=20 bash scripts/run_ablation_npu.sh prepared/indoor_gam/vla_gam.yaml
 ```
 
-Training is not started by preparation. Resume only from a matching full checkpoint using the original configuration and `--resume`.
+Run each training command as a separate job with its own available devices. To resume, pass the matching full checkpoint as the second argument and keep the same `NPROC` and data configuration. `EPOCHS` is the total target, not the number of extra epochs.
+
+```bash
+NPROC=8 EPOCHS=20 bash scripts/run_ablation_npu.sh prepared/indoor_future/vla_future.yaml /path/to/last.pt
+```
+
+Preparation and configuration inspection do not start training.
