@@ -36,7 +36,12 @@ def configure_metric_depth(cfg):
 def prepare(root, output, ratio=.05, seed=42, variant="vla_future"):
     root,output=Path(root).resolve(),Path(output).resolve()
     output.mkdir(parents=True,exist_ok=True)
-    expected_tasks=read_json(root/'audit/split_tasks.json')
+    snapshot=read_json(REPO/'docs/experiment_baselines/indooruav/split_ids.json')
+    expected_tasks={
+        'train':['vla_ins'+key for key in snapshot['splits']['train']+snapshot['splits']['val']],
+        'test_seen':['vla_ins'+key for key in snapshot['official_test_excluded']],
+        'test_unseen':[],
+    }
     official_train={r['traj_path'].strip('/') for r in csv.DictReader(open(root/'train.csv'))}
     episodes={};groups=collections.defaultdict(list);pose_cache={}
     for name in sorted(expected_tasks['train']):
@@ -76,7 +81,6 @@ def prepare(root, output, ratio=.05, seed=42, variant="vla_future"):
                   action_representation='chunk_anchor_local',splits=dict(train=train,val=val),
                   official_test_excluded=sorted(official_test),episodes=episodes,
                   sources={name:sha(root/name) for name in ['train.csv','test_seen.csv','test_unseen.csv']})
-    snapshot=read_json(REPO/'docs/experiment_baselines/indooruav/split_ids.json')
     if manifest['splits'] != snapshot['splits'] or manifest['official_test_excluded'] != snapshot['official_test_excluded'] or manifest['sources'] != snapshot['sources']:
         raise ValueError('IndoorUAV split or official source hashes differ from the recorded experiment')
     manifest_path=output/'manifest.json'

@@ -15,7 +15,7 @@ python -m experiments.uavflow_paper_ablation.future_train --print-config
 python -m experiments.uavflow_paper_ablation.gam_train --variant vla_gam --print-config
 ```
 
-For IndoorUAV, supply the official data root with `train.csv`, `test_seen.csv`, `test_unseen.csv`, `vla_ins`, `without_screenshot` and `audit/split_tasks.json`. Prepare both configs using different output directories. The preparation groups a long trajectory and its reverse, excludes the official test sets, checks the stored split IDs and source hashes, computes action statistics, and records the manifest hash.
+For IndoorUAV, supply the official data root with `train.csv`, `test_seen.csv`, `test_unseen.csv`, `vla_ins` and `without_screenshot`. Prepare both configs using different output directories. The preparation groups a long trajectory and its reverse, excludes the official test sets, checks the stored split IDs and source hashes, computes action statistics, and records the manifest hash.
 
 ```bash
 python -m experiments.indooruav_warp.prepare --data-root /path/to/indoor-data --output prepared/indoor_future --variant vla_future
