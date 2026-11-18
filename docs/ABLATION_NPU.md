@@ -6,7 +6,7 @@ Place the DA3 checkpoint at `checkpoints/track4world_da3.pth` and Qwen3.5-2B at 
 
 VLA+Future uses current RGB and Qwen's five action slots in one DA3 pass and supervises t+5 depth and the final action. VLA+GAM uses the frozen DA3 shallow features and Qwen slots in a GAM predictor, then decodes predicted features and action slots with the future DA3. The configurations retain their recorded slot encoding and Pose choices. Both preserve full epoch, last and best checkpoints including optimizer state.
 
-For UAVFlow, the split is `docs/experiment_baselines/warp_20261029/episode_split.json`. Depth scale is 100 metres. Check the data, model and stats paths, then inspect configurations:
+For UAVFlow, the split is `docs/experiment_baselines/warp_20261029/episode_split.json`. Both ablations use the original Open instruction map `docs/experiment_baselines/warp_20261029/raw_instructions.json` (SHA-256 `0ec7276977ca233ea4236ea7ddf31859778a8f9c2f1d76006e357df621223c0d`) and the seven reviewed target-noun repairs in `data/instruction_overrides.json`. The recorded split contains 10,008 training and 101 validation episodes. Depth scale is 100 metres. Check the data, model and stats paths, then inspect configurations:
 
 ```bash
 export PYTHONPATH="$PWD/src:$PWD"
@@ -22,7 +22,7 @@ python -m experiments.indooruav_warp.prepare --data-root /path/to/indoor-data --
 python -m experiments.indooruav_warp.prepare --data-root /path/to/indoor-data --output prepared/indoor_gam --variant vla_gam
 ```
 
-The expected manifest SHA-256 is `11e059df476bfff92da9921f47acec9409c725b41aa1cc706b3587c8abd1d77e`. Indoor actions are five cumulative current-anchor targets, and Habitat depth is converted to metres and trained with depth scale 1. The recorded split has 24,288 train and 1,279 validation tasks. Prepared config paths refer to the location used during preparation, so regenerate if data or checkout moves.
+The expected manifest SHA-256 is `11e059df476bfff92da9921f47acec9409c725b41aa1cc706b3587c8abd1d77e`. Indoor actions are five cumulative current-anchor targets, and Habitat depth is converted to metres and trained with depth scale 1. The recorded split has 24,288 train and 1,279 validation tasks, with 474,970 and 24,937 windows respectively. Indoor uses its own original instructions and does not apply the UAVFlow instruction map. Prepared config paths refer to the location used during preparation, so regenerate if data or checkout moves.
 
 ## Training commands
 
@@ -59,3 +59,9 @@ NPROC=8 EPOCHS=5 bash scripts/run_ablation_npu.sh prepared/indoor_future/vla_fut
 ```
 
 Preparation and configuration inspection do not start training.
+
+## Alignment and intended ablations
+
+For each dataset, the ablations use that dataset's recorded split, image processing, action representation, normalizer, Qwen/DA3 weights, shared Pose MLP and final action-head initialization. Qwen LoRA learning rate is 1e-5, DA3 LoRA learning rate is 5e-5, and Pose MLP and action heads use 5e-4. AdamW uses constant learning rate and zero warmup. Each epoch, last and best checkpoint includes the full optimizer and training state.
+
+The intentional model differences are VLA+Future's single current-image DA3 pass supervised with future depth, and VLA+GAM's future-feature Predictor with feature MSE and future-depth supervision. VLA+GAM keeps the specified Qwen slot and Pose design. Five-slot Predictor embeddings and an extra Future DA3 Pose token are not enabled in its default configuration. Hardware-dependent grouping on 2, 4, 6 and 8 NPUs is documented above. These are new experiments and the recorded runs retain their historical configurations.

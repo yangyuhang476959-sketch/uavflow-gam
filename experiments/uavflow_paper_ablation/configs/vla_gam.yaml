@@ -70,7 +70,7 @@ dataset:
   gt_depth_root: data/UAV-Flow-Sim-Depth/hybrid
   gt_depth_fallback_roots:
   - data/UAV-Flow-Sim-Depth/replay
-  instruction_overrides_path: data/UAV-Flow-Sim-Depth/metadata/instruction_overrides.json
+  instruction_overrides_path: data/instruction_overrides.json
   gt_depth_required: true
   gt_depth_min_meters: 0.0
   gt_depth_max_meters: 650.0
@@ -263,3 +263,5 @@ training:
   epoch_weights_only: false
   preserve_warp24_microgroups: true
 legacy_initialization_reference: docs/experiment_baselines/warp_20261029/common_init_hashes.json
+instruction_map: docs/experiment_baselines/warp_20261029/raw_instructions.json
+instruction_map_sha256: 0ec7276977ca233ea4236ea7ddf31859778a8f9c2f1d76006e357df621223c0d

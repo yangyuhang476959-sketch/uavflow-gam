@@ -1,0 +1,91 @@
+{
+  "source_description": "Actual Open non-unified 15 epoch Warp/Current/UAV-GAM and remote Indoor 5 epoch Warp/Current/UAV-GAM resolved configs. Paths are omitted for portability. Historical configs are recorded as run, not retroactively treated as matched.",
+  "reference_configs": {
+    "uavflow_open_warp": {
+      "source_sha256": "8b7c53721ec2962652c8248242eeb35edac42d35cc96af6881099c7f479ada20",
+      "max_epochs": 15,
+      "lr": 5e-05,
+      "predictor_lr_mult": 0.2,
+      "head_lr_mult": 10.0,
+      "qwen_lora_lr": null,
+      "depth_scale_meters": 100.0,
+      "depth_target_mode": "both",
+      "feature_weight": 0.0,
+      "save_every_epochs": 1,
+      "epoch_weights_only": false
+    },
+    "uavflow_open_current": {
+      "source_sha256": "be9c562f1622bdb009a4094f9a84cc99e773b5080494d2e9f6e4d74f7899cc13",
+      "max_epochs": 15,
+      "lr": 5e-05,
+      "predictor_lr_mult": 0.2,
+      "head_lr_mult": 10.0,
+      "qwen_lora_lr": null,
+      "depth_scale_meters": 100.0,
+      "depth_target_mode": "current",
+      "feature_weight": 0.0,
+      "save_every_epochs": 1,
+      "epoch_weights_only": false
+    },
+    "uavflow_open_uav_gam": {
+      "source_sha256": "84bb3104c35ec06151395c29b334c0a79438cc92ef875940b59c016425a3bff1",
+      "max_epochs": 15,
+      "lr": 5e-05,
+      "predictor_lr_mult": 0.2,
+      "head_lr_mult": 10.0,
+      "qwen_lora_lr": null,
+      "depth_scale_meters": 100.0,
+      "depth_target_mode": "future",
+      "feature_weight": 1.0,
+      "save_every_epochs": 1,
+      "epoch_weights_only": false
+    },
+    "indoor_warp": {
+      "source_sha256": "bb1418437a76c0daf8d290de12c10fb939e0af8ae9e3b856d1053debe708f549",
+      "max_epochs": 5,
+      "lr": 5e-05,
+      "predictor_lr_mult": 0.2,
+      "head_lr_mult": 10.0,
+      "qwen_lora_lr": 1e-05,
+      "depth_scale_meters": 1.0,
+      "depth_target_mode": "both",
+      "feature_weight": 0.0,
+      "save_every_epochs": 1,
+      "epoch_weights_only": false
+    },
+    "indoor_current": {
+      "source_sha256": "54d673b0d231e89aa38f0292ae2970c2237a3c1f5df01f59f1cc3e15b49bb4e8",
+      "max_epochs": 5,
+      "lr": 5e-05,
+      "predictor_lr_mult": 0.2,
+      "head_lr_mult": 10.0,
+      "qwen_lora_lr": 1e-05,
+      "depth_scale_meters": 1.0,
+      "depth_target_mode": "current",
+      "feature_weight": 0.0,
+      "save_every_epochs": 1,
+      "epoch_weights_only": false
+    },
+    "indoor_uav_gam": {
+      "source_sha256": "07d2564d0a69794890e93a4a3a124312b2283f798866a292a8e296d6da5ac3bc",
+      "max_epochs": 5,
+      "lr": 5e-05,
+      "predictor_lr_mult": 0.2,
+      "head_lr_mult": 10.0,
+      "qwen_lora_lr": null,
+      "depth_scale_meters": 1.0,
+      "depth_target_mode": "future",
+      "feature_weight": 1.0,
+      "save_every_epochs": 1,
+      "epoch_weights_only": false
+    }
+  },
+  "open_instruction_map_sha256": "0ec7276977ca233ea4236ea7ddf31859778a8f9c2f1d76006e357df621223c0d",
+  "open_target_repairs_sha256": "5642ba735250d8e6ec46600b73df7c42d13f3b47226e58e2ef774d4e7b853523",
+  "indoor_manifest_sha256": "11e059df476bfff92da9921f47acec9409c725b41aa1cc706b3587c8abd1d77e",
+  "intentional_differences": [
+    "VLA+Future uses future rather than current depth target with no GAM predictor.",
+    "VLA+GAM uses Qwen action slots and GAM predictor, final action and future feature/depth supervision, with no separate Future DA3 Pose token.",
+    "2/4/6/8 devices repartition reference 24 samples with different loss reduction groups."
+  ]
+}
