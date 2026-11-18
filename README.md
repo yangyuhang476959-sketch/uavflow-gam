@@ -1,98 +1,137 @@
-> Current VLA+GAM and VLA+Future training, IndoorUAV preparation and Ascend handoff are documented in [docs/ABLATION_NPU.md](docs/ABLATION_NPU.md).
-
 # UAVFlow-GAM
 
-Active release: **three metric-depth experiments** — GAM baseline LoRA,
-the original VLM/GAM correction with Current Bank CA, and RGB-warp correction.
+VLA+Future 和 VLA+GAM 的 UAVFlow-Open、IndoorUAV 训练代码。UAVFlow-Open 训练 **15 轮**，IndoorUAV 训练 **5 轮**。
 
-Minimal research code for transferring Geometric Action Models to
-UAV-Flow-Sim. This repository contains only the source, configurations and
-launchers needed to reproduce the remote ablation suite:
+## 1. 环境准备
 
-- GitHub: training code, experiment definitions and setup/launch scripts.
-- ModelScope: episode-aligned UAV-Flow depth sidecars.
-- Compute-server output directory: checkpoints, logs and generated results.
+下面的版本是之前使用的 Ascend 910B2 参考环境：Python 3.11、CANN 9.0.0、PyTorch 2.7.1、torch-npu 2.7.1.post4。先确认机器的驱动和 CANN 版本与其兼容。其他版本的安装和排查见 [NPU_SETUP.md](NPU_SETUP.md)。
 
-The original UAV-Flow RGB/instruction trajectories are not duplicated here.
-Download them from the official UAV-Flow Hugging Face repository and join the
-depth sidecars by `episode_id` and `frame_indices`.
+```bash
+git clone https://github.com/yangyuhang476959-sketch/uavflow-gam.git
+cd uavflow-gam
+export PROJECT_ROOT="$PWD"
 
-After downloading the official simulation parquet shards, keep them unchanged.
-Seven known person/dog instruction mismatches are corrected at load time using
-`data/instruction_overrides.json`; the dataset documentation lists this patch
-and its application order.
+conda create -n uavflow-npu python=3.11 pip -y
+conda activate uavflow-npu
+source /usr/local/Ascend/cann-9.0.0/set_env.sh  # 按实际 CANN 路径修改
+npu-smi info
 
-## Repository map
+python -m pip install --no-deps PyYAML==6.0.2 --index-url https://pypi.org/simple
+python -m pip install 'torch==2.7.1+cpu' 'torchvision==0.22.1' \
+  --index-url https://download.pytorch.org/whl/cpu
+cat > platform-constraints.txt <<'CONSTRAINTS'
+torch==2.7.1+cpu
+torch-npu==2.7.1.post4
+torchvision==0.22.1
+CONSTRAINTS
+export PLATFORM_CONSTRAINTS="$PROJECT_ROOT/platform-constraints.txt"
+python -m pip install -c "$PLATFORM_CONSTRAINTS" 'torch-npu==2.7.1.post4' \
+  --index-url https://pypi.org/simple
+python -m pip install -c "$PLATFORM_CONSTRAINTS" -c constraints-ascend.txt \
+  -r requirements-ascend.txt
+```
 
-- `experiments/uavflow_predictor_idm/`: model, objectives and training entry point.
-- `src/robot/`: DA3/GAM model and UAV-Flow data implementation.
-- `scripts/`: data download/audit and training helpers.
-- `data/instruction_overrides.json`: seven reviewed instruction corrections.
-- `data/uavflow_stats_sim_openvla_yaw4d/`: fixed action normalization statistics.
-- `experiments/metric_jobs/`: three independent Python training entry points.
-- `experiments/uavflow_remote_ablation/`: shared configuration/split machinery
-  and historical benchmark compatibility, not the active ten-cell matrix.
+安装 **Triton-Ascend 和 Flash Linear Attention（FLA）**。Qwen 的 FLA 路径使用它们加速。
 
-## Remote experiment quick start
+```bash
+export TRITON_ASCEND_TARGET="$PROJECT_ROOT/.ascend/triton"
+export FLA_ASCEND_DIR="$PROJECT_ROOT/.ascend/flash-linear-attention"
+mkdir -p "$TRITON_ASCEND_TARGET"
+python -m pip install --target "$TRITON_ASCEND_TARGET" --ignore-installed --no-deps \
+  'triton-ascend==3.2.1' pybind11 --only-binary=:all: \
+  --index-url https://pypi.org/simple \
+  --extra-index-url https://triton-ascend.osinfra.cn/pypi/simple
 
-**NVIDIA UE simulation handoff: [simulation/README.md](simulation/README.md).**
-This is the copied closed-loop simulator client and its separate environment,
-not a change to training or Ascend setup.
+git clone https://github.com/fla-org/flash-linear-attention.git "$FLA_ASCEND_DIR"
+git -C "$FLA_ASCEND_DIR" checkout --detach 9f38d24980c46d46bd38614e743cdacd21906578
 
-**Ascend handoff: [NPU_SETUP.md](NPU_SETUP.md).**
+git clone https://github.com/ByteDance-Seed/Depth-Anything-3.git Depth-Anything-3
+git -C Depth-Anything-3 checkout --detach 2c21ea849ceec7b469a3e62ea0c0e270afc3281a
+python -m pip install -c "$PLATFORM_CONSTRAINTS" -c constraints-ascend.txt \
+  'hatchling>=1.25' 'hatch-vcs>=0.4' editables --index-url https://pypi.org/simple
+python -m pip install --no-build-isolation --no-deps -e ./Depth-Anything-3
+```
 
-The code was previously validated on Ascend 910B2 / aarch64, Driver 25.2.1,
-CANN 9.0.0, Python 3.11.15, PyTorch 2.7.1 and torch_npu 2.7.1.post4.
-The receiving engineer must prepare a hardware-compatible stack using Huawei's
-official compatibility guidance. These versions are a validation record, not a
-universal prescription for A2/A3 or other Driver/CANN versions.
+每次打开新终端，激活环境并设置运行变量：
 
-Follow the manual Python/package, data preparation and smoke-test commands in
-`NPU_SETUP.md`; the previous automatic Ascend bootstrap is no longer the handoff
-workflow. This workflow does not install or modify Driver, Firmware or CANN.
+```bash
+conda activate uavflow-npu
+source /usr/local/Ascend/cann-9.0.0/set_env.sh  # 按实际 CANN 路径修改
+cd /path/to/uavflow-gam  # 修改为仓库路径
+export PROJECT_ROOT="$PWD"
+export TRITON_ASCEND_TARGET="$PROJECT_ROOT/.ascend/triton"
+export FLA_ASCEND_DIR="$PROJECT_ROOT/.ascend/flash-linear-attention"
+export PYTHONPATH="$TRITON_ASCEND_TARGET:$FLA_ASCEND_DIR:$PROJECT_ROOT/src:$PROJECT_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+export UAVFLOW_ACCELERATOR=npu UAVFLOW_QWEN_FLA_NPU=1 UAVFLOW_DISABLE_FLEX_ATTENTION=1
 
-Choose one of the [three metric experiments](docs/METRIC_EXPERIMENTS.md).
-Defaults are **10 epochs, constant LR, no Stop phase**, per-process batch 4.
-One distributed experiment per node is supported through the existing trainer;
-use explicit `--resume` with unchanged data/batch/world-size for exact continuation.
+python - <<'PY'
+import os
+from pathlib import Path
+import torch, torch_npu, triton, fla
+assert torch.npu.is_available()
+assert Path(triton.__file__).resolve().is_relative_to(Path(os.environ['TRITON_ASCEND_TARGET']).resolve())
+print('NPU:', torch.npu.device_count(), 'Triton:', triton.__version__, 'FLA:', fla.__file__)
+PY
+```
 
-For NVIDIA-only environment instructions, see
-[`docs/REMOTE_TRAINING.md`](docs/REMOTE_TRAINING.md); do not apply that CUDA setup
-to an Ascend node. Architecture details are in
-[`docs/vla_gfm_action_tokens.md`](docs/vla_gfm_action_tokens.md).
+环境导入检查通过后，还应在目标机器验证实际 NPU 前向和反向。详细检查步骤见 [NPU_SETUP.md](NPU_SETUP.md)。
 
-The derived depth sidecars are published as
-[`acetaffy123/UAV-Flow-Sim-Depth`](https://modelscope.cn/datasets/acetaffy123/UAV-Flow-Sim-Depth/files).
+## 2. Data Preparation
 
-Before publishing, follow [`docs/PUBLISH_CHECKLIST.md`](docs/PUBLISH_CHECKLIST.md).
+### UAVFlow-Open
 
-## Data source precedence
+下载数据、深度和预训练权重。数据默认存入 `data/`，权重存入 `checkpoints/`。
 
-For a given episode, training uses the first available source:
+```bash
+python -m pip install -c "$PROJECT_ROOT/platform-constraints.txt" -c constraints-ascend.txt modelscope==1.38.1
+python scripts/download_uavflow_assets.py \
+  --data-root "$PROJECT_ROOT/data" --model-root "$PROJECT_ROOT/checkpoints" \
+  --hf-endpoint https://hf-mirror.com \
+  --depth-repo acetaffy123/UAV-Flow-Sim-Depth --workers 2
+```
 
-1. human-reviewed dynamic-object hybrid depth;
-2. corrected reverse replay depth;
-3. primary calibrated PnP-to-UE replay depth.
+训练使用仓库内固定划分、Open 原始指令映射和动作归一化统计。路径不同时，在 `experiments/uavflow_paper_ablation/configs/` 的对应 YAML 中修改数据及权重路径。权重哈希和数据说明见 [docs/ABLATION_NPU.md](docs/ABLATION_NPU.md)。
 
-The third source is not the obsolete raw-pose export. Every selected replay
-episode has a saved camera-pose reference and per-episode iterative PnP
-calibration before depth is rendered in UE.
+### IndoorUAV
 
-## Reproducibility status
+准备好 IndoorUAV 数据目录，包含 `train.csv`、`test_seen.csv`、`test_unseen.csv`、`vla_ins/`、`without_screenshot/`、`rgb/` 和 `depth/`。其中 `rgb/` 和 `depth/` 保存轨迹逐帧图像及深度。将下面路径换成实际目录：
 
-Machine-specific paths are supplied through the environment variables listed
-in `NPU_SETUP.md` (Ascend) or `docs/REMOTE_TRAINING.md` (NVIDIA).
-Large checkpoints, depth arrays and all generated
-experiment outputs are deliberately excluded from Git.
+```bash
+export INDOOR_DATA_ROOT=/path/to/indoor-data
+python -m experiments.indooruav_warp.prepare \
+  --data-root "$INDOOR_DATA_ROOT" --output prepared/indoor_future --variant vla_future
+python -m experiments.indooruav_warp.prepare \
+  --data-root "$INDOOR_DATA_ROOT" --output prepared/indoor_gam --variant vla_gam
+```
 
-## Maintained architectures
+这一步复用已记录的轨迹分组划分、检查来源并生成动作统计和训练配置。
 
-See [the three-experiment handoff](docs/METRIC_EXPERIMENTS.md) for architecture,
-pose conventions, losses and exact commands. Detailed geometry implementation:
-[RGB-warp correction](docs/dual_stream_rgbwarp.md).
+## 3. Run
 
-Unused local launchers, triangle/visibility probes and ten obsolete matrix
-job wrappers have been removed. Shared backend modules and regression fixtures
-are retained where the three experiments or the working environment benchmark
-still import them. Local debug products are ignored, not published. No datasets,
-policy checkpoints or evaluation annotations are part of this cleanup.
+`NPROC` 是每台机器使用的 NPU 数量。以下以单机 8 卡为例，四条命令分别对应独立实验。
+
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+
+# UAVFlow-Open · 15 轮
+NPROC=8 EPOCHS=15 bash scripts/run_ablation_npu.sh experiments/uavflow_paper_ablation/configs/vla_future.yaml
+NPROC=8 EPOCHS=15 bash scripts/run_ablation_npu.sh experiments/uavflow_paper_ablation/configs/vla_gam.yaml
+
+# IndoorUAV · 5 轮
+NPROC=8 EPOCHS=5 bash scripts/run_ablation_npu.sh prepared/indoor_future/vla_future.yaml
+NPROC=8 EPOCHS=5 bash scripts/run_ablation_npu.sh prepared/indoor_gam/vla_gam.yaml
+```
+
+支持总计 1、2、3、4、6、8、12、24 卡，全局 batch 为 24。2、4、6、8、12、24 卡会重新分组，损失归约和浮点结果可能与原三卡不同。
+
+三机各 8 卡时，在每台机器设置相同的主节点地址，`NODE_RANK` 分别设为 0、1、2，并在每台运行相同的实验命令：
+
+```bash
+export NNODES=3 NPROC=8 MASTER_ADDR=192.0.2.10 MASTER_PORT=29500 # 替换为主节点地址
+export NODE_RANK=0  # 另两台分别为 1、2
+EPOCHS=15 bash scripts/run_ablation_npu.sh experiments/uavflow_paper_ablation/configs/vla_future.yaml
+```
+
+多机需要在各节点的相同路径访问仓库、配置、数据和权重，并共享结果目录。续训时在命令末尾加对应的 `last.pt` 路径，`EPOCHS` 填总目标轮数。每轮、last 和 best 均保存完整训练状态和优化器。
+
+NPU 环境和多卡启动方案沿用已有适配，当前两项消融还未在目标 24 卡 NPU 集群实跑。参数与对齐记录见 [docs/ABLATION_NPU.md](docs/ABLATION_NPU.md)。
