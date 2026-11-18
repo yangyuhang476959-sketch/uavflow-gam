@@ -226,7 +226,7 @@ loss:
   transport_geometry_weight: 1.0
   depth_reconstruction: l1
 training:
-  results_dir: results/paper_vla_gam20
+  results_dir: results/paper_vla_gam15
   batch_size: 8
   num_workers: 4
   lr: 5.0e-05
@@ -235,7 +235,7 @@ training:
   direct_action_head_lr_mult: 10.0
   weight_decay: 0.0
   warmup_steps: 0
-  max_epochs: 20
+  max_epochs: 15
   max_steps: 0
   scheduler_total_steps: 0
   min_lr_ratio: 0.05

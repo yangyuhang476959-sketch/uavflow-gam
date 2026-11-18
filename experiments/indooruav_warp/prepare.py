@@ -108,7 +108,7 @@ def prepare(root, output, ratio=.05, seed=42, variant="vla_future"):
     configure_metric_depth(cfg)
     cfg['training'].update(results_dir=str(REPO/'results'/f'indooruav_{variant}'),
                            batch_size=8,gradient_accumulation_steps=1,num_workers=4,
-                           max_epochs=20,max_steps=0,amp=True,amp_dtype='bf16',
+                           max_epochs=5,max_steps=0,amp=True,amp_dtype='bf16',
                            epoch_weights_only=False,preserve_warp24_microgroups=True,
                            full_eval_unique=True,eval_batch_size=8,eval_every=5000,
                            eval_every_epoch=True,save_every_epochs=1)
@@ -137,7 +137,7 @@ def prepare(root, output, ratio=.05, seed=42, variant="vla_future"):
     batches=[math.ceil(len(range(r,windows['val'],3))/eval_batch) for r in range(3)]
     report=dict(train_tasks=len(train),val_tasks=len(val),val_task_ratio=len(val)/len(episodes),
                 windows=windows,updates_per_epoch=windows['train']//24,
-                updates_20_epochs=(windows['train']//24)*20,
+                updates_5_epochs=(windows['train']//24)*5,
                 eval_rank_batches=batches,eval_forward_counts_equal=len(set(batches))==1,
                 eval_batch_size_per_rank=eval_batch,
                 data_root=str(root),manifest=str(manifest_path),manifest_sha256=sha(manifest_path),

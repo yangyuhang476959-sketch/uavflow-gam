@@ -26,7 +26,7 @@ The expected manifest SHA-256 is `11e059df476bfff92da9921f47acec9409c725b41aa1cc
 
 ## Training commands
 
-The default is **20 epochs**. Set `NPROC` to 1, 2, 3, 4, 6 or 8 and `EPOCHS` to the total target number of epochs. `NPROC` is the number of NPUs used by this job. Set `ASCEND_RT_VISIBLE_DEVICES` to the desired devices before launching. The launcher maintains global batch 24.
+The default is **15 epochs for UAVFlow-Open** and **5 epochs for IndoorUAV**. Set `NPROC` to 1, 2, 3, 4, 6 or 8 and `EPOCHS` to the total target number of epochs. `NPROC` is the number of NPUs used by this job. Set `ASCEND_RT_VISIBLE_DEVICES` to the desired devices before launching. The launcher maintains global batch 24.
 
 | NPUs | Microbatch per NPU | Gradient accumulation |
 | --- | ---: | ---: |
@@ -44,18 +44,18 @@ One and three NPUs retain the reference 8-sample microgroups. Other counts repar
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
 # UAVFlow-Open
-NPROC=8 EPOCHS=20 bash scripts/run_ablation_npu.sh experiments/uavflow_paper_ablation/configs/vla_future.yaml
-NPROC=8 EPOCHS=20 bash scripts/run_ablation_npu.sh experiments/uavflow_paper_ablation/configs/vla_gam.yaml
+NPROC=8 EPOCHS=15 bash scripts/run_ablation_npu.sh experiments/uavflow_paper_ablation/configs/vla_future.yaml
+NPROC=8 EPOCHS=15 bash scripts/run_ablation_npu.sh experiments/uavflow_paper_ablation/configs/vla_gam.yaml
 
 # IndoorUAV, after preparing the two configs above
-NPROC=8 EPOCHS=20 bash scripts/run_ablation_npu.sh prepared/indoor_future/vla_future.yaml
-NPROC=8 EPOCHS=20 bash scripts/run_ablation_npu.sh prepared/indoor_gam/vla_gam.yaml
+NPROC=8 EPOCHS=5 bash scripts/run_ablation_npu.sh prepared/indoor_future/vla_future.yaml
+NPROC=8 EPOCHS=5 bash scripts/run_ablation_npu.sh prepared/indoor_gam/vla_gam.yaml
 ```
 
 Run each training command as a separate job with its own available devices. To resume, pass the matching full checkpoint as the second argument and keep the same `NPROC` and data configuration. `EPOCHS` is the total target, not the number of extra epochs.
 
 ```bash
-NPROC=8 EPOCHS=20 bash scripts/run_ablation_npu.sh prepared/indoor_future/vla_future.yaml /path/to/last.pt
+NPROC=8 EPOCHS=5 bash scripts/run_ablation_npu.sh prepared/indoor_future/vla_future.yaml /path/to/last.pt
 ```
 
 Preparation and configuration inspection do not start training.

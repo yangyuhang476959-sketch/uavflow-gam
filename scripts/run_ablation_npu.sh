@@ -2,17 +2,17 @@
 set -euo pipefail
 
 if [[ $# -lt 1 || $# -gt 2 ]]; then
-  echo "Usage: NPROC=3 EPOCHS=20 bash scripts/run_ablation_npu.sh CONFIG [CHECKPOINT]" >&2
+  echo "Usage: NPROC=3 EPOCHS=15 bash scripts/run_ablation_npu.sh CONFIG [CHECKPOINT]" >&2
   exit 2
 fi
 config_path=$1
 resume_path=${2:-}
 export NPROC=${NPROC:-3}
-export EPOCHS=${EPOCHS:-20}
+export EPOCHS=${EPOCHS:-}
 export UAVFLOW_ACCELERATOR=npu
 export PYTHONPATH="$PWD/src:$PWD${PYTHONPATH:+:$PYTHONPATH}"
 case "$NPROC" in 1|2|3|4|6|8) ;; *) echo 'NPROC must be 1, 2, 3, 4, 6 or 8' >&2; exit 2;; esac
-if [[ ! $EPOCHS =~ ^[1-9][0-9]*$ ]]; then echo 'EPOCHS must be a positive integer' >&2; exit 2; fi
+if [[ -n $EPOCHS && ! $EPOCHS =~ ^[1-9][0-9]*$ ]]; then echo 'EPOCHS must be a positive integer' >&2; exit 2; fi
 resolved_config=$(mktemp "${TMPDIR:-/tmp}/uavflow-npu-config.XXXXXXXX.yaml")
 trap 'rm -- "$resolved_config"' EXIT
 python - "$config_path" "$resolved_config" <<'PY'
@@ -22,7 +22,8 @@ from omegaconf import OmegaConf
 
 cfg = OmegaConf.load(sys.argv[1])
 world = int(os.environ['NPROC'])
-cfg.training.max_epochs = int(os.environ['EPOCHS'])
+if os.environ['EPOCHS']:
+    cfg.training.max_epochs = int(os.environ['EPOCHS'])
 cfg.training.batch_size = 8 if world == 1 else 24 // world
 cfg.training.gradient_accumulation_steps = 3 if world == 1 else 1
 cfg.training.allow_warp24_two_gpu_repartition = world == 2
