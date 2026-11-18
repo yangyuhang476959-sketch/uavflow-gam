@@ -1,3 +1,5 @@
+> Current VLA+GAM and VLA+Future training, IndoorUAV preparation and Ascend handoff are documented in [docs/ABLATION_NPU.md](docs/ABLATION_NPU.md).
+
 # UAVFlow-GAM
 
 Active release: **three metric-depth experiments** — GAM baseline LoRA,

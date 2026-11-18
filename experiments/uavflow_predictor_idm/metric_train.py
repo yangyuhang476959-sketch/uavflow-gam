@@ -12,18 +12,14 @@ from .rgbwarp_train import build_config as rgbwarp_config
 from experiments.uavflow_remote_ablation.matrix_v2 import overrides
 
 
-VARIANTS=('gam','current_bank','rgbwarp','rgbwarp_no_action')
+VARIANTS=('gam','current_bank','rgbwarp')
 
 
 def build_config(variant,extra=()):
     if variant not in VARIANTS:
         raise ValueError(f'Choose one of {VARIANTS}')
-    if variant in {'rgbwarp','rgbwarp_no_action'}:
+    if variant=='rgbwarp':
         cfg=rgbwarp_config()
-        if variant=='rgbwarp_no_action':
-            cfg.model.rgbwarp_correction.inject_proposal_action_tokens=False
-            cfg.model.rgbwarp_correction.visual_residual_heads=8
-            cfg.training.results_dir=str(Path(os.environ.get('OUTPUT_ROOT','results/metric_release'))/variant)
     else:
         cfg=correction_config('pure')
         cfg.model.provenance_correction={}
@@ -54,19 +50,12 @@ def build_config(variant,extra=()):
             cfg.model.parallel_current_geometry_read_enabled=True
             cfg.model.current_geometry_bank_mode='output_current'
             cfg.model.current_geometry_read_mode='per_layer'
-            cfg.model.current_geometry_gate_init=1.0
-            cfg.model.current_geometry_zero_init=True
-            cfg.model.current_geometry_qk_norm=True
-            cfg.training.current_geometry_head_lr=True
             cfg.loss.feature_weight=0.
             cfg.loss.action_direct_weight=.5
             cfg.loss.action_refine_weight=.5
         cfg.loss.depth_scale_mode='fixed_metric'
         cfg.loss.depth_fixed_scale_meters=100.
-    # Correction graphs can leave disabled/optional heads unused on any backend.
-    cfg.training.find_unused_parameters = variant in {'current_bank', 'rgbwarp', 'rgbwarp_no_action'}
-    cfg.training.gradient_accumulation_steps = 1
-    cfg.training.max_epochs = 10
+        cfg.training.max_epochs=5
     # Split the outer depth budget3 equally, like proposal/final action.
     cfg.loss.depth_linear_weight=1./3.
     cfg.loss.depth_log_weight=1./3.
@@ -76,10 +65,6 @@ def build_config(variant,extra=()):
     cfg.loss.depth_semantic_grad_weight=1./3.
     # All new pose-token runs use the online yaw4d convention explicitly.
     cfg.dataset.openvla_prompt_pose_mode='evaluator_yaw4d'
-    cfg.dataset.eval_ratio=0.01
-    cfg.training.eval_every=5000
-    cfg.training.eval_every_epoch=True
-    cfg.training.eval_max_batches=0
     cfg.dataset.pose_progress_enabled=True
     cfg.model.pose_progress_enabled=True
     cfg.stage1.qwen_pose_progress_enabled=variant!='gam'
@@ -87,24 +72,6 @@ def build_config(variant,extra=()):
     cfg.stage1.t5_model=os.environ.get('T5_MODEL',str(root/'t5-base'))
     cfg.training.results_dir=str(Path(os.environ.get('OUTPUT_ROOT','results/metric_release'))/variant)
     return OmegaConf.merge(cfg,OmegaConf.from_dotlist(list(extra)))
-
-
-
-def preserve_resume_qk_norm(cfg, checkpoint_path, extra=()):
-    """A new default must not silently change an existing checkpoint's graph."""
-    import torch
-    saved = torch.load(checkpoint_path, map_location="cpu", weights_only=False, mmap=True)
-    model = saved.get("config", {}).get("model", {})
-    explicit = {item.split("=", 1)[0] for item in extra}
-    if bool(cfg.model.get("dual_stream_rgbwarp_enabled", False)):
-        key = "model.rgbwarp_correction.qk_norm"
-        if key not in explicit:
-            cfg.model.rgbwarp_correction.qk_norm = bool(model.get("rgbwarp_correction", {}).get("qk_norm", False))
-    elif bool(cfg.model.get("parallel_current_geometry_read_enabled", False)):
-        key = "model.current_geometry_qk_norm"
-        if key not in explicit:
-            cfg.model.current_geometry_qk_norm = bool(model.get("current_geometry_qk_norm", False))
-    return cfg
 
 
 def main(default_variant=None):
@@ -120,8 +87,6 @@ def main(default_variant=None):
     if args.max_trajectories is not None:
         extra.append(f'dataset.max_trajectories={args.max_trajectories}')
     cfg=build_config(args.variant,extra)
-    if args.resume:
-        cfg=preserve_resume_qk_norm(cfg,args.resume,extra)
     if args.print_config:
         print(OmegaConf.to_yaml(cfg,resolve=True));return
     if args.eval_only and not args.resume:

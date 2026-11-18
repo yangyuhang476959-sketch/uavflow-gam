@@ -1,0 +1,19 @@
+{
+  "recorded_date": "2026-10-29",
+  "user_instruction": "后面跑的都以当前 Warp 为基准",
+  "reference_run": "results/warp_direct_pose5_qwen1e5_20261028/warp",
+  "files": {
+    "action_stage.yaml": {
+      "source": "results/warp_direct_pose5_qwen1e5_20261028/config_stage1_10epochs.yaml",
+      "sha256": "51772b526a1be5f3122bb20c7b77d16ee3da39546c81a8950351951328e1ba3b"
+    },
+    "joint_stop_stage.yaml": {
+      "source": "results/warp_direct_pose5_qwen1e5_20261028/config_stage2_joint_stop.yaml",
+      "sha256": "21670bf8b4e0f700c1ed6ccd415a27af8f4709752de60857e8c022e0f4e7a23b"
+    },
+    "episode_split.json": {
+      "source": "results/warp_direct_pose5_20epochs_20261028/episode_split_input.json",
+      "sha256": "f0c8867cd1c328ea9e4dc5eea981ab63c411ca02acdb382e1d4c949164fae09a"
+    }
+  }
+}

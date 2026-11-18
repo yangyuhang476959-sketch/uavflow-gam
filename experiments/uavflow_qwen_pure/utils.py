@@ -70,6 +70,5 @@ def restore_rng(state, device):
 
 
 def atomic_save(payload, path):
-    temporary = path.with_suffix(path.suffix + '.tmp')
-    torch.save(payload, temporary)
-    os.replace(temporary, path)
+    from experiments.uavflow_paper_ablation.checkpoint_io import save_full
+    save_full(payload,path)

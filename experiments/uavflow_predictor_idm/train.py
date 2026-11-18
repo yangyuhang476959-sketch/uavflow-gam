@@ -9,17 +9,20 @@ import json
 import math
 import os
 import random
+import time
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.distributed as dist
+
+if os.environ.get("UAVFLOW_AUTOGRAD_ANOMALY") == "1":
+    torch.autograd.set_detect_anomaly(True)
 from omegaconf import OmegaConf
 from torch.utils.data import ConcatDataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
-from experiments.uavflow_predictor_idm.eval_sampler import evaluation_sampler
 from experiments.uavflow_predictor_idm.runtime import (
     apply_overrides,
     amp_dtype,
@@ -35,7 +38,6 @@ from experiments.uavflow_predictor_idm.runtime import (
     max_memory_allocated_gb,
     profile_phase,
     StepBenchmark,
-    optimizer_batches,
     step_generator,
 )
 
@@ -56,6 +58,16 @@ from experiments.uavflow_predictor_idm.logging_metrics import compact_train_line
 from experiments.uavflow_predictor_idm.vlm_conditioning import build_stage2_conditioner
 from robot.data.dataset import ActionNormalizer, build_robot_dataset
 from robot.modeling.da3_giant_encoder import DA3GiantEncoder
+
+
+def optimizer_batches(loader, accumulation_steps):
+    """Yield complete equal-size microbatch groups; drop incomplete epoch tails."""
+    iterator = iter(loader)
+    while True:
+        group = list(itertools.islice(iterator, accumulation_steps))
+        if len(group) < accumulation_steps:
+            return
+        yield group
 
 
 class CursorDistributedSampler(DistributedSampler):
@@ -96,6 +108,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="experiments/uavflow_predictor_idm/config.yaml")
     ap.add_argument("--resume", default="")
+    ap.add_argument("--activate-joint-stop", action="store_true", help="Explicit epoch10 RGB-Warp continuation: preserve policy optimizer and append a fresh Stop group.")
     ap.add_argument("--init-checkpoint", default="", help="Load Predictor/action weights only and start a new optimizer/run.")
     ap.add_argument("--proposal-checkpoint", default="", help="Initialize B's exact proposal from a prompt Pure-Qwen checkpoint.")
     ap.add_argument("--eval-only", action="store_true")
@@ -107,6 +120,8 @@ def main() -> None:
     )
     ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
     args = ap.parse_args()
+    if args.activate_joint_stop and (not args.resume or args.eval_only):
+        raise ValueError('--activate-joint-stop requires a training resume checkpoint')
     if args.resume and args.init_checkpoint:
         raise ValueError("Use only one of --resume and --init-checkpoint.")
     if args.proposal_checkpoint and (args.resume or args.init_checkpoint):
@@ -136,31 +151,74 @@ def main() -> None:
     correction_cfg = cfg.model.get('provenance_correction', {}) or {}
     provenance_enabled = correction_mode != 'legacy'
     rgbwarp_enabled=bool(cfg.model.get('dual_stream_rgbwarp_enabled',False))
+    current_only=rgbwarp_enabled and cfg.model.get('rgbwarp_correction',{}).get('branch_mode')=='current_only'
+    geometry_branch=str(cfg.model.get('rgbwarp_correction',{}).get('branch_mode','warp'))
+    future_only=rgbwarp_enabled and geometry_branch=='future_only'
+    single_stream=current_only or future_only
+    gam_enabled=rgbwarp_enabled and geometry_branch in {'uav_gam','vla_gam'}
+    no_rasterizer=single_stream or gam_enabled
+    current_final_only=single_stream and bool(cfg.model.rgbwarp_correction.get('current_final_only',False))
+    native_gam=gam_enabled and bool(cfg.model.rgbwarp_correction.get('native_gam_path',False))
+    if cfg.model.get('rgbwarp_correction',{}).get('future_pose_token_enabled',False):
+        if not rgbwarp_enabled or geometry_branch!='warp' or not cfg.stage1.get('qwen_pose5_enabled',False):
+            raise ValueError('Future Pose token requires Warp with the existing Qwen native 5D Pose MLP')
     if rgbwarp_enabled:
+        indoor = str(cfg.dataset.get('type')) == 'indooruav_vla'
+        expected_action_mode = 'chunk_anchor_local' if indoor else 'openvla_yaw_only'
+        if indoor and cfg.model.rgbwarp_correction.get('action_representation') != 'chunk_anchor_local':
+            raise ValueError('IndoorUAV requires current-anchor cumulative action targets')
         if (transport_enabled or provenance_enabled or max_context!=1 or action_chunk_size!=5
                 or int(cfg.dataset.get('visual_anchor_stride',1))!=5 or feature_target_offset!=1
-                or str(cfg.dataset.get('action_delta_mode'))!='openvla_yaw_only'
+                or str(cfg.dataset.get('action_delta_mode'))!=expected_action_mode
                 or str(cfg.dataset.get('openvla_prompt_pose_mode'))!='evaluator_yaw4d'):
             raise ValueError('RGB-warp requires standalone H1/chunk5/stride5 and canonical yaw4d state/action')
-        if str(cfg.stage1.get('qwen_token_selection'))!='action_placeholders' or not cfg.stage1.get('qwen_numeric_pose_token',False):
+        if geometry_branch=='uav_gam':
+            if (cfg.stage1.get('text_encoder_type')!='t5' or not cfg.stage1.get('paper_t5_pose_token',False)
+                    or cfg.stage1.get('qwen_lora_enabled',False)):
+                raise ValueError('UAV-GAM requires frozen T5 plus matched native5D Pose, no Qwen')
+        elif str(cfg.stage1.get('qwen_token_selection'))!='action_placeholders' or not cfg.stage1.get('qwen_numeric_pose_token',False):
             raise ValueError('RGB-warp requires native five Qwen slots and numeric pose token')
-        if (float(cfg.loss.feature_weight)!=0 or float(cfg.loss.get('deep_feature_weight',0))!=0
-                or float(cfg.loss.action_weight)!=3 or float(cfg.loss.depth_weight)!=3
-                or float(cfg.loss.get('action_direct_weight',0))!=.5
-                or float(cfg.loss.get('action_refine_weight',0))!=.5
-                or str(cfg.loss.get('depth_scale_mode'))!='fixed_metric' or str(cfg.loss.get('depth_target_mode'))!='both'):
-            raise ValueError('RGB-warp loss is 3*mean(proposal,final)+3*mean(Current,Future GAM depth); no feature loss')
+        if cfg.model.rgbwarp_correction.get('vla_pose_in_vlm_only',False):
+            if geometry_branch!='vla_gam' or not native_gam or not cfg.stage1.get('qwen_pose5_enabled',False):
+                raise ValueError('VLA-only Pose requires native VLA-GAM and the Qwen 5D Pose token')
+        if native_gam:
+            if (float(cfg.loss.feature_weight)!=1 or float(cfg.loss.action_weight)!=3
+                    or float(cfg.loss.depth_weight)!=3 or float(cfg.loss.action_direct_weight)!=0
+                    or float(cfg.loss.action_refine_weight)!=1
+                    or str(cfg.loss.depth_scale_mode)!='fixed_metric'
+                    or str(cfg.loss.depth_target_mode)!='future'):
+                raise ValueError('Native GAM requires final-only action, feature MSE1 and future-only metric depth3')
+        else:
+            if (float(cfg.loss.feature_weight)!=0 or float(cfg.loss.get('deep_feature_weight',0))!=0
+                    or float(cfg.loss.action_weight)!=3 or float(cfg.loss.depth_weight)!=3
+                    or float(cfg.loss.get('action_direct_weight',0))!=(0. if current_final_only else .5)
+                    or float(cfg.loss.get('action_refine_weight',0))!=(1. if current_final_only else .5)
+                    or str(cfg.loss.get('depth_scale_mode'))!='fixed_metric'
+                    or str(cfg.loss.get('depth_target_mode'))!=('current' if current_only else 'future' if future_only else 'both')):
+                raise ValueError('Geometry loss requires 3*mean(proposal,final) and depth_weight=3; '
+                                 'depth_target_mode must match the selected branch; no feature loss')
         if not bool(cfg.model.get('da3_lora',{}).get('enabled',False)):
             raise ValueError('RGB-warp requires shared DA3 LoRA, not full-rank tuning')
         if list(cfg.model.da3_lora.get('target_modules',[]))!=['all-linear']:
             raise ValueError('RGB-warp requires explicit all-linear DA3 LoRA')
+        joint_stop=bool(cfg.model.get('stop_head_enabled',False))
+        if joint_stop:
+            if (not bool(cfg.stage1.get('qwen_pose5_enabled',False) or cfg.stage1.get('paper_t5_pose_token',False))
+                    or str(cfg.model.get('stop_head_mode'))!='action_hidden_pose'
+                    or float(cfg.loss.get('stop_weight',0))<=0
+                    or cfg.training.get('stop_head_lr') is None):
+                raise ValueError('RGB Warp Stop requires5D Pose, existing MLP head, positive loss and separate Stop LR')
+            if str(cfg.dataset.get('stop_target_mode'))!='current' or float(cfg.dataset.get('stop_soft_target_fraction',0))!=0:
+                raise ValueError('RGB Warp Stop uses hard current-frame labels')
+        elif float(cfg.loss.get('stop_weight',0))!=0:
+            raise ValueError('Stop loss requires an enabled Stop head')
         for name in ('relative_pose_weight','action_rollout_pose_weight','pose_consistency_weight',
-                     'stop_weight','depth_semantic_separate_weight','depth_scale_weight'):
+                     'depth_semantic_separate_weight','depth_scale_weight'):
             if float(cfg.loss.get(name,0))!=0:
                 raise ValueError(f'RGB-warp does not enable loss.{name}')
         if 'depth_global_weight' in cfg.loss or 'depth_dynamic_weight' in cfg.loss:
             raise ValueError('RGB-warp uses depth_weight=3, not separate global/dynamic outer weights')
-        if (str(cfg.loss.get('depth_target_source'))!='ue_gt'
+        if (str(cfg.loss.get('depth_target_source'))!=('habitat_gt' if indoor else 'ue_gt')
                 or str(cfg.loss.get('depth_gradient_mode'))!='gam_l1'
                 or str(cfg.loss.get('depth_reconstruction'))!='l1'
                 or any(float(cfg.loss.get(key, 0)) < 0 for key in
@@ -198,6 +256,16 @@ def main() -> None:
               'refinement=DA3_internal_action_tokens', flush=True)
     accelerator = configure_accelerator(local_rank=local_rank, distributed=is_dist)
     if rank == 0:
+        if current_only:
+            print('GEOMETRY_BRANCH current_only: one current RGB/action-token DA3 pass; '
+                  'direct full-action head; no Future/Predictor/Warp/CA; '
+                  + ('loss=3*final_action+3*current_depth' if current_final_only else 'loss=3*mean(proposal,final)+3*current_depth'),flush=True)
+        if future_only:
+            print('GEOMETRY_BRANCH future_only: current RGB/action tokens predict future depth and final action; loss=3*final_action+3*future_depth',flush=True)
+        if gam_enabled:
+            print('GEOMETRY_BRANCH '+geometry_branch+': native GAMFuturePredictor; '
+                  'direct full-action head; no Warp/mask/bank CA/residual; ' +
+                  ('loss=3*final_action+1*future_feature_MSE+3*future_depth; native text path; no current decode/pre-action' if native_gam else 'loss=3*mean(pre_geometry,final)+3*mean(current_depth,future_depth)'),flush=True)
         print(
             "runtime "
             f"accelerator={accelerator.kind} "
@@ -264,6 +332,25 @@ def main() -> None:
             print(f"Using explicit IDM episode split: {split_file}", flush=True)
     train_set = build_robot_dataset(train_dataset_cfg, is_eval=False)
     eval_set = build_robot_dataset(eval_dataset_cfg, is_eval=True)
+    if cfg.get('instruction_map'):
+        from experiments.uavflow_warp_direct.instruction_control import apply_instruction_map
+        for split_name,dataset in [('train',train_set),('val',eval_set)]:
+            audit=apply_instruction_map(dataset,str(cfg.instruction_map),str(cfg.instruction_map_sha256))
+            if rank==0:print('INSTRUCTION_WORDING_ONLY '+split_name+' '+json.dumps(audit),flush=True)
+    if cfg.get('matched_manifest'):
+        from experiments.uavflow_pure_stop_probe.data import inventory
+        expected = json.loads(Path(str(cfg.matched_manifest)).read_text())
+        for split_name, dataset in [('train',train_set),('val',eval_set)]:
+            if inventory(dataset) != expected['native'][split_name]:
+                raise ValueError('Matched dataset/window order differs: '+split_name)
+    stop_repeat_count=int(cfg.training.get('joint_stop_terminal_repeat_count',0))
+    if stop_repeat_count:
+        if not rgbwarp_enabled or not cfg.model.get('stop_head_enabled'):raise ValueError('Stop-only repeats require joint RGB Warp')
+        if not args.resume:raise ValueError('Stop-only repeats require epoch10 activation or a joint Stop checkpoint resume')
+        if not cfg.model.get('stop_init_file'):raise ValueError('Stop-only repeats require the Pure-matched Stop initialization')
+        from experiments.uavflow_warp_direct.joint_stop import StopOnlyTerminalRepeats
+        train_set=StopOnlyTerminalRepeats(train_set,stop_repeat_count)
+        if rank==0:print('STOP_ONLY_TERMINAL_PAIRS native='+str(train_set.native_size)+' added='+str(train_set.added_windows)+' total='+str(len(train_set)),flush=True)
     eval_domain_sets: dict[str, torch.utils.data.Dataset] = {}
     if hasattr(eval_set, "datasets") and isinstance(eval_set.datasets, dict):
         eval_items = list(eval_set.datasets.items())
@@ -288,6 +375,7 @@ def main() -> None:
         or (
             bool(cfg.model.get("stop_head_enabled", False))
             and str(cfg.model.get("stop_head_mode", "")) == "action_hidden_pose"
+            and not rgbwarp_enabled
         )
         or bool(cfg.model.get("relative_pose_head_enabled", False))
         or float(cfg.loss.get("action_rollout_pose_weight", 0.0)) > 0.0
@@ -396,7 +484,7 @@ def main() -> None:
         rollout_steps=int(cfg.model.rollout_steps), d_model=int(cfg.model.d_model),
         depth=int(cfg.model.depth), num_heads=int(cfg.model.num_heads),
         ffn_ratio=float(cfg.model.ffn_ratio), dropout=float(cfg.model.dropout),
-        language_dim=int(text.hidden_size),
+        language_dim=int(getattr(text,'action_interface_dim',text.hidden_size)),
         language_len=int(cfg.model.get("language_len", 77)),
         variable_language_tokens=bool(
             getattr(text, "variable_length_tokens", False)
@@ -467,9 +555,6 @@ def main() -> None:
         ),
         parallel_action_position_mode=str(cfg.model.get("parallel_action_position_mode", "legacy")),
         action_residual_gate_init=cfg.model.get('action_residual_gate_init'),
-        current_geometry_gate_init=cfg.model.get('current_geometry_gate_init'),
-        current_geometry_zero_init=bool(cfg.model.get('current_geometry_zero_init',False)),
-        current_geometry_qk_norm=bool(cfg.model.get('current_geometry_qk_norm',False)),
         support_aware_transport=transport_cfg,
         correction_mode=correction_mode,
         provenance_correction=OmegaConf.to_container(correction_cfg, resolve=True) if OmegaConf.is_config(correction_cfg) else dict(correction_cfg),
@@ -499,6 +584,28 @@ def main() -> None:
         gradient_checkpointing=bool(cfg.model.gradient_checkpointing),
     ).to(device)
     raw_model = model
+    if native_gam and cfg.model.rgbwarp_correction.get('native_frozen_shallow',False) and rank==0:
+        from experiments.uavflow_paper_ablation.frozen_shallow import prefix_parameters
+        assert not any(p.requires_grad for _,p in prefix_parameters(da3))
+        print('NATIVE_GAM_FIXED_TEACHER shallow_boundary='+str(da3.backbone.pretrained.alt_start)+'; immutable pretrained shallow input/target; input detached; deep LoRA rank='+str(cfg.model.da3_lora.rank)+'; predictor SDPA with native block mask',flush=True)
+    if cfg.get('legacy_initialization_reference') and not args.resume and rank==0:
+        if geometry_branch=='uav_gam':
+            from experiments.uavflow_paper_ablation.initialization import verify_uav_initialization
+            audit=verify_uav_initialization(raw_model,text,str(cfg.legacy_initialization_reference))
+        else:
+            from experiments.uavflow_warp_direct.instruction_control import verify_legacy_initialization
+            audit=verify_legacy_initialization(raw_model,text,str(cfg.legacy_initialization_reference))
+        print('LEGACY_INITIALIZATION_EXACT '+json.dumps(audit,sort_keys=True),flush=True)
+    if cfg.model.get('stop_init_file'):
+        if not raw_model.stop_head_enabled or raw_model.stop_head_mode!='action_hidden_pose':raise ValueError('Shared Stop init requires enabled action_hidden_pose head')
+        from experiments.uavflow_matched_repeat.stop_alignment import load_shared_stop
+        stop_alignment=load_shared_stop(raw_model.stop_head,str(cfg.model.stop_init_file),text.state_scale.detach().cpu().tolist())
+        if rank==0:print('MATCHED_STOP_INIT '+json.dumps(stop_alignment,sort_keys=True),flush=True)
+    if cfg.get('matched_common_init'):
+        from experiments.uavflow_matched_repeat.common import apply_warp
+        alignment = apply_warp(raw_model, text, str(cfg.matched_common_init))
+        if rank == 0:
+            print('MATCHED_COMMON_INIT '+json.dumps(alignment,sort_keys=True),flush=True)
     trainable_conditioner_names = {
         name for name, parameter in text.named_parameters() if parameter.requires_grad
     }
@@ -637,11 +744,14 @@ def main() -> None:
     if raw_model.provenance_correction is not None:
         direct_head_ids.update(id(p) for p in raw_model.provenance_correction.proposal_projection.parameters() if p.requires_grad)
     if raw_model.rgbwarp_correction is not None:
-        direct_head_ids.update(id(p) for p in raw_model.rgbwarp_correction.parameters() if p.requires_grad)
+        # The embedded GAM Predictor is checkpointed with the controller, but
+        # belongs to the existing Predictor LR group rather than the head LR.
+        from experiments.uavflow_paper_ablation.initialization import controller_head_parameter_ids
+        direct_head_ids.update(controller_head_parameter_ids(raw_model.rgbwarp_correction))
     if raw_model.action_residual_gate_logit is not None:
         direct_head_ids.add(id(raw_model.action_residual_gate_logit))
-    if bool(cfg.training.get('current_geometry_head_lr',False)) and raw_model.current_geometry_read is not None:
-        direct_head_ids.update(id(p) for p in raw_model.current_geometry_read.parameters() if p.requires_grad)
+    if bool(getattr(text,'pose5_enabled',False)):
+        direct_head_ids.update(id(p) for p in text.state_encoder.parameters() if p.requires_grad)
     separate_stop_lr = cfg.training.get("stop_head_lr") is not None
     stop_head_ids = {
         id(parameter) for parameter in raw_model.stop_head.parameters()
@@ -738,6 +848,10 @@ def main() -> None:
                 raise KeyError("Correction resume requires saved action_normalizer")
             normalizer = ActionNormalizer.from_state_dict(ckpt["action_normalizer"])
         saved_cfg = ckpt.get("config", {})
+        stop_activation=None
+        if args.activate_joint_stop:
+            from experiments.uavflow_warp_direct.joint_stop import validate_stop_activation
+            stop_activation=validate_stop_activation(ckpt,cfg_dict)
         saved_model_cfg = saved_cfg.get("model", {}) if isinstance(saved_cfg, dict) else {}
         saved_dataset_cfg = saved_cfg.get("dataset", {}) if isinstance(saved_cfg, dict) else {}
         saved_rollout = int(saved_model_cfg.get("rollout_steps", -1))
@@ -756,6 +870,11 @@ def main() -> None:
         # final training budget may intentionally change on continuation, so
         # they are not part of this compatibility contract.
         compatibility_paths = (
+            "dataset.type", "dataset.data_root", "dataset.manifest", "dataset.manifest_sha256",
+            "dataset.depth_unit_scale_m", "dataset.depth_kind", "dataset.hfov_degrees", "dataset.image_size",
+            "instruction_map",
+            "instruction_map_sha256",
+            "legacy_initialization_reference",
             "stage1.da3_checkpoint",
             "stage1.idm_checkpoint",
             "stage1.action_stats_dir",
@@ -779,7 +898,6 @@ def main() -> None:
             "model.pose_progress_enabled",
             "stage1.qwen_pose_progress_enabled",
             "dataset.split_file",
-            "dataset.eval_ratio",
             "dataset.real_root",
             "dataset.sim_root",
             "dataset.mixture_weights",
@@ -816,9 +934,6 @@ def main() -> None:
             "model.deep_action_enabled",
             "model.current_geometry_action_enabled",
             "model.current_geometry_read_mode",
-            "model.current_geometry_gate_init",
-            "model.current_geometry_zero_init",
-            "model.current_geometry_qk_norm",
             "model.current_geometry_bank_mode",
             "model.geometry_architecture",
             "model.vlm_action_seed_enabled",
@@ -839,6 +954,10 @@ def main() -> None:
             "model.provenance_correction",
             "model.dual_stream_rgbwarp_enabled",
             "model.rgbwarp_correction",
+            "stage1.qwen_pose5_enabled",
+            "stage1.paper_t5_pose_token",
+            "stage1.paper_t5_projection_seed",
+            "stage1.qwen_pose_init_seed",
             "model.da3_lora",
             "stage1.qwen_numeric_pose_token",
             "model.parallel_current_depth_enabled",
@@ -875,11 +994,14 @@ def main() -> None:
             "loss.depth_grad_weight",
             "training.batch_size",
             "training.gradient_accumulation_steps",
-            "training.current_geometry_head_lr",
+            "training.preserve_warp24_microgroups",
             "training.amp_dtype",
             "training.direct_action_head_lr_mult",
             "training.predictor_lr_mult",
             "training.stop_head_lr",
+            "training.joint_stop_start_epoch",
+            "training.joint_stop_start_step",
+            "training.joint_stop_terminal_repeat_count",
         )
 
         def nested_get(mapping, path):
@@ -891,18 +1013,20 @@ def main() -> None:
             return value
 
         current_cfg = cfg_dict if isinstance(cfg_dict, dict) else {}
+        migration = bool(cfg.training.get("preserve_two_rank_microgroups", False))
+        if migration:
+            from experiments.uavflow_matched_repeat.migration import validate
+            validate(saved_cfg, current_cfg, int(ckpt['world_size']), world,
+                     int(ckpt['step']), int(ckpt['epoch']), int(ckpt['batch']), len(train_set))
+            if rank == 0: print('FOUR_GPU_MIGRATION_VALIDATED: optimizer retained; canonical 8-sample groups; cursor='+str((ckpt['step'],ckpt['epoch'],ckpt['batch'])), flush=True)
         mismatches = []
         for path in compatibility_paths:
+            if migration and path == "training.gradient_accumulation_steps":continue
+            if args.activate_joint_stop:
+                from experiments.uavflow_warp_direct.joint_stop import STOP_MIGRATION_PATHS
+                if path in STOP_MIGRATION_PATHS:continue
             saved_value = nested_get(saved_cfg, path)
             current_value = nested_get(current_cfg, path)
-            if path in {"training.current_geometry_head_lr", "model.current_geometry_zero_init", "model.current_geometry_qk_norm"}:
-                saved_value, current_value = bool(saved_value), bool(current_value)
-            if path == "dataset.eval_ratio":
-                saved_value = float(0.05 if saved_value is None else saved_value)
-                current_value = float(0.05 if current_value is None else current_value)
-            if path == "training.gradient_accumulation_steps":
-                saved_value = 1 if saved_value is None else int(saved_value)
-                current_value = 1 if current_value is None else int(current_value)
             if path == "model.current_geometry_action_enabled":
                 # Checkpoints predating CA1_HB omit this disabled-by-default flag.
                 saved_value, current_value = bool(saved_value), bool(current_value)
@@ -913,20 +1037,18 @@ def main() -> None:
             if path == "model.current_geometry_bank_mode":
                 saved_value = saved_value or "every_layer_concat"
                 current_value = current_value or "every_layer_concat"
-            if path == "model.rgbwarp_correction":
-                saved_value = dict(saved_value or {})
-                current_value = dict(current_value or {})
-                saved_value.setdefault("qk_norm", False)
-                current_value.setdefault("qk_norm", False)
             if saved_value != current_value:
                 mismatches.append(f"{path}: checkpoint={saved_value!r}, current={current_value!r}")
         saved_world = ckpt.get("world_size")
-        if saved_world is not None and int(saved_world) != int(world):
+        if saved_world is not None and int(saved_world) != int(world) and not migration:
             mismatches.append(
                 f"world_size: checkpoint={int(saved_world)!r}, current={int(world)!r}"
             )
         saved_train_size = ckpt.get("train_size")
-        if saved_train_size is not None and int(saved_train_size) != int(len(train_set)):
+        if args.activate_joint_stop and stop_repeat_count:
+            expected_size=int(saved_train_size)+5*len(train_set.traj)
+            if train_set.native_size!=int(saved_train_size) or len(train_set)!=expected_size:raise ValueError('Stop-only repeat sample count changed unexpectedly')
+        if saved_train_size is not None and int(saved_train_size) != int(len(train_set)) and not (args.activate_joint_stop and stop_repeat_count):
             mismatches.append(
                 f"train_size: checkpoint={int(saved_train_size)!r}, current={int(len(train_set))!r}"
             )
@@ -1002,18 +1124,39 @@ def main() -> None:
             current.update(ckpt["da3_trainable"])
             raw_model.da3.load_state_dict(current, strict=True)
         if raw_model.stop_head_enabled:
-            if "stop_head" not in ckpt:
+            if args.activate_joint_stop:
+                if ckpt.get('stop_head') is not None:raise ValueError('Stop activation must initialize only a new head')
+            elif ckpt.get("stop_head") is None:
                 raise KeyError("Stop-enabled resume checkpoint has no stop_head state.")
-            raw_model.stop_head.load_state_dict(ckpt["stop_head"], strict=True)
+            else:raw_model.stop_head.load_state_dict(ckpt["stop_head"], strict=True)
         if raw_model.depth_scale_head_enabled:
             if ckpt.get("depth_scale_head") is None:
                 raise KeyError("Scale-separated resume checkpoint has no depth_scale_head state.")
             raw_model.depth_scale_head.load_state_dict(
                 ckpt["depth_scale_head"], strict=True
             )
-        optimizer.load_state_dict(ckpt["optimizer"])
+        if args.activate_joint_stop:
+            from experiments.uavflow_warp_direct.joint_stop import load_optimizer_with_new_stop_group
+            load_optimizer_with_new_stop_group(optimizer,ckpt['optimizer'])
+        else:optimizer.load_state_dict(ckpt["optimizer"])
+        if cfg.training.get("preserve_two_rank_microgroups", False) or os.environ.get("UAVFLOW_VERIFY_RESUME_OPTIMIZER") == "1":
+            saved_opt = ckpt['optimizer']
+            loaded_opt = optimizer.state_dict()
+            inherited_groups=loaded_opt['param_groups'][:len(saved_opt['param_groups'])] if args.activate_joint_stop else loaded_opt['param_groups']
+            if saved_opt['param_groups'] != inherited_groups:
+                raise ValueError('Optimizer parameter groups changed during migration')
+            for pid, state in saved_opt['state'].items():
+                for key,value in state.items():
+                    actual=loaded_opt['state'][pid][key]
+                    if torch.is_tensor(value):
+                        if not torch.equal(value.cpu(),actual.cpu()):raise ValueError('Optimizer tensor changed: '+str((pid,key)))
+                    elif value != actual: raise ValueError('Optimizer value changed')
+            if rank == 0: print('MIGRATION_OPTIMIZER_EXACTLY_RESTORED states='+str(len(saved_opt['state'])),flush=True)
         scaler.load_state_dict(ckpt["scaler"])
         start_step = int(ckpt["step"]); start_epoch = int(ckpt.get("epoch", 0)); start_batch = int(ckpt.get("batch", 0))
+        if args.activate_joint_stop:
+            start_epoch=stop_activation['epoch'];start_batch=0
+            if rank==0:print('JOINT_STOP_ACTIVATED '+json.dumps(stop_activation),flush=True)
     if is_dist:
         model = torch.nn.parallel.DistributedDataParallel(
             model, device_ids=[local_rank], output_device=local_rank,
@@ -1024,8 +1167,26 @@ def main() -> None:
     accumulation_steps = int(cfg.training.get("gradient_accumulation_steps", 1))
     if accumulation_steps < 1:
         raise ValueError("gradient_accumulation_steps must be positive")
+    from experiments.uavflow_matched_repeat.migration import PreservedMicrogroupSampler
+    from experiments.uavflow_paper_ablation.sampling import Warp24MicrogroupSampler
+    sampler_cls = PreservedMicrogroupSampler if cfg.training.get("preserve_two_rank_microgroups", False) else CursorDistributedSampler
+    preserve_warp24=bool(cfg.training.get('preserve_warp24_microgroups',False))
+    if preserve_warp24:
+        repartition_two = (world == 2 and int(cfg.training.batch_size) == 12
+                           and accumulation_steps == 1
+                           and bool(cfg.training.get('allow_warp24_two_gpu_repartition',False)))
+        repartition_single = (world == 1 and int(cfg.training.batch_size) == 24
+                              and accumulation_steps == 1
+                              and bool(cfg.training.get('allow_warp24_single_gpu_repartition',False)))
+        if not repartition_two and not repartition_single and (int(cfg.training.batch_size)!=8 or accumulation_steps*world!=3):
+            raise ValueError('Warp24 requires original micro8 groups, or explicit two-GPU micro12 repartition')
+        if repartition_two and rank == 0:
+            print('WARP24_TWO_GPU_REPARTITION global24 samples preserved; local batches12 replace reference8; loss groups/numerics may differ',flush=True)
+        if repartition_single:
+            print('WARP24_SINGLE_GPU_REPARTITION global24 sample identities/order preserved; local batch24 replaces distributed microbatches; depth reduction/numerics can differ',flush=True)
+        sampler_cls=Warp24MicrogroupSampler
     train_sampler = (
-        CursorDistributedSampler(
+        sampler_cls(
             train_set,
             num_replicas=world,
             rank=rank,
@@ -1035,12 +1196,29 @@ def main() -> None:
             resume_batch=start_batch,
             batch_size=int(cfg.training.batch_size) * accumulation_steps,
         )
+        if is_dist or preserve_warp24 else None
+    )
+    # A bounded evaluation must not consume the Real-first ConcatDataset prefix
+    # (which previously contained zero Sim windows).  A fixed shuffled sampler
+    # gives every evaluation the same deterministic subset over all physical
+    # validation windows and both domains.
+    eval_sampler = (
+        DistributedSampler(
+            eval_set, num_replicas=world, rank=rank, shuffle=True,
+            seed=int(cfg.seed), drop_last=False,
+        )
         if is_dist else None
     )
-    # Full validation shards never pad/repeat examples. Bounded monitoring
-    # retains the historical fixed shuffled subset.
-    eval_sampler = evaluation_sampler(eval_set,world=world,rank=rank,
-        max_batches=int(cfg.training.eval_max_batches),shuffle=True,seed=int(cfg.seed))
+    if bool(cfg.training.get("full_eval_unique", False)):
+        # Exact strided shards: no DistributedSampler padding/repeated windows.
+        eval_sampler = list(range(rank, len(eval_set), world)) if is_dist else None
+        eval_batch_size = int(cfg.training.get("eval_batch_size", cfg.training.batch_size))
+        batch_counts = [math.ceil(len(range(r, len(eval_set), world)) / eval_batch_size)
+                        for r in range(world)]
+        if len(set(batch_counts)) != 1:
+            raise ValueError("Uneven full-eval forward counts would deadlock DDP buffer broadcasts")
+    else:
+        eval_batch_size = int(cfg.training.batch_size)
     train_loader = DataLoader(
         train_set, batch_size=int(cfg.training.batch_size), sampler=train_sampler,
         shuffle=train_sampler is None, num_workers=int(cfg.training.num_workers),
@@ -1048,7 +1226,7 @@ def main() -> None:
         persistent_workers=int(cfg.training.num_workers) > 0,
     )
     eval_loader = DataLoader(
-        eval_set, batch_size=int(cfg.training.batch_size), sampler=eval_sampler,
+        eval_set, batch_size=eval_batch_size, sampler=eval_sampler,
         shuffle=False, num_workers=max(1, int(cfg.training.num_workers) // 2),
         pin_memory=accelerator.kind == "cuda", drop_last=False,
     )
@@ -1058,9 +1236,13 @@ def main() -> None:
     # degradation can be measured without Real/Sim mixture bias.
     eval_domain_loaders: dict[str, DataLoader] = {}
     for domain_index, (domain_name, domain_set) in enumerate(eval_domain_sets.items()):
-        domain_sampler = evaluation_sampler(domain_set,world=world,rank=rank,
-            max_batches=int(cfg.training.eval_max_batches),shuffle=True,
-            seed=int(cfg.seed)+1000+domain_index)
+        domain_sampler = (
+            DistributedSampler(
+                domain_set, num_replicas=world, rank=rank, shuffle=True,
+                seed=int(cfg.seed) + 1000 + domain_index, drop_last=False,
+            )
+            if is_dist else None
+        )
         eval_domain_loaders[domain_name] = DataLoader(
             domain_set,
             batch_size=int(cfg.training.batch_size),
@@ -1181,6 +1363,9 @@ def main() -> None:
             payload = {
                 "checkpoint": str(args.resume),
                 "step": int(start_step),
+                "validation_windows": len(eval_set),
+                "unique_full_validation": bool(cfg.training.get("full_eval_unique", False)),
+                "eval_max_batches": int(cfg.training.eval_max_batches),
                 "protocol": {
                     "rollout_steps": int(cfg.model.rollout_steps),
                     "future_steps": int(cfg.dataset.future_steps),
@@ -1210,6 +1395,8 @@ def main() -> None:
     samples_per_rank = (
         int(math.ceil(len(train_set) / float(world))) if is_dist else len(train_set)
     )
+    if preserve_warp24:
+        samples_per_rank=train_sampler.updates*(24//world)
     steps_per_epoch = samples_per_rank // int(cfg.training.batch_size) // accumulation_steps
     if steps_per_epoch < 1:
         raise ValueError("Dataset is too small for one accumulated optimizer update")
@@ -1218,6 +1405,9 @@ def main() -> None:
         if configured_epochs > 0
         else int(cfg.training.max_steps)
     )
+    if stop_repeat_count:
+        from experiments.uavflow_warp_direct.joint_stop import joint_step_budget
+        max_steps=joint_step_budget(cfg_dict,steps_per_epoch)
     scheduler_total_steps = int(
         cfg.training.get("scheduler_total_steps", 0) or max_steps
     )
@@ -1305,14 +1495,8 @@ def main() -> None:
 
     def atomic_save_checkpoint(payload: dict, destination: Path) -> None:
         """Write a checkpoint atomically so interruption cannot corrupt resume."""
-        temporary = destination.with_name(
-            f".{destination.name}.tmp-rank0-{os.getpid()}"
-        )
-        try:
-            torch.save(payload, temporary)
-            os.replace(temporary, destination)
-        finally:
-            temporary.unlink(missing_ok=True)
+        from experiments.uavflow_paper_ablation.checkpoint_io import save_full
+        save_full(payload,destination)
 
     def point_last_at(numbered_checkpoint: Path) -> None:
         """Make last.pt an atomic, zero-extra-space alias of an epoch checkpoint."""
@@ -1320,7 +1504,8 @@ def main() -> None:
         temporary = output / f".last.pt.tmp-rank0-{os.getpid()}"
         try:
             temporary.unlink(missing_ok=True)
-            os.link(numbered_checkpoint, temporary)
+            if numbered_checkpoint.is_symlink():temporary.symlink_to(numbered_checkpoint.resolve())
+            else:os.link(numbered_checkpoint, temporary)
             os.replace(temporary, destination)
         finally:
             temporary.unlink(missing_ok=True)
@@ -1330,12 +1515,18 @@ def main() -> None:
     ) -> Path:
         payload = checkpoint_payload(saved_step, saved_epoch, saved_batch)
         destination = output / f"ckpt_{saved_step:07d}.pt"
-        atomic_save_checkpoint(payload, destination)
-        point_last_at(destination)
+        if cfg.training.get('epoch_weights_only',False):
+            from experiments.uavflow_matched_repeat.common import compact
+            atomic_save_checkpoint(payload, output / 'last.pt')
+            atomic_save_checkpoint(compact(payload), destination)
+        else:
+            atomic_save_checkpoint(payload, destination)
+            point_last_at(destination)
         return destination
 
-    best_action_path = output / "best_action.pt"
-    best_action_meta_path = output / "best_action.json"
+    joint_stop_selection=rgbwarp_enabled and raw_model.stop_head_enabled
+    best_action_path = output / ("best_joint_action.pt" if joint_stop_selection else "best_action.pt")
+    best_action_meta_path = output / ("best_joint_action.json" if joint_stop_selection else "best_action.json")
     best_action_value = float("inf")
     if best_action_meta_path.is_file():
         try:
@@ -1357,6 +1548,7 @@ def main() -> None:
     last_saved_step = start_step if args.resume else -1
     health_cfg = cfg.training.get("warp_health", {}) or {}
     health_guard = None
+    consecutive_nonfinite_skips = 0
     stop_reason = None
     if rgbwarp_enabled and bool(health_cfg.get("enabled", False)):
         from .training_health import WarpHealthGuard
@@ -1378,6 +1570,9 @@ def main() -> None:
         if guard_state is not None:
             health_guard.load_state_dict(guard_state)
     pbar = tqdm(total=max_steps, initial=step, disable=rank != 0, desc="uav-predictor-idm")
+    from .global_loss_logging import GlobalLossWindow
+    global_loss_window=GlobalLossWindow(current_only=current_only,future_only=native_gam or future_only,final_only=native_gam or current_final_only)
+    global_loss_logging=rgbwarp_enabled and bool(cfg.training.get('log_global_interval',False))
     model.train()
     while step < max_steps and stop_reason is None:
         if train_sampler is not None:
@@ -1386,13 +1581,20 @@ def main() -> None:
             train_set.set_epoch(epoch)
         # With DDP, CursorDistributedSampler has already sliced away consumed
         # samples. Keep a logical (pre-slice) batch index for future checkpoints.
-        resumed_batch_offset = start_batch if (is_dist and epoch == start_epoch) else 0
+        resumed_batch_offset = start_batch if (train_sampler is not None and epoch == start_epoch) else 0
         for batch_idx, microbatches in enumerate(optimizer_batches(train_loader, accumulation_steps)):
-            if not is_dist and epoch == start_epoch and batch_idx < start_batch:
+            if train_sampler is None and epoch == start_epoch and batch_idx < start_batch:
                 continue
             logical_batch_idx = batch_idx + resumed_batch_offset
             if step >= max_steps:
                 break
+            from experiments.uavflow_paper_ablation.disk_guard import low_space
+            if low_space(output,step,device,is_dist,rank,force=True):
+                if rank==0:
+                    atomic_save_checkpoint(checkpoint_payload(step,epoch,logical_batch_idx),output/'last.pt')
+                    (output/'_SPACE_PAUSED.json').write_text(json.dumps(dict(step=step,epoch=epoch,batch=logical_batch_idx,reason='5GiB policy: full emergency checkpoint saved',time_unix=time.time())))
+                if is_dist:dist.barrier();dist.destroy_process_group()
+                return
             step += 1
             if benchmark is not None:
                 benchmark.before_step(step)
@@ -1416,7 +1618,7 @@ def main() -> None:
                 # Step-keyed randomness makes context sampling and augmentation
                 # bitwise resume-stable without serializing global CUDA RNG state.
                 batch_generator = step_generator(
-                    accelerator, int(cfg.seed) + ((step - 1) * accumulation_steps + micro_idx + 1) * world + rank
+                    accelerator, train_sampler.micro_seed(step, micro_idx) if isinstance(train_sampler, (PreservedMicrogroupSampler,Warp24MicrogroupSampler)) else int(cfg.seed) + ((step - 1) * accumulation_steps + micro_idx + 1) * world + rank
                 )
                 augmented_sequence = temporal_color_augment(
                     torch.cat([
@@ -1517,11 +1719,33 @@ def main() -> None:
                 )
                 if correction_mode == 'uncertain':
                     loss = loss + float(correction_cfg.get('uncertainty_weight', 1.))*values['provenance_uncertainty_loss']
+                if os.environ.get("UAVFLOW_COMPONENT_AUDIT") == "1":
+                    target = (raw_model.rgbwarp_correction.future_predictor.future_visual_proj.weight if gam_enabled
+                              else raw_model.rgbwarp_correction.proposal_projection[-1].weight if single_stream
+                              else raw_model.rgbwarp_correction.correspondence.attention.in_proj_weight)
+                    component_rows = []
+                    component_keys=("action", "diagnostic_future_depth" if future_only else "diagnostic_current_depth") if single_stream else (
+                        "action", "diagnostic_current_depth", "diagnostic_future_depth")
+                    for key in component_keys:
+                        derivative = torch.autograd.grad(values[key], target, retain_graph=True, allow_unused=True)[0]
+                        if derivative is None:
+                            component_rows.append(dict(component=key, unused=True))
+                        else:
+                            component_rows.append(dict(component=key, value=float(values[key]),
+                                finite=bool(torch.isfinite(derivative).all()),
+                                qkv_norm64=[float(g.double().norm()) for g in derivative.chunk(3,dim=0)],
+                                max_abs=float(derivative.abs().max())))
+                    (output / f"component_audit_rank{rank}.json").write_text(json.dumps(component_rows,indent=2))
                 with profile_phase("R1/backward"):
                     scaler.scale(loss / accumulation_steps).backward()
                 for key, value in values.items():
                     if isinstance(value, torch.Tensor):
-                        detached = value.detach() / accumulation_steps
+                        # Counts/moments must cover all accumulated windows,
+                        # whereas losses retain the equal-microbatch objective.
+                        count_stat=no_rasterizer and key in {
+                            '_global_log_action_stats','action_raw_moments',
+                            '_window_action_stats','_global_log_stop_stats'}
+                        detached = value.detach() if count_stat else value.detach() / accumulation_steps
                         averaged_values[key] = averaged_values.get(key, 0) + detached
                 detached_loss = loss.detach() / accumulation_steps
                 averaged_loss = detached_loss if averaged_loss is None else averaged_loss + detached_loss
@@ -1536,14 +1760,29 @@ def main() -> None:
                 weighted_depth_global = float(cfg.loss.get("depth_weight", 0.0)) * values["depth"]
                 weighted_depth_dynamic = values["depth"].new_zeros(())
             scaler.unscale_(optimizer)
+            if os.environ.get("UAVFLOW_GRAD_AUDIT") == "1":
+                gradient_rows = []
+                for prefix, component in (("model", raw_model),):
+                    for name, parameter in component.named_parameters():
+                        if parameter.grad is None:
+                            continue
+                        g = parameter.grad.detach()
+                        gradient_rows.append(dict(name=prefix+"."+name,
+                            finite=bool(torch.isfinite(g).all()),
+                            max_abs=float(g.abs().max()), norm64=float(g.double().norm())))
+                gradient_rows.sort(key=lambda row: row["norm64"] if math.isfinite(row["norm64"]) else float("inf"), reverse=True)
+                audit = dict(step=step, rank=rank, loss=float(loss), gradients=gradient_rows,
+                             losses={key:float(value) for key,value in values.items() if isinstance(value,torch.Tensor) and value.numel()==1})
+                (output / f"gradient_audit_rank{rank}_step{step}.json").write_text(json.dumps(audit,indent=2))
             grad = torch.nn.utils.clip_grad_norm_(trainable, float(cfg.training.grad_clip))
             if health_guard is not None:
                 # Equal local batch sizes: averaging these pixel fractions across
                 # ranks represents the entire effective batch, not just rank 0.
                 health = torch.stack((
-                    values["rgbwarp_valid_ratio"].float(),
-                    values["rgbwarp_current_depth_zero_fraction"].float(),
-                    values["rgbwarp_current_depth_mean_m"].float(),
+                    # Current-only has no rasterization coverage to monitor.
+                    (loss.new_ones(()) if no_rasterizer else values["rgbwarp_valid_ratio"]).float(),
+                    values["rgbwarp_future_depth_zero_fraction" if native_gam else "rgbwarp_current_depth_zero_fraction"].float(),
+                    values["rgbwarp_future_depth_mean_m" if native_gam else "rgbwarp_current_depth_mean_m"].float(),
                     (~(torch.isfinite(loss) & torch.isfinite(grad))).float(),
                 )).detach()
                 if is_dist:
@@ -1560,9 +1799,33 @@ def main() -> None:
                               empty_steps=health_guard.empty_steps,
                               collapsed_steps=health_guard.collapsed_steps,
                               stop_reason=stop_reason)
+                if native_gam:
+                    record['future_depth_zero_fraction']=record.pop('current_depth_zero_fraction')
+                    record['future_depth_mean_m']=record.pop('current_depth_mean_m')
+                if no_rasterizer:
+                    record.pop('warp_valid_ratio')
+                    record['branch_mode']=geometry_branch
                 if rank == 0:
                     with (output / "health.jsonl").open("a") as handle:
                         handle.write(json.dumps(record) + "\n")
+                if stop_reason == "nonfinite" and bool(health_cfg.get("skip_nonfinite", False)):
+                    consecutive_nonfinite_skips += 1
+                    if consecutive_nonfinite_skips < int(health_cfg.get("maximum_consecutive_skips", 100)):
+                        # Consume this batch, but do not touch parameters or Adam moments.
+                        optimizer.zero_grad(set_to_none=True)
+                        if scaler.is_enabled():
+                            scaler.update()
+                        if rank == 0:
+                            skipped = dict(record, consecutive_skips=consecutive_nonfinite_skips,
+                                           optimizer_update=False, epoch=epoch,
+                                           next_batch=logical_batch_idx + 1)
+                            with (output / "nonfinite_skips.jsonl").open("a") as handle:
+                                handle.write(json.dumps(skipped) + "\n")
+                            print("\n[SKIP_NONFINITE] " + json.dumps(skipped), flush=True)
+                        stop_reason = None
+                        continue
+                elif stop_reason is None:
+                    consecutive_nonfinite_skips = 0
                 if stop_reason is not None:
                     # No optimizer update has happened for this observed batch.
                     # Save the preceding completed step and its exact cursor.
@@ -1588,6 +1851,15 @@ def main() -> None:
                     print("\n" + benchmark_line, flush=True)
                     with (output / "train.log").open("a") as handle:
                         handle.write(benchmark_line + "\n")
+            log_metadata=None
+            if global_loss_logging:
+                global_loss_window.add(values,loss)
+                if step % int(cfg.training.log_every)==0:
+                    global_values,global_total,log_metadata=global_loss_window.finish(is_dist)
+                    values.update(global_values);loss=global_total
+                    weighted_action=float(cfg.loss.action_weight)*values['action']
+                    weighted_feature=float(cfg.loss.feature_weight)*values['feature']
+                    weighted_depth_global=float(cfg.loss.depth_weight)*values['depth']
             if rank == 0 and step % int(cfg.training.log_every) == 0:
                 feat_steps = "/".join(
                     f"{float(value):.4f}"
@@ -1657,10 +1929,27 @@ def main() -> None:
                     f"peak_mem={memory_gb:.2f}GB"
                 )
                 line = compact_train_line(line, values, cfg)
+                if native_gam:line=line.replace(f"direct={values['direct_action'].item():.4f} ",'')
+                if log_metadata is not None:
+                    line=line.replace('action_stats_scope=rank0_batch','action_stats_scope=global_interval')
+                    line+=' '+ ' '.join(f'{key}={value}' for key,value in log_metadata.items())
                 print("\n" + line, flush=True)
                 with (output / "train.log").open("a") as handle: handle.write(line + "\n")
+            from experiments.uavflow_paper_ablation.disk_guard import low_space
+            if low_space(output,step,device,is_dist,rank):
+                if rank == 0:
+                    atomic_save_checkpoint(checkpoint_payload(step,epoch,logical_batch_idx+1),output/'last.pt')
+                    (output/'_SPACE_PAUSED.json').write_text(json.dumps(dict(step=step,epoch=epoch,batch=logical_batch_idx+1,reason='Low free disk; complete optimizer checkpoint saved',time_unix=time.time())))
+                    print(f'SPACE_PAUSED full_checkpoint={output / "last.pt"} step={step}',flush=True)
+                if is_dist:
+                    dist.barrier();dist.destroy_process_group()
+                return
             periodic_eval_due = int(cfg.training.eval_every) > 0 and step % int(cfg.training.eval_every) == 0
             epoch_eval_due = bool(cfg.training.get("eval_every_epoch", False)) and logical_batch_idx + 1 == steps_per_epoch
+            if (periodic_eval_due or epoch_eval_due) and native_gam and cfg.model.rgbwarp_correction.get('native_frozen_shallow',False):
+                # Protect the exact training cursor before validation can fail.
+                if rank==0:atomic_save_checkpoint(checkpoint_payload(step,epoch,logical_batch_idx+1),output/'last.pt')
+                if is_dist:dist.barrier()
             if periodic_eval_due or epoch_eval_due:
                 ev = evaluate(
                     model=model, da3=da3, text=text, normalizer=normalizer,
@@ -1714,6 +2003,12 @@ def main() -> None:
                         cfg.loss.get("depth_gradient_tolerance_pixels", 2)
                     ),
                 )
+                if bool(cfg.training.get("full_eval_unique", False)):
+                    if int(cfg.training.eval_max_batches) > 0:
+                        raise ValueError("full_eval_unique requires eval_max_batches <= 0")
+                    evaluated = int(ev[f"H{min(int(v) for v in cfg.model.context_lengths)}_evaluated_windows"])
+                    if evaluated != len(eval_set):
+                        raise RuntimeError(f"Incomplete full validation: {evaluated} != {len(eval_set)}")
                 domain_evals: dict[str, dict[str, float]] = {}
                 for domain_name, domain_loader in eval_domain_loaders.items():
                     domain_evals[domain_name] = evaluate(

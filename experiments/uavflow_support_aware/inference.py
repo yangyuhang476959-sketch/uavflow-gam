@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import inspect
+from contextlib import nullcontext
 
 import torch
 from omegaconf import OmegaConf
@@ -118,14 +119,29 @@ class RGBWarpPolicy(SupportAwarePolicy):
     @torch.inference_mode()
     def predict(self,current_images,instructions,*,reference_images=None,current_prompt_pose=None,
                 first_sim_pose=None,current_sim_pose=None,stats_keys=None,camera_intrinsics=None,
-                observed_pose_history=None):
+                observed_pose_history=None,image_valid_mask=None):
         """Observation only. Canonical state is first-YAW-frame cm/degrees.
 
         Prefer raw simulator poses, converted by EXACT Dataset helper. An
         existing service may provide already canonical current_prompt_pose.
         Never pass simulator world xyz directly as a relative state.
         """
-        if getattr(self.conditioner,'pose_progress_enabled',False):
+        if getattr(self.conditioner,'pose5_enabled',False):
+            if observed_pose_history is not None:
+                if current_prompt_pose is not None:raise ValueError('Provide history OR canonical 5D state')
+                from robot.data.uavflow_dataset import episode_yaw4d_state
+                states=[]
+                for history in observed_pose_history:
+                    if len(history)<1:raise ValueError('Empty observation history')
+                    state=episode_yaw4d_state(history[0],history[-1]).tolist()
+                    states.append(state+[float(len(history)==1)])
+                current_prompt_pose=torch.tensor(states,device=current_images.device,dtype=torch.float32)
+            elif first_sim_pose is not None or current_sim_pose is not None:
+                raise ValueError('5D is_start requires full observed history or explicit canonical 5D state')
+            current_prompt_pose=torch.as_tensor(current_prompt_pose,device=current_images.device,dtype=torch.float32)
+            if current_prompt_pose.shape!=(len(instructions),5) or not torch.isfinite(current_prompt_pose).all():raise ValueError('Expected finite canonical [B,5] cm/deg/is_start')
+            if not ((current_prompt_pose[:,-1]==0)|(current_prompt_pose[:,-1]==1)).all():raise ValueError('is_start must be 0/1')
+        elif getattr(self.conditioner,'pose_progress_enabled',False):
             current_prompt_pose=canonical_progress_state(current_images,instructions,current_prompt_pose,
                 observed_pose_history,first_sim_pose,current_sim_pose)
         else:
@@ -138,18 +154,31 @@ class RGBWarpPolicy(SupportAwarePolicy):
                 or current_images.shape[0]!=len(instructions)):
             raise ValueError('Expected current RGB [B,1,3,H,W]')
         with autocast_context(current_images.device,enabled=self.amp,dtype_name=self.amp_dtype):
-            language=encode_stage2_condition(self.conditioner,instructions,
-                reference_images=current_images,current_images=current_images,
-                current_pose=current_prompt_pose,pad_to=self.model.predictor.language_len)
+            conditioner_device = next(self.conditioner.parameters()).device
+            conditioning_images = current_images.to(conditioner_device)
+            conditioner_context = (torch.cuda.device(conditioner_device)
+                                   if conditioner_device.type == 'cuda' else nullcontext())
+            with conditioner_context:
+                language=encode_stage2_condition(self.conditioner,instructions,
+                    reference_images=conditioning_images,current_images=conditioning_images,
+                    current_pose=current_prompt_pose.to(conditioner_device),pad_to=self.model.predictor.language_len)
+            gam_options=({'gam_pose_embedding':language['pose_embedding'].to(current_images.device)}
+                if (self.model.rgbwarp_correction.config.get('branch_mode') in {'uav_gam','vla_gam'}
+                    or self.model.rgbwarp_correction.config.get('future_pose_token_enabled',False)) else {})
             output=self.model(current_images[:,0],reference_shallow=None,
-                lang_feats=language['last_hidden_state'],lang_padding_mask=language['attention_mask'],
+                lang_feats=language['last_hidden_state'].to(current_images.device),
+                lang_padding_mask=(None if language['attention_mask'] is None else language['attention_mask'].to(current_images.device)),
                 action_denormalizer=lambda x:self.normalizer.denormalize(x,stats_keys=stats_keys),
-                camera_intrinsics=camera_intrinsics)
+                camera_intrinsics=camera_intrinsics,image_valid_mask=image_valid_mask,
+                stop_pose=(current_prompt_pose[:,None]/self.conditioner.state_scale.to(current_prompt_pose.device)
+                           if self.model.stop_head_enabled else None),**gam_options)
         output['actions_meters_radians']=self.normalizer.denormalize(output['actions_norm'].float(),stats_keys=stats_keys)[:,0]
+        if output.get('stop_logits') is not None:output['stop_probabilities']=output['stop_logits'].float().sigmoid()
         return output
 
 
-def load_policy(checkpoint_path, *, device="cuda:0", da3_checkpoint=None, qwen_model=None):
+def load_policy(checkpoint_path, *, device="cuda:0", da3_checkpoint=None, qwen_model=None,
+                conditioner_device=None):
     from experiments.uavflow_predictor_idm.runtime import bootstrap_accelerator_plugin
     bootstrap_accelerator_plugin()
     from robot.data.dataset import ActionNormalizer
@@ -182,14 +211,19 @@ def load_policy(checkpoint_path, *, device="cuda:0", da3_checkpoint=None, qwen_m
         da3.configure_deep_lora(block_idx=int(lora.get("start_block", 13)), rank=int(lora.get("rank", 64)),
                                alpha=float(lora.get("alpha", 128.)), dropout=float(lora.get("dropout", 0.)),
                                target_modules=lora.get("target_modules"))
-    conditioner = build_stage2_conditioner(cfg.stage1, cfg.model).to(device).eval()
+    conditioner = build_stage2_conditioner(cfg.stage1, cfg.model).to(
+        device if conditioner_device is None else conditioner_device
+    ).eval()
     options = OmegaConf.to_container(cfg.model, resolve=True)
     options = {key: value for key, value in options.items()
                if key in inspect.signature(UAVFlowPredictorIDM.__init__).parameters}
-    options.update(da3=da3, idm=None, action_dim=4, language_dim=int(conditioner.hidden_size),
+    options.update(da3=da3, idm=None, action_dim=4, language_dim=int(getattr(conditioner,'action_interface_dim',conditioner.hidden_size)),
                    variable_language_tokens=bool(getattr(conditioner, "variable_length_tokens", False)),
                    depth_decode_enabled=True)
     model = UAVFlowPredictorIDM(**options).to(device)
+    if cfg.get('matched_common_init'):
+        from experiments.uavflow_matched_repeat.common import apply_warp
+        apply_warp(model,conditioner,str(cfg.matched_common_init))
     model.predictor.load_state_dict(checkpoint["predictor"], strict=True)
     model.semantic_geometry_action.load_state_dict(checkpoint["semantic_geometry_action"], strict=True)
     model.parallel_action_head.load_state_dict(checkpoint["parallel_action_head"], strict=True)
@@ -221,6 +255,9 @@ def load_policy(checkpoint_path, *, device="cuda:0", da3_checkpoint=None, qwen_m
     if "action_normalizer" not in checkpoint:
         raise KeyError("Candidate B checkpoint must carry its action_normalizer")
     normalizer = ActionNormalizer.from_state_dict(checkpoint["action_normalizer"])
+    if model.stop_head_enabled:
+        if checkpoint.get('stop_head') is None:raise KeyError('Stop-enabled checkpoint requires its trained Stop head')
+        model.stop_head.load_state_dict(checkpoint['stop_head'],strict=True)
     policy_type=RGBWarpPolicy if model.dual_stream_rgbwarp_enabled else SupportAwarePolicy
     return policy_type(model, conditioner, normalizer, amp=bool(cfg.training.amp),
                               pose_state_mode=str(cfg.dataset.get('openvla_prompt_pose_mode','preprocessed')),

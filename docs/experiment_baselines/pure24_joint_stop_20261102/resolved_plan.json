@@ -1,0 +1,120 @@
+{
+  "config": {
+    "seed": 42,
+    "stop_seed": 43,
+    "action_epochs": 10,
+    "joint_epochs": 10,
+    "batch_size": 24,
+    "gradient_accumulation_steps": 1,
+    "num_workers": 4,
+    "eval_batch_size": 24,
+    "eval_every_updates": 5000,
+    "log_every_updates": 25,
+    "save_every_updates": 1000,
+    "lora_lr": 1e-05,
+    "head_lr": 0.0005,
+    "stop_lr": 0.0005,
+    "stop_width": 512,
+    "stop_loss_weight": 1.0,
+    "stop_pos_weight": 5.0,
+    "self_pair_end_count": 5,
+    "action_variant": "A",
+    "warmup_ratio": 0.0,
+    "min_lr_ratio": 1.0,
+    "scheduler": "constant",
+    "base_config": "results/pure_stop_probe_v3_mask_ab_val001/run_20261024/stage1_runtime.json",
+    "joint_stop_gradient": "shared",
+    "pose_extra_init": "random",
+    "cpu_threads": 4,
+    "vision_gradient_checkpointing_blocks": 8,
+    "checkpoint_min_epoch": 1,
+    "action_only": false,
+    "decoder_width": 1536,
+    "matched_warp_config": "/root/autodl-tmp/uavflow-gam/results/pure24_legacy_warp_recipe_5epochs_20261101/warp_reference.yaml",
+    "matched_manifest": "/root/autodl-tmp/uavflow-gam/results/pure24_legacy_warp_recipe_5epochs_20261101/manifest.json",
+    "common_init_file": "/root/autodl-tmp/uavflow-gam/results/matched_repeat5_pure_warp_20261029/common_init.pt",
+    "drop_last": true,
+    "action_loss_weight": 3.0,
+    "best_action_scope": "all",
+    "epoch_weights_only": false,
+    "matched_joint_stop": true,
+    "common_stop_init_file": "/root/autodl-tmp/uavflow-gam/results/pure24_joint_stop10_20261102/common_stop_init.pt"
+  },
+  "group": "A",
+  "representation": "pose5",
+  "pose_lr": 0.0005,
+  "pose_names": [
+    "x_cm",
+    "y_cm",
+    "z_cm",
+    "relative_yaw_deg",
+    "is_start"
+  ],
+  "pose_scale": [
+    1000.0,
+    1000.0,
+    1000.0,
+    180.0,
+    1.0
+  ],
+  "effective_batch": 24,
+  "data_split": "inherited immutable 1% stratified episode validation; full validation; no internal test",
+  "optimizer": "inherited AdamW betas=(0.9,0.999), eps=1e-8, weight_decay=0, grad_clip=1",
+  "pose_lr_scope": "action policy state_encoder only; Stop and its dedicated Pose MLP fixed at stop_lr",
+  "output": "results/pure24_joint_stop10_20261102/pure",
+  "inherited": {
+    "qwen_model": "qwen3.5-2b",
+    "normalizer_dir": "data/uavflow_stats_sim_openvla_yaw4d",
+    "prepared_dir": "results/pure_stop_probe_v3_mask_ab_val001/prepared",
+    "eval_ratio": 0.01,
+    "episode_split_mode": "stratified_instruction",
+    "episode_split_seed": 42,
+    "action_convention": "yaw4d",
+    "action_delta_mode": "openvla_yaw_only",
+    "optimizer": {
+      "name": "AdamW",
+      "weight_decay": 0.0,
+      "betas": [
+        0.9,
+        0.999
+      ],
+      "eps": 1e-08,
+      "grad_clip": 1.0
+    }
+  },
+  "stages": [
+    {
+      "name": "action",
+      "epochs": 10,
+      "windows": 309145,
+      "planned_updates": 128810,
+      "warmup_updates": 0
+    },
+    {
+      "name": "joint_action_stop",
+      "epochs": 10,
+      "windows": 359185,
+      "planned_updates": 149660,
+      "warmup_updates": 0
+    }
+  ],
+  "validation": {
+    "episodes": 101,
+    "total_windows": 3095,
+    "normal_windows": 2592,
+    "extra_absorbing_windows": 503,
+    "terminal_self_pair_windows": 0,
+    "extra_absorbing_fraction": 0.16252019386106623,
+    "stop_positive": 101,
+    "stop_negative": 2994,
+    "real_transition_action_slots": 13962,
+    "padded_action_slots": 1513,
+    "supervised_action_slots": 15475,
+    "masked_padding_slots": 0,
+    "zero_action_supervision_windows": 0,
+    "sample_sha256": "e5a4e10c4ddcb48b9e60ffb3db9d8b2782ed61779d0cfd983cf0051d37bc606c",
+    "normal_sha256": "2cefc66c1569f0d0dcff7cc7770b2eac697e17992bb241c846d2671c326f40a2"
+  },
+  "sampling": "native action windows retained; added5 terminal self-pairs per episode have action mask0 and Stop supervision1; joint Stop",
+  "checkpoint_selection": "lowest full-val ALL-window action L1; joint best_stop separately max full-val Stop F1"
+}

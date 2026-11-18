@@ -2871,6 +2871,9 @@ def _repeat_missing_views(dataset_cfg: Mapping[str, Any]) -> bool:
 
 def build_robot_dataset(dataset_cfg: Dict[str, Any], is_eval: bool = False) -> Dataset:
     dataset_type = str(dataset_cfg.get("type", "mimicgen")).lower()
+    if dataset_type == 'indooruav_vla':
+        from .indooruav_dataset import IndoorUAVVLADataset
+        return IndoorUAVVLADataset(is_eval=is_eval, **dict(dataset_cfg))
     pad_views_to_max = _pad_views_to_max_enabled(dataset_cfg)
     view_max_views = _configured_view_max(dataset_cfg) if pad_views_to_max else None
     repeat_missing_views = _repeat_missing_views(dataset_cfg)
@@ -3174,10 +3177,11 @@ def summarize_action_statistics(stats_by_key: Dict[str, Dict[str, np.ndarray]]) 
 
 
 class ActionNormalizer:
-    """Per-dataset action normalization. Two modes:
+    """Per-dataset action normalization. Three modes:
 
     - ``q01_q99`` (default): ``2*(x - q01)/(q99 - q01) - 1``, unclamped.
     - ``mean_std``: ``(x - mean) / (std + eps)``, no clamp.
+    - ``none``: identity; targets and predictions remain in native units.
 
     Both modes can be backed by the same cached stats files since
     ``compute_action_statistics`` always emits ``q01``/``q99``/``mean``/``std``.
@@ -3186,7 +3190,7 @@ class ActionNormalizer:
     """
 
     CONSTANT_DIM_THRESHOLD = 1e-6  # dims with q99-q01 (or std) below this are treated as constant
-    SUPPORTED_NORM_MODES = ("q01_q99", "mean_std")
+    SUPPORTED_NORM_MODES = ("q01_q99", "mean_std", "none")
     FULL_7D_REQUIRED_KEYS = {"robocasa_cosmos24_7d"}
 
     @staticmethod
@@ -3275,6 +3279,8 @@ class ActionNormalizer:
         self.default_key = default_key if default_key in self.stats_by_key else next(iter(self.stats_by_key))
 
     def _normalize_single(self, actions: torch.Tensor, stats_key: str) -> torch.Tensor:
+        if self.norm_mode == "none":
+            return actions
         stats = self.stats_by_key[stats_key]
         mask = stats["mask"].to(actions.device)
         if self.norm_mode == "mean_std":
@@ -3288,6 +3294,8 @@ class ActionNormalizer:
         return torch.where(mask.view(*([1] * (actions.ndim - 1)), -1), normalized, actions)
 
     def _denormalize_single(self, actions: torch.Tensor, stats_key: str) -> torch.Tensor:
+        if self.norm_mode == "none":
+            return actions
         stats = self.stats_by_key[stats_key]
         mask = stats["mask"].to(actions.device)
         if self.norm_mode == "mean_std":

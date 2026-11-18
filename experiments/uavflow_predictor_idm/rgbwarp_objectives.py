@@ -4,6 +4,7 @@ This is intentionally a target-view CONTROL regularizer, not a claim of
 pixel-aligned depth reconstruction at an arbitrary proposal camera pose.
 """
 import torch
+import os
 from .objectives import masked_action_l1,_finite_difference_gradient_l1
 from .runtime import autocast_context
 from .vlm_conditioning import encode_stage2_condition
@@ -32,40 +33,58 @@ def depth_loss(prediction,target,valid,scale,*,linear_weight=1.,log_weight=0.,gr
 
 def forward_rgbwarp_batch(*,model,da3,text,normalizer,batch,context_len,rollout_steps,amp,amp_dtype,
                          depth_linear_weight=1.,depth_log_weight=0.,depth_grad_weight=1.,
-                         depth_log_epsilon_normalized=1e-6):
+                         depth_log_epsilon_normalized=1e-6,stop_pos_weight=5.,feature_horizon_weights=(1.,),
+                         feature_patch_weight=1.,feature_cls_weight=0.,feature_register_weight=0.):
     ref=model.module if hasattr(model,'module') else model
+    if ref.rgbwarp_correction.config.get('native_gam_path',False):
+        from experiments.uavflow_paper_ablation.native_objectives import forward_native_gam_batch
+        return forward_native_gam_batch(model=model,da3=da3,text=text,normalizer=normalizer,batch=batch,context_len=context_len,rollout_steps=rollout_steps,amp=amp,amp_dtype=amp_dtype,depth_linear_weight=depth_linear_weight,depth_log_weight=depth_log_weight,depth_grad_weight=depth_grad_weight,depth_log_epsilon_normalized=depth_log_epsilon_normalized,stop_pos_weight=stop_pos_weight,feature_horizon_weights=feature_horizon_weights,feature_patch_weight=feature_patch_weight,feature_cls_weight=feature_cls_weight,feature_register_weight=feature_register_weight)
+    current_only=ref.rgbwarp_correction.config.get('branch_mode')=='current_only'
+    future_only=ref.rgbwarp_correction.config.get('branch_mode')=='future_only'
+    final_only=(current_only or future_only) and ref.rgbwarp_correction.config.get('current_final_only',False)
     images=batch['all_view_images']
     if context_len!=1 or rollout_steps!=1 or images.shape[1:3]!=(2,1):
         raise ValueError('RGB-warp currently requires exactly Ft,F(t+5), H=1,V=1')
     pose=batch.get('episode_pose_progress' if getattr(text,'pose_progress_enabled',False) else 'openvla_prompt_pose')
     if pose is None:raise KeyError('RGB-warp requires canonical current pose [cm,deg]')
+    if getattr(text,'pose5_enabled',False):
+        pose=pose5_state(pose,batch['frame_indices'])
+    stop_pose=None
+    if getattr(ref,'stop_head_enabled',False):
+        if not getattr(text,'pose5_enabled',False):raise ValueError('Joint RGB Warp Stop requires canonical5D Pose')
+        stop_pose=pose[:,:1].float()/text.state_scale.to(pose.device)
     keys=list(batch['action_stats_key'])
     with autocast_context(images.device,enabled=bool(amp),dtype_name=amp_dtype):
         language=encode_stage2_condition(text,list(batch['task_description']),
             reference_images=images[:,0],current_images=images[:,0],
             pad_to=ref.predictor.language_len,current_pose=pose[:,0])
+        gam_options=({'gam_pose_embedding':language['pose_embedding']}
+            if (ref.rgbwarp_correction.config.get('branch_mode') in {'uav_gam','vla_gam'}
+                or ref.rgbwarp_correction.config.get('future_pose_token_enabled',False)) else {})
         output=model(images[:,0,0],reference_shallow=None,
             lang_feats=language['last_hidden_state'],lang_padding_mask=language['attention_mask'],
             action_denormalizer=lambda x:normalizer.denormalize(x,stats_keys=keys),
-            camera_intrinsics=batch.get('camera_intrinsics'))
+            camera_intrinsics=batch.get('camera_intrinsics'),stop_pose=stop_pose,
+            image_valid_mask=(batch['image_valid_mask'][:,0,0] if 'image_valid_mask' in batch else None),**gam_options)
         target_raw=batch['actions'][:,:1].float();mask=batch['action_loss_mask'][:,:1].bool()
         target=normalizer.normalize(target_raw,stats_keys=keys)
-        proposal_loss=masked_action_l1(output['direct_actions_norm'],target,mask)
+        proposal_loss=target.new_zeros(()) if final_only else masked_action_l1(output['direct_actions_norm'],target,mask)
         refine_loss=masked_action_l1(output['actions_norm'],target,mask)
         scale=float(ref.rgbwarp_correction.config.get('depth_scale_meters',100.))
         gt=batch['gt_depth_meters'];valid=batch['gt_depth_mask']
-        current=output['current_depth_output']['depth'].reshape_as(gt[:,0,0])
-        future=output['deep_joint_features']['depth'].reshape_as(gt[:,1,0])
+        current=None if future_only else output['current_depth_output']['depth'].reshape_as(gt[:,0,0])
+        future=None if current_only else output['deep_joint_features']['depth'].reshape_as(gt[:,1,0])
         # DO NOT warp/detach the target following proposal, and DO NOT exclude
         # predicted warp holes: target is the fixed real t+5 GT-valid region.
         depth_options=dict(linear_weight=depth_linear_weight,log_weight=depth_log_weight,
                            grad_weight=depth_grad_weight,log_epsilon_normalized=depth_log_epsilon_normalized)
-        curr_loss=depth_loss(current,gt[:,0,0],valid[:,0,0],scale,**depth_options)
-        fut_loss=depth_loss(future,gt[:,1,0],valid[:,1,0],scale,**depth_options)
+        curr_loss=None if future_only else depth_loss(current,gt[:,0,0],valid[:,0,0],scale,**depth_options)
+        fut_loss=None if current_only else depth_loss(future,gt[:,1,0],valid[:,1,0],scale,**depth_options)
     prediction=output['actions_norm'];raw=normalizer.denormalize(prediction.float(),stats_keys=keys)
     zero=prediction.new_zeros(())
     # Compatibility-only zero diagnostics for the existing trainer/evaluator.
-    # No feature/pose/stop head is evaluated or supervised in this mode.
+    # No feature/pose auxiliary head is supervised in this mode. Joint Stop,
+    # when explicitly enabled, replaces its placeholders below.
     unused='feature feature_patch feature_cls feature_register feature_cos deep_feature deep_feature_patch deep_feature_cls deep_feature_cos depth_log_l1 depth_scale_l1 depth_semantic_total depth_semantic_linear_l1 depth_semantic_log_l1 depth_semantic_grad depth_semantic_ratio relative_pose relative_pose_translation relative_pose_yaw relative_pose_unit action_rollout_pose action_rollout_pose_translation action_rollout_pose_yaw pose_consistency stop stop_accuracy stop_recall stop_rate stop_positive_probability stop_negative_probability stop_positive_probability_sum stop_negative_probability_sum stop_positive_count stop_negative_count stop_future_gate action_dual_current action_dual_future action_dual_future_gate gate'.split()
     values={k:zero for k in unused}
     for key in ('feature_per_horizon','feature_patch_per_horizon','feature_cls_per_horizon',
@@ -82,12 +101,15 @@ def forward_rgbwarp_batch(*,model,da3,text,normalizer,batch,context_len,rollout_
     pred=raw.detach().reshape(-1,4);truth=target_raw.detach().reshape(-1,4);weight=mask.float().reshape(-1,4)
     moments=torch.stack((weight.sum(0),(pred*weight).sum(0),(pred.square()*weight).sum(0),
                          (truth*weight).sum(0),(truth.square()*weight).sum(0),((pred-truth).abs()*weight).sum(0)))
-    total_depth=(curr_loss['total']+fut_loss['total'])/2
-    values.update(action=(proposal_loss+refine_loss)/2,direct_action=proposal_loss,refine_action=refine_loss,
+    depth_branches=[loss for loss in (curr_loss,fut_loss) if loss is not None]
+    def mean_depth(key):
+        return sum(branch[key] for branch in depth_branches)/len(depth_branches)
+    total_depth=mean_depth('total')
+    values.update(action=refine_loss if final_only else (proposal_loss+refine_loss)/2,direct_action=proposal_loss,refine_action=refine_loss,
         action_direct=proposal_loss,action_refine=refine_loss,depth=total_depth,depth_global=total_depth,
-        depth_l1=(curr_loss['l1']+fut_loss['l1'])/2,depth_linear_l1=(curr_loss['l1']+fut_loss['l1'])/2,
-        depth_log_l1=(curr_loss['log_l1']+fut_loss['log_l1'])/2,
-        depth_grad=(curr_loss['grad']+fut_loss['grad'])/2,depth_valid_ratio=(curr_loss['valid_ratio']+fut_loss['valid_ratio'])/2,
+        depth_l1=mean_depth('l1'),depth_linear_l1=mean_depth('l1'),
+        depth_log_l1=mean_depth('log_l1'),
+        depth_grad=mean_depth('grad'),depth_valid_ratio=mean_depth('valid_ratio'),
         depth_scene_scale_mean=zero.new_tensor(scale),
         raw_l1=masked_action_l1(raw,target_raw,mask),action_raw_moments=moments,
         action_per_sample_step=action_per_step.detach(),raw_per_sample_step=raw_per_step.detach(),
@@ -96,16 +118,38 @@ def forward_rgbwarp_batch(*,model,da3,text,normalizer,batch,context_len,rollout_
         target_zero_slot_fraction=((target_raw.abs().amax(-1)<1e-8)&mask.any(-1)).float().mean(),
         **output['diagnostics'])
     for branch, prediction_depth in [('current', current), ('future', future)]:
+        if prediction_depth is None:continue
         detached = prediction_depth.detach().float()
         values[f'rgbwarp_{branch}_depth_mean_m'] = detached.mean() * scale
         values[f'rgbwarp_{branch}_depth_zero_fraction'] = (detached <= 1e-6).float().mean()
         values[f'rgbwarp_{branch}_depth_min_m'] = detached.amin() * scale
         values[f'rgbwarp_{branch}_depth_max_m'] = detached.amax() * scale
+    if 'frame_indices' in batch:
+        from .window_metrics import action_window_sums
+        values['_window_action_stats']=action_window_sums(prediction.detach() if final_only else output['direct_actions_norm'].detach(),prediction.detach(),target,mask,batch['frame_indices'])
+        if final_only:values['_window_action_stats'][:,0]=0
+    count=mask.sum().to(proposal_loss.dtype)
+    values['_global_log_action_stats']=torch.stack((proposal_loss.detach()*count,refine_loss.detach()*count,count))
     values['rgbwarp_proposal_loss']=proposal_loss.detach()
     values['rgbwarp_refine_loss']=refine_loss.detach()
     for branch,loss in [('current',curr_loss),('future',fut_loss)]:
+        if loss is None:continue
         for key,value in loss.items():values[f'depth_{branch}_{key}']=value.detach()
         # MSE is diagnostic only; reconstruction uses linear/log L1.
         values[f'depth_{branch}_linear_l1']=loss['l1'].detach()
         values[f'depth_{branch}_semantic_ratio']=zero
+    if os.environ.get("UAVFLOW_COMPONENT_AUDIT") == "1":
+        if curr_loss is not None:values["diagnostic_current_depth"] = curr_loss["total"]
+        if fut_loss is not None:values["diagnostic_future_depth"] = fut_loss["total"]
+    if output.get('stop_logits') is not None:
+        from experiments.uavflow_warp_direct.joint_stop import stop_values
+        if 'stop_target' not in batch:raise KeyError('Joint Warp Stop requires current-frame Stop labels')
+        values.update(stop_values(output['stop_logits'],batch['stop_target'][:,:1],stop_pos_weight))
     return values
+
+
+def pose5_state(yaw4d,frame_indices):
+    """Actual episode frame zero, never the start of a sampled window."""
+    if yaw4d.shape[:-1]!=frame_indices.shape or yaw4d.shape[-1]!=4:
+        raise ValueError('Expected matching canonical yaw4d states and actual frame indices')
+    return torch.cat((yaw4d.float(),frame_indices.eq(0).to(yaw4d.dtype).unsqueeze(-1)),dim=-1)

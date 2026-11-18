@@ -1,0 +1,26 @@
+{
+  "phase": "prepared",
+  "normal_train_windows": 259187,
+  "absorbing_train_windows": 49958,
+  "terminal_repeat5_windows": 50040,
+  "train_windows": 359185,
+  "validation_windows": 3095,
+  "updates_per_epoch": 11224,
+  "total_updates": 224480,
+  "consumed_per_epoch": 359168,
+  "dropped_per_epoch": 17,
+  "shared_initial_hashes": {
+    "encoder": "fe9d553367cf7a943ea379b5e1d201841081eeb2f0ed82421c485f722b925ce9",
+    "pose": "53ca7c29b13c745efc2a425aee9658626616b9f1a07c3d355b53609730a0bd8e",
+    "projection": "ef871a4d4aa2d3b0aa205f038fecaf9ff46ecefa28ae3e50bf634697a84dc817",
+    "head": "e0c4f402c12e6957154543255bd55812eac4898ad35629b0bc7938e0a2e621d9"
+  },
+  "head_output_exact_match": true,
+  "real_samples_pose_mask_zero_checks": true,
+  "common_init_bytes": 230105444,
+  "cuda_initialized": false,
+  "created_unix": 1793259138.6022158,
+  "actual_head_width": 1536,
+  "head_width_source": "Actual old/current Warp checkpoint parallel_action_head.decoder.input_proj.weight",
+  "previous_bringup_archived": "results/matched_repeat5_width_check_20261029"
+}

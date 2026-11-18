@@ -109,22 +109,22 @@ class TinyDA3(DA3GiantEncoder):
         self.register_buffer('encoder_mean',torch.zeros(1,3,1,1));self.register_buffer('encoder_std',torch.ones(1,3,1,1))
 
 
-def make_model(corr=True,mask=True,inject_actions=True,qk_norm=False):
+def make_model(corr=True,mask=True,output_mode="residual",stop=False,branch_mode=None,current_final_only=False,extra_correction=None):
     da3=TinyDA3()
     da3.configure_deep_lora(0,rank=2,alpha=4,dropout=0,target_modules=['all-linear'])
     return UAVFlowPredictorIDM(da3=da3,idm=None,action_dim=4,action_chunk_size=5,
         d_model=32,depth=1,num_heads=4,language_dim=16,language_len=8,
         direct_action_enabled=True,deep_action_enabled=True,compute_idm_branch=False,
+        stop_head_enabled=stop,stop_head_mode="action_hidden_pose" if stop else "legacy_action_token",stop_model_dim=32,
         geometry_architecture='dual_vla_gfm',parallel_vla_gfm_enabled=True,
         parallel_vla_gfm_mode='qwen_tokens',parallel_action_decode_mode='geometry_residual',
         parallel_action_position_mode='decoder_only',parallel_vla_gfm_width=32,parallel_vla_gfm_heads=4,
-        action_residual_gate_init=.1,
+        action_residual_gate_init=.1 if output_mode=='residual' else None,
         parallel_current_geometry_read_enabled=False,parallel_current_depth_enabled=True,
         depth_decode_enabled=True,gradient_checkpointing=True,train_deep_backbone=True,deep_train_start_block=0,
-        dual_stream_rgbwarp_enabled=True,rgbwarp_correction={'correspondence_layers':[3,5,7,9],
+        dual_stream_rgbwarp_enabled=True,rgbwarp_correction={'action_output_mode':output_mode,'correspondence_layers':[3,5,7,9],
             'correspondence_width':16,'correspondence_heads':4,'use_correspondence_attention':corr,
-            'use_pixel_binary_mask':mask,'inject_proposal_action_tokens':inject_actions,
-            'visual_residual_heads':4,'qk_norm':qk_norm})
+            'use_pixel_binary_mask':mask,**({'current_final_only':True} if current_final_only else {}),**({'branch_mode':branch_mode} if branch_mode else {}),**(extra_correction or {})})
 
 
 def run(model):
@@ -204,37 +204,6 @@ def test_future_depth_gradient_through_warp_not_action_value_shortcut(monkeypatc
     assert torch.isfinite(gp).all() and torch.isfinite(gc).all()
     (loss+result['actions_norm'].square().mean()+current.square().mean()).backward()
     assert not [n for n,p in net.named_parameters() if p.requires_grad and p.grad is None]
-
-
-def test_candidate4_injects_random_learned_slots_at_same_future_boundary(monkeypatch):
-    net=make_model(corr=True,inject_actions=False).train()
-    # The production correction decoder is zero-initialized; give it a
-    # nonzero test projection so gradients can reach the preceding readout.
-    with torch.no_grad():
-        net.parallel_action_correction_head.decoder.output.weight.normal_(0,.01)
-    captured={}
-    original=net.da3.propagate_shallow_with_actions_grad
-    def with_actions(shallow,actions,**kwargs):
-        captured['actions']=actions
-        return original(shallow,actions,**kwargs)
-    monkeypatch.setattr(net.da3,'propagate_shallow_with_actions_grad',with_actions)
-    result,slots=run(net)
-    learned=net.rgbwarp_correction.random_action_tokens
-    torch.testing.assert_close(captured['actions'],learned[:,None,None])
-    assert 0.01 < learned.detach().std() < 0.04
-    assert torch.autograd.grad(captured['actions'].sum(),slots,allow_unused=True)[0] is None
-    assert result['actions_norm'].shape==(1,1,5,4)
-    assert result['deep_joint_features']['depth'].shape==(1,1,224,224)
-    assert result['diagnostics']['rgbwarp_future_action_tokens'].item()==1
-    assert result['diagnostics']['rgbwarp_future_vlm_action_tokens'].item()==0
-    # Geometry depth still differentiates through Proposal -> bilinear RGB warp
-    # -> Future DA3; random learned slots supply the correction token content.
-    result['deep_joint_features']['depth'].square().mean().backward(retain_graph=True)
-    assert slots.grad is not None and torch.isfinite(slots.grad).all()
-    net.zero_grad(set_to_none=True)
-    result['actions_norm'].square().mean().backward()
-    assert learned.grad is not None and torch.isfinite(learned.grad).all()
-    assert learned.grad.abs().sum()>0
 
 
 def test_fixed_target_objective_and_eval_proposal_final_metrics(monkeypatch):
@@ -323,12 +292,12 @@ def test_entrypoint_explicit_defaults():
     assert cfg.model.dual_stream_rgbwarp_enabled and not cfg.model.support_aware_transport
     assert not cfg.model.use_fixed_first_frame and not cfg.model.stop_head_enabled
     assert cfg.stage1.qwen_numeric_pose_token
-    assert cfg.model.rgbwarp_correction.warp_mode=='bilinear'
+    assert cfg.model.rgbwarp_correction.warp_mode=='alpha'
     assert cfg.model.da3_lora.target_modules==['all-linear']
     assert cfg.loss.action_weight==3 and cfg.loss.depth_weight==3 and cfg.loss.feature_weight==0
     assert cfg.loss.action_direct_weight==cfg.loss.action_refine_weight==.5
     assert cfg.loss.depth_reconstruction=='l1'
-    assert cfg.training.max_epochs==10
+    assert cfg.training.max_epochs==5
 
 
 def test_numeric_state_hook_and_observation_only_service(monkeypatch):
@@ -419,20 +388,3 @@ def test_camera_motion_composition_stays_fp32_under_bf16_amp():
     actual.square().sum().backward()
     assert actions.grad is not None and torch.isfinite(actions.grad).all()
     assert actions.grad.abs().sum() > 0
-
-
-@pytest.mark.parametrize('inject_actions',[True,False])
-def test_qk_normalized_warp_routes_both_candidates_through_same_action_decoder(inject_actions):
-    net=make_model(inject_actions=inject_actions,qk_norm=True).train()
-    ca=net.rgbwarp_correction.correspondence
-    assert ca.attention.qk_norm_enabled
-    nn.init.normal_(ca.output.weight,std=.01)
-    result,slots=run(net)
-    (result['deep_joint_features']['depth'].square().mean()+result['actions_norm'].square().mean()).backward()
-    assert torch.isfinite(slots.grad).all()
-    for norm in (ca.attention.q_norm,ca.attention.k_norm):
-        assert norm.weight.grad is not None and torch.isfinite(norm.weight.grad).all()
-        assert norm.weight.grad.abs().sum()>0
-    state=copy.deepcopy(net.state_dict())
-    restored=make_model(inject_actions=inject_actions,qk_norm=True)
-    restored.load_state_dict(state,strict=True)

@@ -1,0 +1,9 @@
+{
+  "epoch_format": "full",
+  "optimizer": true,
+  "last_format": "full",
+  "best_format": "full",
+  "requested_unix": 1793261903.1376388,
+  "reason": "User explicitly requires full per-epoch training checkpoints, same as previous runs",
+  "active_worker_compatibility": "Pin exact same-step full last.pt into epoch path without restarting workers"
+}

@@ -456,6 +456,7 @@ class ActionHiddenPoseStopHead(nn.Module):
                  action_slots: int = 1) -> None:
         super().__init__()
         self.action_dim = int(action_dim)
+        self.pose_dim = int(pose_dim)
         self.action_slots = int(action_slots)
         if self.action_slots <= 0:
             raise ValueError("action_slots must be positive")
@@ -485,7 +486,7 @@ class ActionHiddenPoseStopHead(nn.Module):
                 f"expected trailing width {self.action_dim * self.action_slots}, "
                 f"got {tuple(action_hidden.shape)}"
             )
-        expected = (*action_hidden.shape[:-1], 5)
+        expected = (*action_hidden.shape[:-1], self.pose_dim)
         if stop_pose.shape != expected:
             raise ValueError(
                 f"Action-hidden Stop requires normalized pose {expected}, "
@@ -535,9 +536,6 @@ class UAVFlowPredictorIDM(nn.Module):
         use_action_history: bool = False,
         use_pose_history: bool = False,
         pose_progress_enabled: bool = False,
-        current_geometry_gate_init: float | None = None,
-        current_geometry_zero_init: bool = False,
-        current_geometry_qk_norm: bool = False,
         action_history_keep_prob: float = 1.0,
         pose_history_keep_prob: float = 1.0,
         pose_history_xyz_noise_meters: float = 0.0,
@@ -876,7 +874,8 @@ class UAVFlowPredictorIDM(nn.Module):
             and self.parallel_action_decode_mode == "geometry_residual"
             else None
         )
-        if self.parallel_action_correction_head is not None:
+        if self.parallel_action_correction_head is not None and not (
+                dual_stream_rgbwarp_enabled and (rgbwarp_correction or {}).get('action_output_mode')=='direct'):
             # R1 starts as the exact VLA base policy. Geometry must learn only
             # a correction, rather than replacing the semantic plan at step 0.
             final = (
@@ -924,7 +923,7 @@ class UAVFlowPredictorIDM(nn.Module):
         elif self.stop_head_mode == "action_hidden_pose":
             self.stop_head = ActionHiddenPoseStopHead(
                 action_dim=int(da3.embed_dim), model_dim=int(stop_model_dim),
-                action_slots=(self.action_chunk_size if self.parallel_vla_gfm_enabled else 1),
+                action_slots=(self.action_chunk_size if self.parallel_vla_gfm_enabled or dual_stream_rgbwarp_enabled else 1),
             )
         elif self.stop_head_mode == "patch_motion":
             if not self.use_fixed_first_frame or not self.use_pose_history:
@@ -1018,10 +1017,7 @@ class UAVFlowPredictorIDM(nn.Module):
             CurrentGeometryRead(
                 int(da3.embed_dim),
                 layer_indices=parallel_geometry_layers,
-                gate_init=(float(current_geometry_gate_init) if current_geometry_gate_init is not None
-                           else (0.05 if self.parallel_vla_gfm_enabled else 1e-3)),
-                zero_init=bool(current_geometry_zero_init),
-                qk_norm=bool(current_geometry_qk_norm),
+                gate_init=(0.05 if self.parallel_vla_gfm_enabled else 1e-3),
                 memory_dim=(
                     int(2 * da3.embed_dim)
                     if self.current_geometry_patch_mode == "concat"
@@ -1095,17 +1091,39 @@ class UAVFlowPredictorIDM(nn.Module):
             if (self.correction_mode!='legacy' or self.transport_policy is not None
                     or not self.parallel_vla_gfm_enabled or self.parallel_vla_gfm_mode!='qwen_tokens'
                     or self.parallel_action_decode_mode!='geometry_residual'
-                    or self.parallel_current_geometry_read_enabled or self.stop_head_enabled
+                    or self.parallel_current_geometry_read_enabled
+                    or (self.stop_head_enabled and self.stop_head_mode!='action_hidden_pose')
                     or self.use_action_history or self.use_pose_history or self.use_fixed_first_frame):
-                raise ValueError('RGB-warp requires native Qwen slots, residual head, no old banks/Predictor/stop/history/F0')
+                raise ValueError('RGB-warp requires native Qwen slots, action head, no old banks/Predictor/history/F0; optional Stop must use the action-hidden/pose MLP')
             from .rgbwarp_correction import RGBWarpCorrection
+            correction_class = RGBWarpCorrection
+            if (rgbwarp_correction or {}).get('branch_mode') in {'current_only','future_only'}:
+                from experiments.uavflow_paper_ablation.current_only import CurrentOnlyCorrection
+                correction_class = CurrentOnlyCorrection
+            gam_mode=(rgbwarp_correction or {}).get('branch_mode') in {'uav_gam','vla_gam'}
+            correction_options={}
+            if gam_mode:
+                from experiments.uavflow_paper_ablation.gam import MatchedGAMCorrection
+                correction_class=MatchedGAMCorrection
+                correction_options=dict(num_register_tokens=int(self.da3.num_register_tokens),
+                    predictor_options=dict(d_model=int(d_model),depth=int(depth),num_heads=int(num_heads),
+                        ffn_ratio=float(ffn_ratio),dropout=float(dropout),language_len=int(language_len),
+                        gradient_checkpointing=bool(gradient_checkpointing),
+                        init_seed=int((rgbwarp_correction or {}).get('predictor_init_seed',45))))
             self.semantic_geometry_action=nn.Identity()  # empty checkpoint-compatible placeholder, never called
             # The old shallow-feature residual gate is unused without Predictor.
             # Action correction uses the independent action gate above.
             self.residual_gate_logit.requires_grad_(False)
             for parameter in self.da3.dpt_head.parameters():parameter.requires_grad_(False)
-            self.rgbwarp_correction=RGBWarpCorrection(language_dim,int(self.da3.embed_dim),self.da3.PATCH_SIZE,
-                                                     self.da3.out_layers,rgbwarp_correction)
+            self.rgbwarp_correction=correction_class(language_dim,int(self.da3.embed_dim),self.da3.PATCH_SIZE,
+                                                     self.da3.out_layers,rgbwarp_correction,**correction_options)
+            if (rgbwarp_correction or {}).get('branch_mode') in {'current_only','future_only'} and (rgbwarp_correction or {}).get('current_final_only',False):
+                self.parallel_action_head.requires_grad_(False)
+            if gam_mode and (rgbwarp_correction or {}).get('native_gam_path',False):
+                self.parallel_action_head.requires_grad_(False)  # compatibility state only; no auxiliary forward/loss
+                if (rgbwarp_correction or {}).get('native_frozen_shallow',False):
+                    from experiments.uavflow_paper_ablation.frozen_shallow import freeze_prefix
+                    self.native_frozen_prefix_names=freeze_prefix(self.da3)
             if self.rgbwarp_correction.correspondence is not None:
                 layers=self.rgbwarp_correction.layers
                 trans=self.da3.backbone.pretrained
@@ -1130,6 +1148,8 @@ class UAVFlowPredictorIDM(nn.Module):
             blocks = self.da3.backbone.pretrained.blocks
             for index, block in enumerate(blocks):
                 block.train(index >= self.deep_train_start_block)
+        if getattr(self,'rgbwarp_correction',None) is not None and self.rgbwarp_correction.config.get('native_frozen_shallow',False):
+            for block in self.da3.backbone.pretrained.blocks[:int(self.da3.backbone.pretrained.alt_start)]:block.eval()
         self.da3.dpt_head.eval()
         if self.idm is not None:
             self.idm.eval()
@@ -1441,9 +1461,19 @@ class UAVFlowPredictorIDM(nn.Module):
         current_depth_meters: torch.Tensor | None = None,
         current_depth_valid: torch.Tensor | None = None,
         camera_intrinsics: torch.Tensor | None = None,
+        gam_pose_embedding: torch.Tensor | None = None,
+        image_valid_mask: torch.Tensor | None = None,
     ) -> dict[str, object]:
         if self.dual_stream_rgbwarp_enabled:
-            return self.rgbwarp_correction(self,observed_shallow,lang_feats,action_denormalizer,camera_intrinsics)
+            if self.rgbwarp_correction.config.get('branch_mode') in {'uav_gam','vla_gam'}:
+                return self.rgbwarp_correction(self,observed_shallow,lang_feats,action_denormalizer,
+                    camera_intrinsics,stop_pose=stop_pose,language_mask=lang_padding_mask,
+                    pose_embedding=gam_pose_embedding)
+            pose_options=({'pose_embedding':gam_pose_embedding}
+                if self.rgbwarp_correction.config.get('future_pose_token_enabled',False) else {})
+            if self.rgbwarp_correction.config.get('branch_mode','warp')=='warp':
+                pose_options['image_valid']=image_valid_mask
+            return self.rgbwarp_correction(self,observed_shallow,lang_feats,action_denormalizer,camera_intrinsics,stop_pose=stop_pose,**pose_options)
         if self.current_geometry_action_enabled and observed_shallow.shape[1] != 1:
             raise ValueError("Current geometry action ablation supports H=1 only (avoid temporal leakage)")
         if self.geometry_architecture != "legacy" and observed_shallow.shape[1:3] != (1, 1):

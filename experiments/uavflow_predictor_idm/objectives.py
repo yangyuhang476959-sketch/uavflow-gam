@@ -865,7 +865,8 @@ def forward_batch(
         return forward_rgbwarp_batch(model=model,da3=da3,text=text,normalizer=normalizer,batch=batch,
             context_len=context_len,rollout_steps=rollout_steps,amp=amp,amp_dtype=amp_dtype,
             depth_linear_weight=depth_linear_weight,depth_log_weight=depth_log_weight,
-            depth_grad_weight=depth_grad_weight,depth_log_epsilon_normalized=depth_log_epsilon_normalized)
+            depth_grad_weight=depth_grad_weight,depth_log_epsilon_normalized=depth_log_epsilon_normalized,
+            stop_pos_weight=stop_pos_weight,feature_horizon_weights=feature_horizon_weights,feature_patch_weight=feature_patch_weight,feature_cls_weight=feature_cls_weight,feature_register_weight=feature_register_weight)
     images = batch["all_view_images"]
     model_ref = model.module if hasattr(model, "module") else model
     use_reference = bool(getattr(model_ref, "use_fixed_first_frame", False))
@@ -1614,14 +1615,13 @@ def evaluate(
     depth_gradient_mode: str = "tolerant_log",
     depth_gradient_tolerance_pixels: int = 2,
 ) -> dict[str, float]:
-    # Unequal exact shards can have different forward counts. Validation
-    # needs no DDP buffer broadcasts; parameters were synchronized in training.
-    model = model.module if hasattr(model, "module") else model
     model.eval()
     sums = {h: torch.zeros(37, device=device) for h in contexts}
     from experiments.uavflow_predictor_idm.logging_metrics import action_statistics
     moment_sums = {h: torch.zeros(6, 4, dtype=torch.float64, device=device) for h in contexts}
-    branch_keys = [f"depth_{branch}_{key}" for branch in ("current", "future")
+    window_sums = {h: torch.zeros(3,4,dtype=torch.float64,device=device) for h in contexts}
+    native_gam_eval=bool(getattr(model.module if hasattr(model,'module') else model,'rgbwarp_correction',None) and (model.module if hasattr(model,'module') else model).rgbwarp_correction.config.get('native_gam_path',False))
+    branch_keys = [f"depth_{branch}_{key}" for branch in (("future",) if native_gam_eval else ("current", "future"))
                    for key in ("total", "linear_l1", "log_l1", "grad", "valid_ratio", "semantic_ratio")]
     branch_sums = {h: torch.zeros(len(branch_keys), device=device) for h in contexts}
     dual_action_sums = {h: torch.zeros(3, device=device) for h in contexts}
@@ -1629,7 +1629,7 @@ def evaluate(
     model_ref = model.module if hasattr(model, "module") else model
     dense_context = bool(getattr(model_ref, "dense_context_supervision", False))
     if getattr(model_ref,'dual_stream_rgbwarp_enabled',False):
-        branch_keys += ['depth_current_mse','depth_future_mse']
+        branch_keys += ['depth_future_mse'] if native_gam_eval else ['depth_current_mse','depth_future_mse']
         branch_sums = {h:torch.zeros(len(branch_keys),device=device) for h in contexts}
     transport_keys = ("transport_geometry", "transport_support_raw",
                       "transport_support_coarse", "transport_matched_fraction")
@@ -1645,9 +1645,10 @@ def evaluate(
             transport_keys += tuple(f'{key}_L{layer}' for key in ('uncertainty', 'confidence', 'uncertainty_mae',
                                     'unsupported_read_before', 'unsupported_read_after'))
     if getattr(model_ref,'dual_stream_rgbwarp_enabled',False):
-        transport_keys+=('rgbwarp_valid_ratio','rgbwarp_correspondence_ratio',
-                         'rgbwarp_proposal_loss','rgbwarp_refine_loss')
-        transport_keys+=tuple('rgbwarp_'+name+'_'+axis for name in ('residual_abs','residual_raw_abs') for axis in ('x','y','z','yaw'))
+        transport_keys+=(('rgbwarp_refine_loss',) if model_ref.rgbwarp_correction.config.get('native_gam_path',False) else ('rgbwarp_proposal_loss','rgbwarp_refine_loss'))
+        if model_ref.rgbwarp_correction.config.get('branch_mode') not in {'current_only','future_only','uav_gam','vla_gam'}:
+            transport_keys+=('rgbwarp_valid_ratio','rgbwarp_correspondence_ratio')
+            transport_keys+=tuple('rgbwarp_'+name+'_'+axis for name in ('residual_abs','residual_raw_abs') for axis in ('x','y','z','yaw'))
     if getattr(model_ref, "transport_policy", None) is not None and model_ref.transport_policy.error_head is not None:
         transport_keys += ("completion_uncertainty_loss", "completion_predicted_error", "completion_confidence", "completion_matched_mass",
                            "completion_target_error_matched", "completion_error_mae_matched")
@@ -1718,6 +1719,7 @@ def evaluate(
                 depth_gradient_mode=depth_gradient_mode,
                 depth_gradient_tolerance_pixels=depth_gradient_tolerance_pixels,
             )
+            if '_window_action_stats' in values:window_sums[context]+=values['_window_action_stats']
             count = float(batch["all_view_images"].shape[0])
             chunk_slot_sums[context][:, 0] += values["action_per_chunk_slot"] * count
             chunk_slot_sums[context][:, 1] += values["raw_per_chunk_slot"] * count
@@ -1812,6 +1814,7 @@ def evaluate(
                 threshold_counts[2] += (~stop_prediction & stop_positive).sum()
                 threshold_counts[3] += (~stop_prediction & ~stop_positive).sum()
     if dist.is_initialized():
+        for value in window_sums.values():dist.all_reduce(value)
         for value in transport_sums.values():
             dist.all_reduce(value)
         for value in moment_sums.values():
@@ -1836,6 +1839,9 @@ def evaluate(
             dist.all_reduce(value)
     result: dict[str, float] = {}
     for context, value in sums.items():
+        if getattr(model_ref,'dual_stream_rgbwarp_enabled',False):
+            from .window_metrics import action_window_results
+            result.update({key:float(v) for key,v in action_window_results(window_sums[context],prefix=f'H{context}_window_').items()})
         count = value[36].clamp_min(1.0)
         result[f"H{context}_evaluated_windows"] = int(value[36].item())
         if (getattr(model_ref, "transport_policy", None) is not None or getattr(model_ref, 'correction_mode', 'legacy') in {'support_aware', 'uncertain'}
@@ -1904,7 +1910,7 @@ def evaluate(
             f"H{context}_depth_scene_scale_m": float((value[35] / count).item()),
         }
         if getattr(model_ref,'dual_stream_rgbwarp_enabled',False):
-            result[f'H{context}_direct_action']=result[f'H{context}_rgbwarp_proposal_loss']
+            result[f'H{context}_direct_action']=result.get(f'H{context}_rgbwarp_proposal_loss',0.)
             result[f'H{context}_refine_action']=result[f'H{context}_rgbwarp_refine_loss']
         pose_axes = pose_axis_sums[context] / count
         result |= {
@@ -1966,5 +1972,7 @@ def evaluate(
                 f"H{context}_step{step_number}_cls": float(per_step[rollout_index, 2].item()),
                 f"H{context}_step{step_number}_cos": float(per_step[rollout_index, 3].item()),
             }
+    if native_gam_eval:
+        result={k:v for k,v in result.items() if not (k.endswith('_proposal_loss') or k.endswith('_direct_action') or '_depth_current_' in k)}
     model.train()
     return result

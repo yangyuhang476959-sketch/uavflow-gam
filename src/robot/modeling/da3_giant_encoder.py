@@ -1498,7 +1498,7 @@ class DA3GiantEncoder(nn.Module):
 
         Returns: (B, total_view, token_count, C) : same shape as input.
         """
-        if not _HAS_FLEX_ATTENTION:
+        if not _HAS_FLEX_ATTENTION and not isinstance(block_mask, torch.Tensor):
             raise RuntimeError(
                 "_run_deep_global_block_flex called without flex_attention."
             )
@@ -1529,7 +1529,8 @@ class DA3GiantEncoder(nn.Module):
         k = k.to(dtype=v.dtype)
         # flex_attention expects (B, H, L, D) : same as SDPA. Bool BlockMask
         # broadcasts across B and H.
-        out = _flex_attention(q, k, v, block_mask=block_mask)
+        out = (torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=block_mask)
+               if isinstance(block_mask, torch.Tensor) else _flex_attention(q, k, v, block_mask=block_mask))
         out = out.transpose(1, 2).reshape(B_, N_, C_)
         out = attn.proj(out)
         out = attn.proj_drop(out)
@@ -1561,6 +1562,7 @@ class DA3GiantEncoder(nn.Module):
         correspondence_read=None,
         correspondence_by_layer=None,
         correspondence_mask=None,
+        return_layer_patch_indices=None,
     ) -> Dict[str, torch.Tensor]:
         """Resume DA3 from shallow visual tokens plus supplied action seeds.
 
@@ -1609,6 +1611,8 @@ class DA3GiantEncoder(nn.Module):
             steps=steps,
             device=visual_tokens.device,
         )
+        if prefix_lengths is not None and (return_layer_patch_indices is not None or correspondence_read is not None):
+            raise ValueError("Temporal memory export/read does not support prefix compaction")
         if prefix_lengths is not None:
             if int(prefix_lengths.max().item()) <= 0:
                 prefix_lengths = torch.full_like(prefix_lengths, steps)
@@ -1716,6 +1720,8 @@ class DA3GiantEncoder(nn.Module):
         patch_start = 1 + action_count + num_register_tokens
         channels = self.embed_dim * 2
         level_feats = []
+        captured_patches = {}
+        requested_patches = set(return_layer_patch_indices or ())
         start_block = int(trans.alt_start)
         use_checkpoint = bool(gradient_checkpointing) and torch.is_grad_enabled()
         # Optional strict timestep-block-causal mask for the deep global
@@ -1734,32 +1740,39 @@ class DA3GiantEncoder(nn.Module):
         # to keep this strictly causal at production scale.
         global_block_mask = None
         if bool(deep_temporal_causal_mask) and int(steps) > 1:
-            if not _HAS_FLEX_ATTENTION:
-                raise RuntimeError(
-                    "predictor.deep_temporal_causal_mask=true requires "
-                    "torch.nn.attention.flex_attention; upgrade PyTorch."
-                )
-            # Cache BlockMask by (steps, v_count, token_count, device).
-            # Rebuilding every forward is cheap; a stable
-            # BlockMask helps the compiled flex_attention reuse its cache.
-            cache_key = (int(steps), int(v_count), int(token_count), str(current_x.device))
-            cached = self._deep_flex_block_mask_cache.get(cache_key)
-            if cached is None:
+            if current_x.device.type == 'cpu':
                 seq_len = int(total_view) * int(token_count)
-                mask_mod = _make_deep_block_causal_mask_mod(
-                    token_count=int(token_count),
-                    v_count=int(v_count),
-                )
-                cached = _create_block_mask(
-                    mask_mod,
-                    B=None,
-                    H=None,
-                    Q_LEN=seq_len,
-                    KV_LEN=seq_len,
-                    device=current_x.device,
-                )
-                self._deep_flex_block_mask_cache[cache_key] = cached
-            global_block_mask = cached
+                if seq_len > 4096:
+                    raise ValueError('CPU causal reference is limited to 4096 tokens; use CUDA flex for training')
+                times = torch.arange(seq_len, device=current_x.device) // (int(v_count) * token_count)
+                global_block_mask = times[:, None] >= times[None, :]
+            else:
+                if not _HAS_FLEX_ATTENTION:
+                    raise RuntimeError(
+                        "predictor.deep_temporal_causal_mask=true requires "
+                        "torch.nn.attention.flex_attention; upgrade PyTorch."
+                    )
+                # Cache BlockMask by (steps, v_count, token_count, device).
+                # Rebuilding every forward is cheap; a stable
+                # BlockMask helps the compiled flex_attention reuse its cache.
+                cache_key = (int(steps), int(v_count), int(token_count), str(current_x.device))
+                cached = self._deep_flex_block_mask_cache.get(cache_key)
+                if cached is None:
+                    seq_len = int(total_view) * int(token_count)
+                    mask_mod = _make_deep_block_causal_mask_mod(
+                        token_count=int(token_count),
+                        v_count=int(v_count),
+                    )
+                    cached = _create_block_mask(
+                        mask_mod,
+                        B=None,
+                        H=None,
+                        Q_LEN=seq_len,
+                        KV_LEN=seq_len,
+                        device=current_x.device,
+                    )
+                    self._deep_flex_block_mask_cache[cache_key] = cached
+                global_block_mask = cached
         _cuda_profile_mark(profile, "deep_prep_done")
         for i, blk in enumerate(trans.blocks):
             if i < start_block:
@@ -1866,13 +1879,17 @@ class DA3GiantEncoder(nn.Module):
                     )
                     unsupported_x = unsupported_now.reshape(b, total_view, action_count, dim)
             if correspondence_read is not None and i in correspondence_by_layer:
-                patches=current_x[:,:,patch_start:].reshape(b,num_patches,dim)
-                memory=correspondence_by_layer[i][:,0,0]
+                patches=current_x[:,:,patch_start:].reshape(b,total_view*num_patches,dim)
+                memory=correspondence_by_layer[i].reshape(b,-1,dim)
+                if correspondence_mask.shape != (b,total_view*num_patches,memory.shape[1]):
+                    raise ValueError('Correspondence mask must align with flattened timestep patches')
                 def corr_step(q,kv,layer=i):
                     return correspondence_read(q,kv,correspondence_mask,layer)
                 patches=(torch_checkpoint(corr_step,patches,memory,use_reentrant=False)
                          if use_checkpoint else corr_step(patches,memory))
-                current_x=torch.cat((current_x[:,:,:patch_start],patches[:,None]),2)
+                current_x=torch.cat((current_x[:,:,:patch_start],patches.reshape(b,total_view,num_patches,dim)),2)
+            if i in requested_patches:
+                captured_patches[i] = current_x[:,:,patch_start:].reshape(b,steps,v_count,num_patches,dim)
             if attn_type == "local":
                 local_x = current_x
             if (
@@ -1907,6 +1924,8 @@ class DA3GiantEncoder(nn.Module):
         _cuda_profile_mark(profile, "deep_blocks_done")
 
         result: Dict[str, torch.Tensor] = {}
+        if return_layer_patch_indices is not None:
+            result["layer_patches"] = captured_patches
         if decode_visuals and len(level_feats) >= 4:
             self._prepare_dpt_head_for_float_decode()
             with torch.autocast(device_type=visual_tokens.device.type, enabled=False):
@@ -1950,9 +1969,6 @@ class DA3GiantEncoder(nn.Module):
         return_layer_patches: bool = False,
         layer_patch_indices: Optional[Sequence[int]] = None,
         layer_patch_mode: str = "concat",
-        correspondence_read=None,
-        correspondence_by_layer=None,
-        correspondence_mask=None,
     ) -> Dict[str, object]:
         """Resume frozen DA3 from the pre-global boundary without action tokens.
 
@@ -1988,8 +2004,6 @@ class DA3GiantEncoder(nn.Module):
             raise ValueError(f"Invalid shallow token count {n_tokens} (patches={num_patches}).")
 
         total_views = int(steps) * int(views)
-        if correspondence_read is not None and total_views != 1:
-            raise ValueError("Correspondence reads in the visual-only DA3 path currently require H1/V1")
         trans = self.backbone.pretrained
         backbone_dtype = next(self.backbone.parameters()).dtype
         current_x = visual_tokens.reshape(b, total_views, n_tokens, dim).to(backbone_dtype).clone()
@@ -2008,8 +2022,6 @@ class DA3GiantEncoder(nn.Module):
         )
         deep_by_layer: Dict[int, torch.Tensor] = {}
         layer_patches = {}
-        correspondence_by_layer = correspondence_by_layer or {}
-        patch_start = 1 + num_register_tokens
         start_block = int(trans.alt_start)
         if start_block < 0:
             raise ValueError("DA3 backbone has no alt_start; cannot resume shallow boundary.")
@@ -2048,15 +2060,6 @@ class DA3GiantEncoder(nn.Module):
                 current_x = trans.process_attention(
                     current_x, block, attn_type=attn_type, pos=pos_emb
                 )
-            if correspondence_read is not None and i in correspondence_by_layer:
-                patches=current_x[:,:,patch_start:].reshape(b,num_patches,dim)
-                memory=correspondence_by_layer[i][:,0,0]
-                def corr_step(q,kv,layer=i):
-                    return correspondence_read(q,kv,correspondence_mask,layer)
-                patches=(torch_checkpoint(corr_step,patches,memory,use_reentrant=False)
-                         if bool(gradient_checkpointing) and torch.is_grad_enabled() and current_x.requires_grad
-                         else corr_step(patches,memory))
-                current_x=torch.cat((current_x[:,:,:patch_start],patches.reshape(b,total_views,num_patches,dim)),2)
             if attn_type == "local":
                 local_x = current_x
             if return_layer_patches and (
@@ -2131,6 +2134,7 @@ class DA3GiantEncoder(nn.Module):
         correspondence_read=None,
         correspondence_by_layer=None,
         correspondence_mask=None,
+        return_layer_patch_indices=None,
     ) -> Dict[str, torch.Tensor]:
         return self._propagate_shallow_with_actions_impl(
             visual_tokens,
@@ -2152,6 +2156,7 @@ class DA3GiantEncoder(nn.Module):
             correspondence_read=correspondence_read,
             correspondence_by_layer=correspondence_by_layer,
             correspondence_mask=correspondence_mask,
+            return_layer_patch_indices=return_layer_patch_indices,
         )
 
     def _propagate_and_decode_impl(

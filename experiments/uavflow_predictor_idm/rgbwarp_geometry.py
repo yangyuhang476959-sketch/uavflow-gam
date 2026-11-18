@@ -33,13 +33,19 @@ def forward_alpha_splat(rgb,depth,transform,intrinsics,*,valid=None,patch_size=1
             target[...,2].reshape(b,1,h,w),radius=radius,points_per_pixel=points_per_pixel,patch_size=patch_size)
 
 
-def action_camera_transform(actions, heading_from_camera=None):
+def action_camera_transform(actions, heading_from_camera=None, *, action_representation='step_local'):
     if actions.ndim!=3 or actions.shape[-1]!=4:
         raise ValueError('Expected [B,K,4] local metre/radian increments')
     # Outer BF16 AMP would downcast pose matmuls even after actions.float().
     # Compose and invert camera geometry in FP32, keeping action gradients.
     with torch.autocast(device_type=actions.device.type, enabled=False):
         actions=actions.float();b=actions.shape[0]
+        if action_representation == 'chunk_anchor_local':
+            # Every slot is already a pose from the SAME current anchor.
+            # Ft -> F(t+K) is the last target, never the product of all slots.
+            actions=actions[:,-1:]
+        elif action_representation != 'step_local':
+            raise ValueError(f'Unknown action representation: {action_representation}')
         pose=torch.eye(4,device=actions.device).expand(b,-1,-1)
         for step in actions.unbind(1):
             c,s=step[:,3].cos(),step[:,3].sin();z=torch.zeros_like(c);o=torch.ones_like(c)
@@ -55,9 +61,25 @@ def action_camera_transform(actions, heading_from_camera=None):
 
 
 
+def _grouped_sum(destination, values, size):
+    """Stable source order and disjoint destination writes; no atomic sum.
+
+    Segments are contiguous after a stable sort. Unlike a global prefix sum,
+    segment_reduce does not subtract large accumulated totals for small groups.
+    This controls forward accumulation only, not all upstream/backward kernels.
+    """
+    result = values.new_zeros((size,) + values.shape[1:])
+    if destination.numel() == 0:
+        return result + values.sum() * 0
+    order = torch.argsort(destination, stable=True)
+    keys, counts = torch.unique_consecutive(destination[order], return_counts=True)
+    summed = torch.segment_reduce(values[order], 'sum', lengths=counts)
+    return result.index_copy(0, keys, summed)
+
+
 def forward_splat(rgb, depth, transform, intrinsics, *, valid=None, patch_size=14,
                   z_absolute_tolerance=.01,z_relative_tolerance=.01,
-                  return_diagnostics=False):
+                  return_diagnostics=False, deterministic_accumulation=False):
     if rgb.ndim!=4 or depth.shape!=(rgb.shape[0],*rgb.shape[-2:]):
         raise ValueError('Expected RGB [B,C,H,W], z-depth [B,H,W]')
     b,c,h,w=rgb.shape;device=rgb.device
@@ -95,18 +117,23 @@ def forward_splat(rgb, depth, transform, intrinsics, *, valid=None, patch_size=1
         zmin.scatter_reduce_(0,destination,z.detach(),reduce='amin',include_self=True)
         visible=(z.detach()<=zmin[destination]+z_absolute_tolerance+z_relative_tolerance*zmin[destination])
         destination,source,bi,weight,z=[v[visible] for v in (destination,source,bi,weight,z)]
-        mass=depth.new_zeros(b*h*w).scatter_add(0,destination,weight)
+        def accumulate(indices, values, size):
+            if deterministic_accumulation:
+                return _grouped_sum(indices, values, size)
+            result=values.new_zeros((size,)+values.shape[1:])
+            expanded=indices.reshape((-1,)+(1,)*(values.ndim-1)).expand_as(values)
+            return result.scatter_add(0,expanded,values)
+        mass=accumulate(destination,weight,b*h*w)
         colors=rgb.permute(0,2,3,1).reshape(b,h*w,c)[bi,source]
-        numerator=rgb.new_zeros(b*h*w,c).scatter_add(0,destination[:,None].expand(-1,c),colors*weight[:,None])
+        numerator=accumulate(destination,colors*weight[:,None],b*h*w)
         coverage=(mass.detach()>1e-6).reshape(b,1,h,w)
         result=(numerator/mass[:,None].clamp_min(1e-6)).reshape(b,h,w,c).permute(0,3,1,2)
-        zd=depth.new_zeros(b*h*w).scatter_add(0,destination,z*weight)/mass.clamp_min(1e-6)
+        zd=accumulate(destination,z*weight,b*h*w)/mass.clamp_min(1e-6)
         n=(h//patch_size)*(w//patch_size)
         dst_pixel=destination%(h*w)
         dst_patch=(dst_pixel//w//patch_size)*(w//patch_size)+(dst_pixel%w//patch_size)
         src_patch=(source//w//patch_size)*(w//patch_size)+(source%w//patch_size)
-        matrix=depth.new_zeros(b*n*n)
-        matrix.scatter_add_(0,bi*n*n+dst_patch*n+src_patch,torch.ones_like(weight))
+        matrix=accumulate(bi*n*n+dst_patch*n+src_patch,torch.ones_like(weight),b*n*n)
         correspondence=(matrix.reshape(b,n,n)>0).detach()
         output=dict(rgb=result,valid=coverage,correspondence=correspondence,
                     depth=zd.reshape(b,h,w),mass=mass.reshape(b,h,w))
@@ -115,13 +142,13 @@ def forward_splat(rgb, depth, transform, intrinsics, *, valid=None, patch_size=1
             # unchanged. Frobenius norm of each target RGB's Jacobian w.r.t.
             # its contributing source projected coordinates (u_i,v_i).
             with torch.no_grad():
-                count=depth.new_zeros(b*h*w).scatter_add_(0,destination,torch.ones_like(weight))
+                count=accumulate(destination,torch.ones_like(weight),b*h*w)
                 du=torch.stack((-(1-dy),1-dy,-dy,dy),-1)[keep][visible]
                 dv=torch.stack((-(1-dx),-dx,1-dx,dx),-1)[keep][visible]
                 target_rgb=result.permute(0,2,3,1).reshape(-1,c)
                 contrast=(colors-target_rgb[destination]).square().sum(-1)
                 squared=(du.square()+dv.square())*contrast/mass[destination].clamp_min(1e-6).square()
-                local_jacobian=depth.new_zeros(b*h*w).scatter_add_(0,destination,squared).sqrt()
+                local_jacobian=accumulate(destination,squared,b*h*w).sqrt()
                 # Exact normalized single-contributor derivative is zero;
                 # exclude FP32 numerator/denominator cancellation residue.
                 local_jacobian[count<=1]=0

@@ -1,0 +1,12 @@
+{
+  "source": "/root/autodl-tmp/uavflow-gam/results/pure24_joint_stop10_20261102",
+  "sha256": {
+    "config.json": "fb0aaa1cb48c232fbdfea7c9abe513d94b63e231d3c4f94db9d7584602b9a5e5",
+    "alignment.json": "f31b3b5147628472478bc00d4e3c1173e4a7fc73b3a276c199e87e9de99222f3",
+    "resolved_plan.json": "af17e78151f0503027f60d68f27d4703b9b7e9566d9c7f296459c027e8c8d3ac"
+  },
+  "shared_stop_file": "/root/autodl-tmp/uavflow-gam/results/pure24_joint_stop10_20261102/common_stop_init.pt",
+  "shared_stop_state_hash": "343390a27a37ae50ad8345465bb1a5370ef6ff7b431a599c2fd5c05ce0ca9c49",
+  "reference": "Actual Pure PoseA 5+5 Stop recipe; current Pure24 batch and native Pose retained",
+  "status": "queued after completed action10"
+}

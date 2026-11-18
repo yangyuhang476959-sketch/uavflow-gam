@@ -46,6 +46,8 @@ class FrozenQwen35Conditioner(nn.Module):
         action_attention_mode: str = "causal",
         numeric_pose_token: bool = False,
         pose_progress_enabled: bool = False,
+        pose5_enabled: bool = False,
+        pose_init_seed: int | None = None,
     ) -> None:
         super().__init__()
         self.encoder = FrozenQwen35SemanticEncoder(
@@ -62,8 +64,13 @@ class FrozenQwen35Conditioner(nn.Module):
             action_placeholder_count=action_placeholder_count,
             action_attention_mode=action_attention_mode,
         )
+        if pose5_enabled:
+            self.encoder.qwen.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant':False})
+            self.encoder.qwen.config.use_cache=False
         self.use_reference_image = bool(use_reference_image)
         self.hidden_size = int(self.encoder.hidden_size)
+        self.pose5_enabled=bool(pose5_enabled)
+        if self.pose5_enabled and (pose_progress_enabled or not numeric_pose_token):raise ValueError('5D Pose requires numeric token and disables 7D progress input')
         self.numeric_pose_token=bool(numeric_pose_token)
         self.pose_progress_enabled=bool(pose_progress_enabled)
         if self.pose_progress_enabled and not self.numeric_pose_token:
@@ -76,9 +83,24 @@ class FrozenQwen35Conditioner(nn.Module):
             self.encoder.qwen.get_output_embeddings().requires_grad_(False)
             self.state_token_id=tokenizer.convert_tokens_to_ids('<|uav_state|>')
             scale=([10.,10.,10.,1.,1.,2*torch.pi,10.] if self.pose_progress_enabled
-                   else [1000.,1000.,1000.,180.])
+                   else ([1000.,1000.,1000.,180.,1.] if self.pose5_enabled else [1000.,1000.,1000.,180.]))
             self.register_buffer('state_scale',torch.tensor(scale))
-            self.state_encoder=nn.Sequential(nn.Linear(len(scale),256),nn.GELU(),nn.Linear(256,self.hidden_size))
+            if pose_init_seed is None:
+                self.state_encoder=nn.Sequential(nn.Linear(len(scale),256),nn.GELU(),nn.Linear(256,self.hidden_size))
+            else:
+                with torch.random.fork_rng(devices=[]):
+                    torch.manual_seed(pose_init_seed);first=nn.Linear(len(scale),256)
+                    torch.manual_seed(pose_init_seed+1);second=nn.Linear(256,self.hidden_size)
+                    self.state_encoder=nn.Sequential(first,nn.GELU(),second)
+
+    def train(self, mode=True):
+        super().train(mode)
+        if getattr(self,'pose5_enabled',False):
+            self.encoder.qwen.eval()
+            if mode:
+                visual=self.encoder.qwen.model.visual;visual.train()
+                for i,block in enumerate(visual.blocks):block.gradient_checkpointing=i<8
+        return self
 
     def encode_tokens(
         self,
@@ -145,6 +167,10 @@ class FrozenQwen35Conditioner(nn.Module):
         # the Qwen processor and `keep` prevents those padding positions from
         # entering cross-attention.
         result = {"last_hidden_state": hidden, "attention_mask": keep}
+        if self.numeric_pose_token and getattr(self,'pose5_enabled',False):
+            # GAM reuses this SAME public MLP output at its native SA proprio
+            # slot. Ordinary Warp/Pure consumers ignore the additional field.
+            result['pose_embedding']=embedding
         # Preserve prompt token ids for diagnostics (for example mapping a
         # noun in a closed-loop instruction back to GAM's cross-attention K/V
         # positions).  Training and policy callers ignore these extra fields.
@@ -156,6 +182,11 @@ class FrozenQwen35Conditioner(nn.Module):
 
 def build_stage2_conditioner(stage1_cfg, model_cfg) -> nn.Module:
     encoder_type = str(stage1_cfg.get("text_encoder_type", "clip")).lower()
+    if stage1_cfg.get('paper_t5_pose_token',False):
+        if encoder_type!='t5':raise ValueError('paper_t5_pose_token requires T5')
+        from experiments.uavflow_paper_ablation.t5_pose import T5PoseConditioner
+        return T5PoseConditioner(str(stage1_cfg.get('t5_model')),int(stage1_cfg.get('qwen_pose_init_seed',43)),
+                                int(stage1_cfg.get('paper_t5_projection_seed',46)),native_text=bool(stage1_cfg.get('paper_t5_native_text',False)))
     if encoder_type in {"qwen", "qwen3_5", "qwen3.5", "vlm"}:
         return FrozenQwen35Conditioner(
             str(stage1_cfg.get("qwen_model")),
@@ -185,6 +216,8 @@ def build_stage2_conditioner(stage1_cfg, model_cfg) -> nn.Module:
             ),
             numeric_pose_token=bool(stage1_cfg.get('qwen_numeric_pose_token',False)),
             pose_progress_enabled=bool(stage1_cfg.get('qwen_pose_progress_enabled',False)),
+            pose5_enabled=bool(stage1_cfg.get('qwen_pose5_enabled',False)),
+            pose_init_seed=stage1_cfg.get('qwen_pose_init_seed'),
         )
     return TextConditioner(
         encoder_type=encoder_type,
@@ -215,4 +248,6 @@ def encode_stage2_condition(
         return conditioner.encode_tokens(
             texts, pad_to=pad_to, images=images, current_pose=current_pose
         )
+    if getattr(conditioner,'pose_conditioned',False):
+        return conditioner.encode_tokens(texts,pad_to=pad_to,current_pose=current_pose)
     return conditioner.encode_tokens(texts, pad_to=pad_to)

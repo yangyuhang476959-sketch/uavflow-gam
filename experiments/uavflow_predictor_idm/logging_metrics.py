@@ -17,7 +17,8 @@ def action_statistics(moments):
 def enabled_metric(key, cfg):
     key = re.sub(r"^H\d+_", "", key)
     loss = cfg.loss
-    if bool(cfg.model.get('dual_stream_rgbwarp_enabled',False)) and (
+    native=bool(cfg.model.get('rgbwarp_correction',{}).get('native_gam_path',False))
+    if bool(cfg.model.get('dual_stream_rgbwarp_enabled',False)) and not native and (
             'feat' in key or key.startswith(('cls','reg','patch','cos_steps'))):
         return False
     if key.startswith("step"):
@@ -47,7 +48,7 @@ def enabled_metric(key, cfg):
         weight = "feature_cls_weight" if "cls" in key else "feature_register_weight"
         return float(loss.get(weight, 0)) > 0
     if key in {"gate", "refine", "patch", "feat_steps", "cos_steps"}:
-        return False
+        return native and key != "gate"
     return True
 
 

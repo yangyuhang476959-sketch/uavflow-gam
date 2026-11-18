@@ -7,14 +7,11 @@ from robot.modeling.action_head_v2 import ActionHeadV2
 
 
 class PureQwenActionPolicy(nn.Module):
-    def __init__(self, model_path, decoder_width=1536, pose_mode='prompt', pose_progress_enabled=False):
+    def __init__(self, model_path, decoder_width=1536, pose_mode='prompt', *, numeric_pose_dim=4, numeric_pose_scale=None, pose_init_seed=None):
         super().__init__()
-        if pose_mode not in {'prompt', 'numeric_head', 'numeric_token'}:
-            raise ValueError('pose_mode must be prompt, numeric_head or numeric_token')
+        if pose_mode not in {'none', 'prompt', 'numeric_head', 'numeric_token'}:
+            raise ValueError('pose_mode must be none, prompt, numeric_head or numeric_token')
         self.pose_mode = pose_mode
-        self.pose_progress_enabled = bool(pose_progress_enabled)
-        if self.pose_progress_enabled and pose_mode != "numeric_token":
-            raise ValueError("Pose progress requires numeric_token mode")
         self.encoder = FrozenQwen35SemanticEncoder(
             model_path, layer_indices=(23,), prompt_mode='current_image_action_question',
             token_selection='action_placeholders', action_placeholder_count=5,
@@ -24,13 +21,25 @@ class PureQwenActionPolicy(nn.Module):
             gradient_checkpointing_kwargs={'use_reentrant': False})
         self.encoder.qwen.config.use_cache = False
         if pose_mode in {'numeric_head', 'numeric_token'}:
-            # Match correction-token progress scales; preserve the legacy4D
-            # centimetre/degree representation when progress is disabled.
-            scale = ([10., 10., 10., 1., 1., 2 * torch.pi, 10.]
-                     if self.pose_progress_enabled else [1000., 1000., 1000., 180.])
+            # Input is episode-relative centimetres/degrees, as in the prompt
+            # baseline. Fixed scaling changes representation, not coordinates.
+            scale = [1000., 1000., 1000., 180.] if numeric_pose_scale is None else list(numeric_pose_scale)
+            if numeric_pose_dim < 4 or len(scale) != numeric_pose_dim or any(not __import__('math').isfinite(v) or v <= 0 for v in scale):
+                raise ValueError('Numeric Pose needs one positive finite scale per dimension')
             self.register_buffer('state_scale', torch.tensor(scale))
-            self.state_encoder = nn.Sequential(nn.Linear(len(scale), 256), nn.GELU(),
-                                               nn.Linear(256, 256 if pose_mode == 'numeric_head' else self.encoder.hidden_size))
+            if pose_init_seed is None:
+                self.state_encoder = nn.Sequential(nn.Linear(numeric_pose_dim, 256), nn.GELU(),
+                    nn.Linear(256, 256 if pose_mode == 'numeric_head' else self.encoder.hidden_size))
+            else:
+                # Ordinary fan-in initialization for EVERY input column. Isolate
+                # RNG per layer so common-shaped layers and the action head keep
+                # identical initialization across representation dimensions.
+                with torch.random.fork_rng(devices=[]):
+                    torch.manual_seed(pose_init_seed)
+                    first = nn.Linear(numeric_pose_dim, 256)
+                    torch.manual_seed(pose_init_seed + 1)
+                    second = nn.Linear(256, 256 if pose_mode == 'numeric_head' else self.encoder.hidden_size)
+                    self.state_encoder = nn.Sequential(first, nn.GELU(), second)
         if pose_mode == 'numeric_token':
             tokenizer = self.encoder.processor.tokenizer
             tokenizer.add_special_tokens({'additional_special_tokens':
@@ -46,12 +55,14 @@ class PureQwenActionPolicy(nn.Module):
                                 n_views=1, n_dims=4, chunk_size=5,
                                 chunk_position_encoding='learned')
 
-    def forward(self, images, instructions, states):
-        if self.pose_mode in {'numeric_head', 'numeric_token'}:
+    def forward(self, images, instructions, states=None, *, return_hidden=False):
+        if self.pose_mode == 'none':
+            # Do not inspect states, create a state token, or substitute zeros.
+            encoded = self.encoder(images, instructions, omit_prompt_pose=True)
+        elif self.pose_mode in {'numeric_head', 'numeric_token'}:
             state = torch.as_tensor(states, device=self.state_scale.device, dtype=torch.float32)
-            dimension = self.state_scale.numel()
-            if state.shape != (len(instructions), dimension) or not torch.isfinite(state).all():
-                raise ValueError(f'Numeric state must be finite [B,{dimension}] in the configured pose convention')
+            if state.shape != (len(instructions), self.state_scale.numel()) or not torch.isfinite(state).all():
+                raise ValueError('Numeric state shape/values do not match configured Pose scales')
             if self.pose_mode == 'numeric_token':
                 pose_embedding = self.state_encoder(state / self.state_scale)
                 def inject(_module, inputs, output):
@@ -72,18 +83,19 @@ class PureQwenActionPolicy(nn.Module):
         if self.pose_mode == 'numeric_head':
             pose_features = self.state_encoder(state / self.state_scale)
             slots = torch.cat((slots, pose_features[:, None].expand(-1, slots.shape[1], -1)), dim=-1)
-        return self.head.forward_slots(slots[:, None])
+        actions = self.head.forward_slots(slots[:, None])
+        return (actions, slots[:, None]) if return_hidden else actions
 
-    def optimizer_groups(self, lora_lr, head_lr, state_lr=None):
-        state = list(self.state_encoder.parameters()) if self.pose_mode in {'numeric_head', 'numeric_token'} else []
-        groups = [dict(params=[p for p in self.encoder.parameters() if p.requires_grad], lr=lora_lr),
-                  dict(params=list(self.projection.parameters()) + list(self.head.parameters()), lr=head_lr)]
-        if getattr(self, 'pose_progress_enabled', False):
-            groups.append(dict(params=state, lr=lora_lr if state_lr is None else state_lr))
-        else:
-            # Preserve legacy 4D checkpoint optimizer layout (two groups).
-            groups[1]['params'] += state
-        return groups
+    def optimizer_groups(self, lora_lr, head_lr, pose_lr=None):
+        if pose_lr is not None:
+            if self.pose_mode not in {'numeric_head', 'numeric_token'}:
+                raise ValueError('Separate Pose LR requires a numeric Pose path')
+            return [dict(name='qwen_lora', params=[p for p in self.encoder.parameters() if p.requires_grad], lr=lora_lr),
+                    dict(name='action_head', params=list(self.projection.parameters()) + list(self.head.parameters()), lr=head_lr),
+                    dict(name='pose_encoder', params=list(self.state_encoder.parameters()), lr=pose_lr)]
+        return [dict(params=[p for p in self.encoder.parameters() if p.requires_grad], lr=lora_lr),
+                dict(params=list(self.projection.parameters()) + list(self.head.parameters())
+                     + (list(self.state_encoder.parameters()) if self.pose_mode in {'numeric_head', 'numeric_token'} else []), lr=head_lr)]
 
     def trainable_state(self):
         return {name: p.detach().cpu().clone() for name, p in self.named_parameters() if p.requires_grad}
